@@ -2173,10 +2173,15 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
         y for y in ["2022", "2023", "2024", "2025"]
         if totals[y] > 0 and final_2026 >= 0.95 * totals[y]
     ]
+    # End the guides at the "Jan" (next-year) tick rather than spanning the whole
+    # axis / the label margin.
+    guide_xmax = datetime(ref_dates[-1].year + 1, 1, 1)
     for prev_y in guide_years:
         prev_total = totals[prev_y]
-        ax.axhline(
+        ax.hlines(
             y=prev_total,
+            xmin=ref_dates[0],
+            xmax=guide_xmax,
             color=colors[prev_y],
             linestyle="--",
             linewidth=1.5,
