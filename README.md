@@ -3,8 +3,7 @@
 A free, self-updating dashboard of CVE / vulnerability statistics, built from the
 [Vulners](https://vulners.com) CVE archive and published to GitHub Pages.
 
-**🔗 Live site:** _enable GitHub Pages (see below), then your dashboard is at_
-`https://<your-username>.github.io/<repo>/`
+**🔗 Live site:** <https://alukashenkov.github.io/vulnpocalypse_2026/>
 
 The site rebuilds itself **every day at 07:00 UTC** via GitHub Actions: it downloads
 the current CVE collection once, regenerates every dashboard's charts and tables, and
