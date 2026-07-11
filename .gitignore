@@ -10,6 +10,7 @@
 !/LICENSE
 !/README.md
 
-# Never track compiled Python, even inside the allowlisted code tree.
+# Never track compiled Python or OS junk, even inside the allowlisted tree.
 **/__pycache__/
 *.py[cod]
+.DS_Store
