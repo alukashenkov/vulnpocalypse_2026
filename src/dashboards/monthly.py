@@ -1855,51 +1855,16 @@ def plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str, outpu
     final_speed_26 = cumulative_2026 / days_count if days_count > 0 else 0.0
 
     plt.style.use("dark_background")
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=True, facecolor="#1E1E1E")
-    ax1.set_facecolor("#1E1E1E")
-    ax2.set_facecolor("#1E1E1E")
+    fig, ax = plt.subplots(1, 1, figsize=(14, 7), facecolor="#1E1E1E")
+    ax.set_facecolor("#1E1E1E")
 
-    ax1.plot(date_series, ytd_values_2025, color="#70A1FF", label="2025 YTD (Same Period)", linewidth=2.5, alpha=0.85)
-    ax1.plot(date_series, ytd_values_2026, color="#FF4757", label="2026 YTD", linewidth=3.5)
+    ax.plot(date_series, ma_2025, color="#70A1FF", label="2025 Daily Speed (30-day MA)", linewidth=2.5, alpha=0.85)
+    ax.plot(date_series, ma_2026, color="#FF4757", label="2026 Daily Speed (30-day MA)", linewidth=3)
+    ax.fill_between(date_series, ma_2025, color="#70A1FF", alpha=0.08)
+    ax.fill_between(date_series, ma_2026, color="#FF4757", alpha=0.08)
 
-    where_pos = [val_26 >= val_25 for val_26, val_25 in zip(ytd_values_2026, ytd_values_2025)]
-    where_neg = [val_26 < val_25 for val_26, val_25 in zip(ytd_values_2026, ytd_values_2025)]
-
-    ax1.fill_between(
-        date_series,
-        ytd_values_2025,
-        ytd_values_2026,
-        where=where_pos,
-        interpolate=True,
-        color="#2ED573",
-        alpha=0.15,
-        label="Net Growth Increase"
-    )
-    ax1.fill_between(
-        date_series,
-        ytd_values_2025,
-        ytd_values_2026,
-        where=where_neg,
-        interpolate=True,
-        color="#FF4757",
-        alpha=0.15,
-        label="Net Growth Decrease"
-    )
-
-    ax1.set_ylabel("Cumulative CVE Count", fontsize=16, fontweight="bold", color="#FFFFFF")
-    ax1.set_title("Cumulative YTD CVEs: 2025 vs 2026 Comparison", fontsize=18, fontweight="bold", color="#FFFFFF", pad=32)
-    ax1.grid(True, color="#444444", linestyle="--", alpha=0.5)
-    ax1.legend(loc="upper left", facecolor="#262626", edgecolor="#444444", fontsize=13)
-    ax1.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, loc: f"{int(x):,}"))
-    ax1.set_ylim(bottom=0)
-
-    ax2.plot(date_series, ma_2025, color="#70A1FF", label="2025 Daily Speed (30-day MA)", linewidth=2.5, alpha=0.85)
-    ax2.plot(date_series, ma_2026, color="#FF4757", label="2026 Daily Speed (30-day MA)", linewidth=3)
-    ax2.fill_between(date_series, ma_2025, color="#70A1FF", alpha=0.08)
-    ax2.fill_between(date_series, ma_2026, color="#FF4757", alpha=0.08)
-    
     # Highlight 2026 YTD Avg Speed prominently on the chart
-    ax2.axhline(
+    ax.axhline(
         y=final_speed_26,
         color="#FF4757",
         linestyle="--",
@@ -1908,7 +1873,7 @@ def plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str, outpu
         label=f"2026 YTD Avg Speed ({final_speed_26:.1f}/day)"
     )
     # Highlight 2025 YTD Avg Speed less prominently for reference
-    ax2.axhline(
+    ax.axhline(
         y=final_speed_25,
         color="#70A1FF",
         linestyle=":",
@@ -1916,50 +1881,25 @@ def plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str, outpu
         alpha=0.6,
         label=f"2025 YTD Avg Speed ({final_speed_25:.1f}/day)"
     )
-    
-    ax2.legend(loc="upper left", facecolor="#262626", edgecolor="#444444", fontsize=13)
 
-    # Annotate final speeds (overall YTD average: CVEs divided by days)
-    # Style the 2026 speed prominently with a larger font size and matching red color
-    ax1.annotate(
-        f"2026 YTD Avg Speed: {final_speed_26:.1f}/day",
-        xy=(0.7, 1.04),
-        xycoords="axes fraction",
-        ha="center",
-        va="bottom",
-        fontsize=15,
-        fontweight="bold",
-        color="#FF4757"
-    )
-    # Style the 2025 speed less prominently with a smaller font size and blue color
-    ax1.annotate(
-        f"2025 YTD Avg Speed: {final_speed_25:.1f}/day",
-        xy=(0.3, 1.04),
-        xycoords="axes fraction",
-        ha="center",
-        va="bottom",
-        fontsize=13,
-        fontweight="bold",
-        color="#70A1FF"
-    )
+    ax.legend(loc="upper left", facecolor="#262626", edgecolor="#444444", fontsize=13)
 
-    ax2.set_ylabel("Publishing Speed (CVEs/day)", fontsize=16, fontweight="bold", color="#FFFFFF")
-    ax2.set_title("CVE Publishing Speed YoY (30-Day Moving Average)", fontsize=18, fontweight="bold", color="#FFFFFF", pad=12)
-    ax2.grid(True, color="#444444", linestyle="--", alpha=0.5)
+    ax.set_ylabel("Publishing Speed (CVEs/day)", fontsize=16, fontweight="bold", color="#FFFFFF")
+    ax.set_title("CVE Publishing Speed YoY (30-Day Moving Average)", fontsize=18, fontweight="bold", color="#FFFFFF", pad=12)
+    ax.grid(True, color="#444444", linestyle="--", alpha=0.5)
 
     # Set bottom of y-axis to 0 to prevent negative speeds
-    ax2.set_ylim(bottom=0)
+    ax.set_ylim(bottom=0)
 
-    ax2.xaxis.set_major_locator(mdates.MonthLocator())
-    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+    ax.xaxis.set_major_locator(mdates.MonthLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
     plt.xticks(rotation=0)
 
-    for ax in [ax1, ax2]:
-        for spine in ["top", "right"]:
-            ax.spines[spine].set_visible(False)
-        for spine in ["left", "bottom"]:
-            ax.spines[spine].set_color("#777777")
-        ax.tick_params(colors="#CCCCCC", labelsize=13)
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+    for spine in ["left", "bottom"]:
+        ax.spines[spine].set_color("#777777")
+    ax.tick_params(colors="#CCCCCC", labelsize=13)
 
     plt.figtext(
         0.5,
