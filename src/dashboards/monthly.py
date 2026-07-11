@@ -104,6 +104,26 @@ CHART_CAPTIONS = {
     ),
 }
 
+# ── Shared chart palette ─────────────────────────────────────────────────────
+# Every chart draws its series colors from the Sankey "premium" palette so the
+# whole dashboard reads as one system. #FF4757 (the Sankey's first red) is the
+# anchor; the rest are pulled from the same palette. Colorblind separation on the
+# dark (#1E1E1E) surface is validated with the dataviz palette validator.
+C_RED = "#FF4757"     # current year / primary emphasis  (Sankey GitHub_M)
+C_BLUE = "#2E86DE"    # previous year / reference         (Sankey Linux)
+C_GREEN = "#2ED573"   # positive / baseline projection    (Sankey ibm)
+C_YELLOW = "#F1C40F"  # (Sankey mitre)
+C_GRAY = "#747D8C"    # oldest year / neutral data        (Sankey Others)
+
+# Fixed color per calendar year for the multi-year comparison charts.
+YEAR_COLORS = {
+    "2022": C_GRAY,
+    "2023": C_YELLOW,
+    "2024": C_GREEN,
+    "2025": C_BLUE,
+    "2026": C_RED,
+}
+
 # Plotting functions below append their saved-file messages here. Kept so those
 # functions stay byte-for-byte identical to the original; not shown on the site.
 saved_files_log = []
@@ -1911,9 +1931,9 @@ def plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str, outpu
     fig, ax = plt.subplots(1, 1, figsize=(14, 7), facecolor="#1E1E1E")
     ax.set_facecolor("#1E1E1E")
 
-    ax.plot(date_series, ma_2025, color="#70A1FF", label=f"{prev_year} Daily Speed (30-day MA)", linewidth=2.5, alpha=0.85)
+    ax.plot(date_series, ma_2025, color=C_BLUE, label=f"{prev_year} Daily Speed (30-day MA)", linewidth=2.5, alpha=0.85)
     ax.plot(date_series, ma_2026, color="#FF4757", label=f"{current_year} Daily Speed (30-day MA)", linewidth=3)
-    ax.fill_between(date_series, ma_2025, color="#70A1FF", alpha=0.08)
+    ax.fill_between(date_series, ma_2025, color=C_BLUE, alpha=0.08)
     ax.fill_between(date_series, ma_2026, color="#FF4757", alpha=0.08)
 
     # Highlight 2026 YTD Avg Speed prominently on the chart
@@ -1928,7 +1948,7 @@ def plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str, outpu
     # Highlight 2025 YTD Avg Speed less prominently for reference
     ax.axhline(
         y=final_speed_25,
-        color="#70A1FF",
+        color=C_BLUE,
         linestyle=":",
         linewidth=1.5,
         alpha=0.6,
@@ -2062,11 +2082,11 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
     ax.set_facecolor("#1E1E1E")
 
     colors = {
-        "2022": "#A4B0BE",
-        "2023": "#70A1FF",
-        "2024": "#2ED573",
-        "2025": "#FFA502",
-        "2026": "#FF4757"
+        "2022": YEAR_COLORS["2022"],
+        "2023": YEAR_COLORS["2023"],
+        "2024": YEAR_COLORS["2024"],
+        "2025": YEAR_COLORS["2025"],
+        "2026": YEAR_COLORS["2026"]
     }
 
     # Plot 2022-2025 curves
@@ -2365,7 +2385,7 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
     ax.set_facecolor("#1E1E1E")
 
     # Plot 2025 as baseline
-    ax.plot(months_names, y_2025_cum, color="#70A1FF", marker="o", linestyle="-", linewidth=3.0, alpha=0.7, zorder=2, label=f"{prev_year} Cumulative")
+    ax.plot(months_names, y_2025_cum, color=C_BLUE, marker="o", linestyle="-", linewidth=3.0, alpha=0.7, zorder=2, label=f"{prev_year} Cumulative")
     
     # Plot 2026 Projected (100k Target Baseline) from May (or earlier if comp < May) onwards
     x_proj_green = months_names[start_proj_idx:]
