@@ -135,7 +135,7 @@ _LOGO_PATH = os.path.join(
 # Sized as a fraction of figure width so it looks the same on every chart when
 # the page scales each image to the same on-screen width. Tune these two if the
 # real logo reads too big/small. Height is derived to keep the square undistorted.
-_LOGO_WIDTH_FRAC = 0.0525    # logo width as a fraction of the figure width
+_LOGO_WIDTH_FRAC = 0.04      # logo width as a fraction of the figure width
 _LOGO_MARGIN_X_FRAC = 0.006  # gap from the left edge, fraction of figure width
 _LOGO_MARGIN_Y_FRAC = 0.010  # gap from the bottom edge, fraction of figure height
 _logo_cache = None           # None = not loaded; False = missing/failed; array = loaded
