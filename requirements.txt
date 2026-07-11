@@ -1,0 +1,4 @@
+requests
+ijson
+matplotlib
+numpy

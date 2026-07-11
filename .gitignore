@@ -1,0 +1,15 @@
+# Allowlist-only. Everything is ignored by default; only the files re-included
+# below are published. Nothing private is named here on purpose — anything not
+# listed simply never gets tracked.
+/*
+
+!/src/
+!/.github/
+!/requirements.txt
+!/.gitignore
+!/LICENSE
+!/README.md
+
+# Never track compiled Python, even inside the allowlisted code tree.
+**/__pycache__/
+*.py[cod]

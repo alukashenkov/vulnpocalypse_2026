@@ -1,0 +1,62 @@
+name: Build & deploy CVE dashboard
+
+on:
+  schedule:
+    - cron: "0 7 * * *"   # daily at 07:00 UTC
+  workflow_dispatch: {}
+
+# Read-only except for Pages; the run never commits to the repo.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never run two builds at once; let a newer run supersede a queued one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      # Deterministic set/dict ordering so table row ties render the same daily.
+      PYTHONHASHSEED: "0"
+      DATA_DIR: ${{ runner.temp }}/data
+      SITE_DIR: ${{ runner.temp }}/site
+      VULNERS_API_KEY: ${{ secrets.VULNERS_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The decompressed archive is ~5.4 GB; reclaim space as cheap insurance.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          large-packages: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - uses: actions/configure-pages@v5
+
+      - name: Build site
+        run: python -m src
+
+      - name: Discard the downloaded archive
+        if: always()
+        run: rm -rf "${{ runner.temp }}/data"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}/site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
