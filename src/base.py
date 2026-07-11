@@ -16,10 +16,10 @@ class DashboardResult:
     Attributes:
         slug: short id used for anchors / filenames (e.g. ``"monthly"``).
         title: human heading shown on the page.
-        blurb: short prose describing what the dashboard shows and how to read it
-            (rendered as the "wording" on the index page).
-        charts: chart image paths, in display order. Each is a filename that lives
-            inside ``out_dir`` (referenced by basename from the HTML).
+        blurb: the dashboard's intro prose, shown as a lead paragraph on the page.
+        charts: chart entries in display order. Each is a dict with ``file`` (a
+            path inside ``out_dir``, referenced by basename from the HTML) and an
+            optional ``caption`` shown beneath the image.
         report_text: the dashboard's aligned-table report as a plain string, shown
             verbatim in a ``<pre>`` block on the tables page. For the monthly
             dashboard this is the same content the old console report produced.
@@ -28,7 +28,7 @@ class DashboardResult:
     slug: str
     title: str
     blurb: str
-    charts: List[str] = field(default_factory=list)
+    charts: List[dict] = field(default_factory=list)
     report_text: str = ""
 
 

@@ -17,7 +17,34 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # The dashboard freezes on the full-2026 snapshot. Scheduled runs stop after
+  # 2027-01-01; the 2027-01-01 run (and any manual run in 2027) is pinned to the
+  # complete 2026 dataset via CVE_CUT_OFF_DATE=2026-12-31 (a naive year-boundary
+  # run would otherwise mishandle the "current month"). Manual runs stay allowed.
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      cutoff: ${{ steps.check.outputs.cutoff }}
+    steps:
+      - id: check
+        run: |
+          today=$(date -u +%Y-%m-%d)
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" || "$today" < "2027-01-02" ]]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Frozen on the full-2026 snapshot; skipping scheduled run."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ "$today" > "2026-12-31" ]]; then
+            echo "cutoff=2026-12-31" >> "$GITHUB_OUTPUT"
+          else
+            echo "cutoff=" >> "$GITHUB_OUTPUT"
+          fi
+
   build-and-deploy:
+    needs: gate
+    if: needs.gate.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -49,6 +76,7 @@ jobs:
           DATA_DIR: ${{ runner.temp }}/data
           SITE_DIR: ${{ runner.temp }}/site
           VULNERS_API_KEY: ${{ secrets.VULNERS_API_KEY }}
+          CVE_CUT_OFF_DATE: ${{ needs.gate.outputs.cutoff }}
         run: python -m src
 
       - name: Discard the downloaded archive

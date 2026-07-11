@@ -161,7 +161,9 @@ header h1 { margin: 0 0 .25rem; font-size: 1.9rem; }
 section { margin: 0 0 3rem; }
 section h2 { font-size: 1.4rem; margin: 0 0 .5rem; border-bottom: 1px solid rgba(128,128,128,.3); padding-bottom: .35rem; }
 .blurb { color: inherit; opacity: .85; margin: .5rem 0 1.25rem; }
-figure { margin: 0 0 1.5rem; }
+.intro { font-size: 1.12rem; line-height: 1.7; opacity: .92; margin: .5rem 0 2rem; }
+figure { margin: 0 0 2.5rem; }
+figcaption { margin-top: .75rem; opacity: .82; line-height: 1.6; }
 img { max-width: 100%; height: auto; border: 1px solid rgba(128,128,128,.2); border-radius: 6px; }
 a { color: #3b82f6; }
 pre { overflow-x: auto; padding: 1rem; border: 1px solid rgba(128,128,128,.3); border-radius: 6px; background: rgba(128,128,128,.08); font-size: 12.5px; line-height: 1.45; }
@@ -192,17 +194,22 @@ def build_site(results, out_dir):
     # index.html
     index_sections = []
     for r in results:
-        figures = "\n".join(
-            f'  <figure><img src="{html.escape(os.path.basename(c))}" '
-            f'alt="{html.escape(r.title)} chart"></figure>'
-            for c in r.charts
-        )
+        figures = []
+        for c in r.charts:
+            caption = c.get("caption", "")
+            cap_html = (
+                f"<figcaption>{html.escape(caption)}</figcaption>" if caption else ""
+            )
+            figures.append(
+                f'  <figure><img src="{html.escape(os.path.basename(c["file"]))}" '
+                f'alt="{html.escape(r.title)} chart">{cap_html}</figure>'
+            )
         index_sections.append(
             f'<section id="{html.escape(r.slug)}">\n'
             f"  <h2>{html.escape(r.title)}</h2>\n"
-            f'  <p class="blurb">{html.escape(r.blurb)}</p>\n'
-            f"{figures}\n"
-            f'  <p><a href="tables.html#{html.escape(r.slug)}">View the full data tables &rarr;</a></p>\n'
+            f'  <p class="intro">{html.escape(r.blurb)}</p>\n'
+            + "\n".join(figures)
+            + f'\n  <p><a href="tables.html#{html.escape(r.slug)}">View the full data tables &rarr;</a></p>\n'
             f"</section>"
         )
     index_body = (

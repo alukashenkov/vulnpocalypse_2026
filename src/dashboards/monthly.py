@@ -26,7 +26,10 @@ from ..base import Dashboard, DashboardResult
 
 # Configuration
 TOP_N = 15
-CUT_OFF_DATE = None  # "YYYY-MM-DD" or None for the last full day
+# Cap the analysis at a fixed date ("YYYY-MM-DD"); None = through the last full
+# day. Env-overridable so the final 2026 run can be pinned to 2026-12-31 (full
+# year) — the workflow sets CVE_CUT_OFF_DATE at the year boundary.
+CUT_OFF_DATE = os.getenv("CVE_CUT_OFF_DATE") or None
 _WRITE_CSV = False   # published path writes no CSV; a local caller may flip this
 
 # Frozen reference predictions calculated on June 6, 2026 (Jan-May completed).
@@ -51,13 +54,55 @@ CHART_FILES = [
 ]
 
 MONTHLY_BLURB = (
-    "Year-over-year CVE publication counts broken down by CNA (CVE Numbering "
-    "Authority), covering 2022-2026. Charts show YTD growth, the yearly "
-    "cumulative curve, each CNA's cumulative contribution, a full-year "
-    "projection from the observed monthly YoY trend, and Sankey flows of how "
-    "CNA output moves month to month. The full comparison tables are on the "
-    "data-tables page."
+    "Welcome to the Vulnpocalypse. This is the counter I keep running in the "
+    "corner of the screen so I can watch the CVE pipeline lap every year that "
+    "came before it. Every chart here is one more angle on the same story: how "
+    "fast CVEs are being published, and how far ahead of the years before it "
+    "the current pace is running. Data is from the Vulners CVE archive. Grab a "
+    "coffee before you scroll."
 )
+
+# Caption shown beneath each chart image (keyed by chart filename). Kept purely
+# descriptive of what the chart shows — no specific figures, dates, or trend
+# claims that would go stale as the data updates.
+CHART_CAPTIONS = {
+    "cve_monthly_stats_comparison_yearly_cumulative.png": (
+        "Five years, five lines, one very rude red one. The newest year crosses "
+        "the full-year totals of earlier years long before its own twelve months "
+        "are up, then keeps climbing like the finish line owed it money. Numbers "
+        "that took those years a whole year to reach, it reaches with months to "
+        "spare. The gap between the red line and the pack is not a rendering "
+        "glitch. That is just the tide coming in."
+    ),
+    "cve_monthly_stats_comparison_ytd_growth.png": (
+        "This is the speedometer, and the needle is pinned. The current year sits "
+        "well above the prior year's line and stays there. The two lines shook "
+        "hands once, early on, and have not spoken since."
+    ),
+    "cve_monthly_stats_comparison_incomplete_month.png": (
+        "Three snapshots of the exact same slice of the calendar, lined up side "
+        "by side: this month so far in the middle, the same days of last month on "
+        "the left, and the same stretch a year ago on the right. Same window, "
+        "three different levels of pain. It answers two questions at a glance, "
+        "whether the current month is already outrunning the one before it, and "
+        "how much further ahead of last year the whole pipeline has drifted. The "
+        "current column is rarely the short one."
+    ),
+    "cve_monthly_stats_comparison_sankey_monthly.png": (
+        "The same firehose, sliced by month, so you can watch the ribbons swell. "
+        "Each column is a month; the taller it stacks, the more CVEs that month "
+        "shipped. Trace any single CNA's band across the months to see how its "
+        'output rises and falls. This is what "more of everything, from everyone" '
+        "looks like when you actually draw it."
+    ),
+    "cve_monthly_stats_comparison_projection.png": (
+        "Two ways to guess where this ends, and neither one lets you sleep. One "
+        "line runs the current rate forward; the other draws the rounder "
+        "baseline. Both land well above where the prior year finished, which "
+        "already reads like the good old days. The asterisks mean projection. The "
+        "slope means call the cavalry."
+    ),
+}
 
 # Plotting functions below append their saved-file messages here. Kept so those
 # functions stay byte-for-byte identical to the original; not shown on the site.
@@ -1325,14 +1370,9 @@ def plot_custom_sankey_flow(
     Only labels CNAs at the first column (December 2025).
     """
     anchor_month_str = anchor_date[5:7]  # e.g., "06" for June
+    current_year = int(anchor_date[:4])  # display year, derived from the data anchor
+    prev_year = current_year - 1
     dec_2025_data = stats.get("12", {}).get("2025", {})
-
-    stages = []
-    # Stage 0: December 2025
-    stages.append({
-        "label": "Dec 2025",
-        "data": dec_2025_data
-    })
 
     # Month abbreviation mapping
     months_abbrev = {
@@ -1340,6 +1380,13 @@ def plot_custom_sankey_flow(
         "05": "May", "06": "Jun", "07": "Jul", "08": "Aug",
         "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec"
     }
+
+    stages = []
+    # Stage 0: December (previous year)
+    stages.append({
+        "label": f"Dec {prev_year}",
+        "data": dec_2025_data
+    })
 
     # Stages 1 to K: Jan 2026 to anchor_month 2026
     for m_int in range(1, int(anchor_month_str) + 1):
@@ -1528,7 +1575,7 @@ def plot_custom_sankey_flow(
     # Title & Subtitle
     ax.text(
         3.0, 1090,
-        "YoY Monthly CVE Contributions of Top CNAs (Dec 2025 - Jun 2026)",
+        f"Monthly CVE Contributions of Top CNAs (Dec {prev_year} - {months_abbrev[anchor_month_str]} {current_year})",
         ha="center",
         va="bottom",
         color="#FFFFFF",
@@ -1537,7 +1584,7 @@ def plot_custom_sankey_flow(
     )
     ax.text(
         3.0, 1065,
-        "Visualizing monthly CVE publications. Sized by absolute volume contribution. Sorted by total number of CVEs in 2026.",
+        f"Visualizing monthly CVE publications. Sized by absolute volume contribution. Sorted by total number of CVEs in {current_year}.",
         ha="center",
         va="bottom",
         color="#A4B0BE",
@@ -1570,6 +1617,7 @@ def plot_incomplete_month_sankey(
     range_label,
     prev_range_label,
     prev_year_str,
+    anchor_date,
     output_filename="cve_monthly_stats_comparison_incomplete_month.png",
 ):
     """
@@ -1586,11 +1634,14 @@ def plot_incomplete_month_sankey(
     of the previous month so that MoM contributors appear as their own lanes in
     all three stops rather than folded into "Others".
     """
-    # Three stages: previous month (MoM) -> 2026 current -> 2025 (YoY).
+    current_year = int(anchor_date[:4])  # display year, derived from the data anchor
+    prev_year = current_year - 1
+
+    # Three stages: previous month (MoM) -> current year -> previous year (YoY).
     stages = [
         {"label": f"{prev_year_str} ({prev_range_label})", "data": prev_data_partial},
-        {"label": f"2026 ({range_label})", "data": data_2026_partial},
-        {"label": f"2025 ({range_label})", "data": data_2025_partial},
+        {"label": f"{current_year} ({range_label})", "data": data_2026_partial},
+        {"label": f"{prev_year} ({range_label})", "data": data_2025_partial},
     ]
 
     # Sort top CNAs by their current-month (pivot) volume.
@@ -1765,7 +1816,7 @@ def plot_incomplete_month_sankey(
     ax.text(
         title_x, 1065,
         f"Left: previous month {prev_range_label} (MoM).  Center: current incomplete month.  "
-        "Right: 2025 same range (YoY).  Sized by volume, sorted by current-month volume.",
+        f"Right: {prev_year} same range (YoY).  Sized by volume, sorted by current-month volume.",
         ha="center",
         va="bottom",
         color="#A4B0BE",
@@ -1794,6 +1845,8 @@ def plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str, outpu
     """
     Plots YTD growth over the same date in 2025 for all days in 2026 up to anchor_date_str.
     """
+    current_year = int(anchor_date_str[:4])  # display year, derived from the data anchor
+    prev_year = current_year - 1
     start_date = datetime(2026, 1, 1)
     try:
         end_date = datetime.strptime(anchor_date_str, "%Y-%m-%d")
@@ -1858,8 +1911,8 @@ def plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str, outpu
     fig, ax = plt.subplots(1, 1, figsize=(14, 7), facecolor="#1E1E1E")
     ax.set_facecolor("#1E1E1E")
 
-    ax.plot(date_series, ma_2025, color="#70A1FF", label="2025 Daily Speed (30-day MA)", linewidth=2.5, alpha=0.85)
-    ax.plot(date_series, ma_2026, color="#FF4757", label="2026 Daily Speed (30-day MA)", linewidth=3)
+    ax.plot(date_series, ma_2025, color="#70A1FF", label=f"{prev_year} Daily Speed (30-day MA)", linewidth=2.5, alpha=0.85)
+    ax.plot(date_series, ma_2026, color="#FF4757", label=f"{current_year} Daily Speed (30-day MA)", linewidth=3)
     ax.fill_between(date_series, ma_2025, color="#70A1FF", alpha=0.08)
     ax.fill_between(date_series, ma_2026, color="#FF4757", alpha=0.08)
 
@@ -1870,7 +1923,7 @@ def plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str, outpu
         linestyle="--",
         linewidth=2.5,
         alpha=0.9,
-        label=f"2026 YTD Avg Speed ({final_speed_26:.1f}/day)"
+        label=f"{current_year} YTD Avg Speed ({final_speed_26:.1f}/day)"
     )
     # Highlight 2025 YTD Avg Speed less prominently for reference
     ax.axhline(
@@ -1879,7 +1932,7 @@ def plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str, outpu
         linestyle=":",
         linewidth=1.5,
         alpha=0.6,
-        label=f"2025 YTD Avg Speed ({final_speed_25:.1f}/day)"
+        label=f"{prev_year} YTD Avg Speed ({final_speed_25:.1f}/day)"
     )
 
     ax.legend(loc="upper left", facecolor="#262626", edgecolor="#444444", fontsize=13)
@@ -2033,7 +2086,7 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
         cumulative_series["2026"],
         color=colors["2026"],
         linewidth=4.5,
-        label=f"2026 YTD (Avg: {avg_speeds['2026']:.1f}/day)"
+        label=f"{int(anchor_date_str[:4])} YTD (Avg: {avg_speeds['2026']:.1f}/day)"
     )
 
     # Draw horizontal lines for the surpassed years' totals
@@ -2138,11 +2191,14 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
     saved_files_log.append(f"Yearly cumulative comparison chart saved to {os.path.abspath(output_filename)}")
 
 
-def plot_monthly_projections(stats, completed_month_strs, slope, intercept, partial_stats=None, current_month_str=None, current_month_yoy_growth=None, output_filename="cve_monthly_stats_comparison_projection.png"):
+def plot_monthly_projections(stats, completed_month_strs, slope, intercept, partial_stats=None, current_month_str=None, current_month_yoy_growth=None, anchor_date=None, output_filename="cve_monthly_stats_comparison_projection.png"):
     """
     Generates a cumulative monthly publication comparison chart for 2025 vs 2026,
     including trend projections for remaining 2026 months and MoM growth annotations.
     """
+    # Display years derived from the data anchor (falls back to the clock if unset).
+    current_year = int(anchor_date[:4]) if anchor_date else datetime.now().year
+    prev_year = current_year - 1
     months_list = [f"{i:02d}" for i in range(1, 13)]
     months_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
@@ -2309,22 +2365,22 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
     ax.set_facecolor("#1E1E1E")
 
     # Plot 2025 as baseline
-    ax.plot(months_names, y_2025_cum, color="#70A1FF", marker="o", linestyle="-", linewidth=3.0, alpha=0.7, zorder=2, label="2025 Cumulative")
+    ax.plot(months_names, y_2025_cum, color="#70A1FF", marker="o", linestyle="-", linewidth=3.0, alpha=0.7, zorder=2, label=f"{prev_year} Cumulative")
     
     # Plot 2026 Projected (100k Target Baseline) from May (or earlier if comp < May) onwards
     x_proj_green = months_names[start_proj_idx:]
     y_proj_green = y_2026_proj_cum[start_proj_idx:]
     
-    ax.plot(x_proj_green, y_proj_green, color="#2ED573", marker="o", markerfacecolor="none", linestyle="--", linewidth=4.5, zorder=3, label="2026 Projected (100k Baseline)")
+    ax.plot(x_proj_green, y_proj_green, color="#2ED573", marker="o", markerfacecolor="none", linestyle="--", linewidth=4.5, zorder=3, label=f"{current_year} Projected (100k Baseline)")
 
     # Plot 2026 Run-rate Projected
     x_proj_rr = months_names[last_comp_idx:]
     y_runrate_proj_plot = y_2026_runrate_proj_cum[last_comp_idx:]
-    ax.plot(x_proj_rr, y_runrate_proj_plot, color="#FF4757", marker="o", markerfacecolor="none", linestyle="-.", linewidth=4.5, zorder=4, label="2026 Projected (Run-rate)")
+    ax.plot(x_proj_rr, y_runrate_proj_plot, color="#FF4757", marker="o", markerfacecolor="none", linestyle="-.", linewidth=4.5, zorder=4, label=f"{current_year} Projected (Run-rate)")
 
     # Plot 2026 Actual (Z-order 5 to keep on top)
     x_actual = months_names[:n_comp]
-    ax.plot(x_actual, y_2026_actual_cum[:n_comp], color="#FF4757", marker="o", linestyle="-", linewidth=4.5, zorder=5, label="2026 Cumulative (Actual)")
+    ax.plot(x_actual, y_2026_actual_cum[:n_comp], color="#FF4757", marker="o", linestyle="-", linewidth=4.5, zorder=5, label=f"{current_year} Cumulative (Actual)")
 
     # Annotate YoY percentages and values
     for i in range(12):
@@ -2511,7 +2567,7 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
             )
 
     ax.set_ylabel("Cumulative CVE Count", fontsize=22.5, fontweight="bold", color="#FFFFFF")  # 150% of 15
-    ax.set_title("Cumulative Monthly CVE Publications: 2025 vs 2026 Projections", fontsize=27, fontweight="bold", color="#FFFFFF", pad=20)
+    ax.set_title(f"Cumulative Monthly CVE Publications: {prev_year} vs {current_year} Projections", fontsize=27, fontweight="bold", color="#FFFFFF", pad=20)
     ax.grid(True, color="#444444", linestyle="--", alpha=0.5)
     ax.legend(loc="upper left", facecolor="#262626", edgecolor="#444444", fontsize=18)  # 150% of 12
     ax.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, loc: f"{int(x):,}"))
@@ -2715,7 +2771,7 @@ def generate(archive_path, out_dir):
         os.chdir(prev_cwd)
 
     charts = [
-        os.path.join(out_dir, name)
+        {"file": os.path.join(out_dir, name), "caption": CHART_CAPTIONS.get(name, "")}
         for name in CHART_FILES
         if os.path.exists(os.path.join(out_dir, name))
     ]
@@ -2892,6 +2948,7 @@ def _run_monthly(results, report_buf):
                 range_label,
                 prev_range_label,
                 prev_year_str,
+                anchor_date,
                 output_filename="cve_monthly_stats_comparison_incomplete_month.png",
             )
 
@@ -2993,4 +3050,5 @@ def _run_monthly(results, report_buf):
         partial_stats=partial_stats,
         current_month_str=current_month_str,
         current_month_yoy_growth=current_month_yoy_growth,
+        anchor_date=anchor_date,
     )
