@@ -20,6 +20,7 @@ import matplotlib
 matplotlib.use("Agg")  # headless: never needs a display in CI
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import matplotlib.image as mpimg
 import matplotlib.patheffects as path_effects
 
 from ..base import Dashboard, DashboardResult
@@ -123,6 +124,56 @@ YEAR_COLORS = {
     "2025": C_BLUE,
     "2026": C_RED,
 }
+
+# ── Watermark logo ───────────────────────────────────────────────────────────
+# Square, transparent-background Vulners logo, overlaid bottom-left on every
+# chart. Drop the file at src/assets/vulners_logo.png; if it is missing the
+# charts simply render without it (a one-time note is printed).
+_LOGO_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "assets", "vulners_logo.png"
+)  # -> src/assets/vulners_logo.png
+# Sized as a fraction of figure width so it looks the same on every chart when
+# the page scales each image to the same on-screen width. Tune these two if the
+# real logo reads too big/small. Height is derived to keep the square undistorted.
+_LOGO_WIDTH_FRAC = 0.07    # logo width as a fraction of the figure width
+_LOGO_MARGIN_FRAC = 0.015  # gap from the figure edges, fraction of figure width
+_logo_cache = None         # None = not loaded; False = missing/failed; array = loaded
+
+
+def _load_logo():
+    global _logo_cache
+    if _logo_cache is None:
+        if os.path.exists(_LOGO_PATH):
+            try:
+                _logo_cache = mpimg.imread(_LOGO_PATH)
+            except Exception as e:  # noqa: BLE001
+                print(f"Could not load logo {_LOGO_PATH}: {e}")
+                _logo_cache = False
+        else:
+            print(f"Logo not found at {_LOGO_PATH}; charts render without it.")
+            _logo_cache = False
+    return _logo_cache if _logo_cache is not False else None
+
+
+def _add_logo(fig, corners=("bottom-left",)):
+    """Overlay the square logo in the given figure corner(s), same physical size
+    on every chart (figure-fraction sizing keeps it undistorted)."""
+    logo = _load_logo()
+    if logo is None:
+        return
+    fw, fh = fig.get_size_inches()
+    aspect = fw / fh
+    w = _LOGO_WIDTH_FRAC              # fraction of width
+    h = _LOGO_WIDTH_FRAC * aspect     # fraction of height -> physically square
+    mx = _LOGO_MARGIN_FRAC
+    my = _LOGO_MARGIN_FRAC * aspect
+    for corner in corners:
+        x0 = mx if "left" in corner else 1 - mx - w
+        y0 = my  # bottom
+        ax_logo = fig.add_axes([x0, y0, w, h], zorder=1000)
+        ax_logo.imshow(logo, interpolation="antialiased")
+        ax_logo.axis("off")
+
 
 # Plotting functions below append their saved-file messages here. Kept so those
 # functions stay byte-for-byte identical to the original; not shown on the site.
@@ -1617,6 +1668,7 @@ def plot_custom_sankey_flow(
     ax.axis("off")
 
     plt.tight_layout()
+    _add_logo(fig)
     plt.savefig(
         output_filename,
         dpi=200,
@@ -1849,6 +1901,7 @@ def plot_incomplete_month_sankey(
     ax.axis("off")
 
     plt.tight_layout()
+    _add_logo(fig)
     plt.savefig(
         output_filename,
         dpi=200,
@@ -1987,6 +2040,7 @@ def plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str, outpu
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.98])
 
+    _add_logo(fig)
     plt.savefig(
         output_filename,
         bbox_inches="tight",
@@ -2199,6 +2253,7 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
     )
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.98])
+    _add_logo(fig)
     plt.savefig(
         output_filename,
         bbox_inches="tight",
@@ -2620,6 +2675,7 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
     )
 
     plt.tight_layout(rect=[0, 0.04, 1, 1])
+    _add_logo(fig)
     plt.savefig(
         output_filename,
         bbox_inches="tight",
@@ -2755,6 +2811,7 @@ def plot_cumulative_contribution_2026(daily_cna_counts_2026, anchor_date_str, ou
     )
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.98])
+    _add_logo(fig)
     plt.savefig(
         output_filename,
         bbox_inches="tight",
