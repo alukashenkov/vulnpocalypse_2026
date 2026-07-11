@@ -135,9 +135,10 @@ _LOGO_PATH = os.path.join(
 # Sized as a fraction of figure width so it looks the same on every chart when
 # the page scales each image to the same on-screen width. Tune these two if the
 # real logo reads too big/small. Height is derived to keep the square undistorted.
-_LOGO_WIDTH_FRAC = 0.07    # logo width as a fraction of the figure width
-_LOGO_MARGIN_FRAC = 0.015  # gap from the figure edges, fraction of figure width
-_logo_cache = None         # None = not loaded; False = missing/failed; array = loaded
+_LOGO_WIDTH_FRAC = 0.0525    # logo width as a fraction of the figure width
+_LOGO_MARGIN_X_FRAC = 0.006  # gap from the left edge, fraction of figure width
+_LOGO_MARGIN_Y_FRAC = 0.010  # gap from the bottom edge, fraction of figure height
+_logo_cache = None           # None = not loaded; False = missing/failed; array = loaded
 
 
 def _load_logo():
@@ -165,8 +166,8 @@ def _add_logo(fig, corners=("bottom-left",)):
     aspect = fw / fh
     w = _LOGO_WIDTH_FRAC              # fraction of width
     h = _LOGO_WIDTH_FRAC * aspect     # fraction of height -> physically square
-    mx = _LOGO_MARGIN_FRAC
-    my = _LOGO_MARGIN_FRAC * aspect
+    mx = _LOGO_MARGIN_X_FRAC
+    my = _LOGO_MARGIN_Y_FRAC
     for corner in corners:
         x0 = mx if "left" in corner else 1 - mx - w
         y0 = my  # bottom
