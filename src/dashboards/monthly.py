@@ -2164,10 +2164,17 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
         label=f"{int(anchor_date_str[:4])} YTD (Avg: {avg_speeds['2026']:.1f}/day)"
     )
 
-    # Draw horizontal lines for the surpassed years' totals
-    for info in surpassed_info:
-        prev_y = info["prev_year"]
-        prev_total = info["prev_total"]
+    # Horizontal guiding lines: any previous year whose full-year total 2026 has
+    # already reached OR is within 95% of. Surpassed years additionally get a
+    # star + "Surpassed ... on <date>" annotation below; approaching years
+    # (95%-100%) show the guiding line only.
+    final_2026 = cumulative_series["2026"][-1] if cumulative_series["2026"] else 0
+    guide_years = [
+        y for y in ["2022", "2023", "2024", "2025"]
+        if totals[y] > 0 and final_2026 >= 0.95 * totals[y]
+    ]
+    for prev_y in guide_years:
+        prev_total = totals[prev_y]
         ax.axhline(
             y=prev_total,
             color=colors[prev_y],
@@ -2188,6 +2195,10 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
             fontweight="bold"
         )
 
+    # Crossover stars + annotations for years 2026 has actually surpassed
+    for info in surpassed_info:
+        prev_y = info["prev_year"]
+        prev_total = info["prev_total"]
         # Plot crossover star marker on 2026 curve
         ax.plot(
             info["ref_date"],
