@@ -23,7 +23,7 @@ Full data tables for each dashboard are on the site's **Data Tables** page.
 
 ## Run it yourself
 
-You only need a free **Vulners API key** ([get one from your Vulners
+You only need a free trial **Vulners API key** ([get one from your Vulners
 account](https://vulners.com)). Then:
 
 1. **Fork** this repository (it must be **public** for free Actions minutes and Pages).
