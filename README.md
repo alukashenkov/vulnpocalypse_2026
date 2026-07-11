@@ -18,7 +18,6 @@ updated (there are no daily commits).
   Numbering Authority, YTD growth, the yearly cumulative curve, per-CNA cumulative
   contribution, a full-year projection from the observed monthly trend, and Sankey
   flows of how output moves month to month.
-- _EPSS exploit-prediction dashboard — planned._
 
 Full data tables for each dashboard are on the site's **Data Tables** page.
 
