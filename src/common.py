@@ -207,7 +207,7 @@ def build_site(results, out_dir):
         )
     index_body = (
         "<header>\n"
-        "  <h1>CVE Statistics Dashboard</h1>\n"
+        "  <h1>Vulnpocalypse 2026 Statistics Dashboard</h1>\n"
         f'  <p class="meta">Updated {generated} &middot; data from '
         '<a href="https://vulners.com">Vulners</a></p>\n'
         "</header>\n"
@@ -240,8 +240,8 @@ def build_site(results, out_dir):
 
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "index.html"), "w", encoding="utf-8") as f:
-        f.write(_html_page("CVE Statistics Dashboard", index_body))
+        f.write(_html_page("Vulnpocalypse 2026 Statistics Dashboard", index_body))
     with open(os.path.join(out_dir, "tables.html"), "w", encoding="utf-8") as f:
-        f.write(_html_page("CVE Statistics — Data Tables", tables_body))
+        f.write(_html_page("Vulnpocalypse 2026 — Data Tables", tables_body))
 
     print(f"Wrote index.html + tables.html to {out_dir}")

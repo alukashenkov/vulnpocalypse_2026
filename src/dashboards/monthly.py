@@ -43,12 +43,11 @@ REFERENCE_PREDICTIONS = {
 # Charts, in the order they appear on the page (written into the out_dir given
 # to generate()). These filenames match what the plotting functions emit.
 CHART_FILES = [
-    "cve_monthly_stats_comparison_projection.png",
-    "cve_monthly_stats_comparison_ytd_growth.png",
     "cve_monthly_stats_comparison_yearly_cumulative.png",
-    "cve_monthly_stats_comparison_cna_cumulative.png",
+    "cve_monthly_stats_comparison_ytd_growth.png",
     "cve_monthly_stats_comparison_incomplete_month.png",
     "cve_monthly_stats_comparison_sankey_monthly.png",
+    "cve_monthly_stats_comparison_projection.png",
 ]
 
 MONTHLY_BLURB = (
@@ -3055,7 +3054,3 @@ def _run_monthly(results, report_buf):
         current_month_str=current_month_str,
         current_month_yoy_growth=current_month_yoy_growth,
     )
-
-    # Generate 2026 CNA Cumulative Contribution chart
-    daily_cna_counts_2026 = results["daily_cna_counts_2026"]
-    plot_cumulative_contribution_2026(daily_cna_counts_2026, anchor_date)
