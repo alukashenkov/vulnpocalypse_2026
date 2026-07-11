@@ -1,4 +1,4 @@
-# CVE Statistics Dashboard
+# Vulnpocalypse 2026 Statistics Dashboard
 
 A free, self-updating dashboard of CVE / vulnerability statistics, built from the
 [Vulners](https://vulners.com) CVE archive and published to GitHub Pages.
