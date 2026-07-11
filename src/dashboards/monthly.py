@@ -2123,10 +2123,23 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
         if surpassed_idx is not None:
             surpassed_dt = dates_series["2026"][surpassed_idx]
             surpass_date_2026 = datetime(2026, surpassed_dt.month, surpassed_dt.day)
+            # Interpolate the exact intersection (where the 2026 line meets the
+            # guide at y = prev_total) so the star sits on the crossing point.
+            cross_x = surpassed_dt
+            if surpassed_idx > 0:
+                v0 = cumulative_series["2026"][surpassed_idx - 1]
+                v1 = cumulative_series["2026"][surpassed_idx]
+                x0 = dates_series["2026"][surpassed_idx - 1]
+                x1 = dates_series["2026"][surpassed_idx]
+                if v1 != v0:
+                    frac = min(max((prev_total - v0) / (v1 - v0), 0.0), 1.0)
+                    cross_x = x0 + (x1 - x0) * frac
             surpassed_info.append({
                 "prev_year": prev_y,
                 "prev_total": prev_total,
                 "ref_date": surpassed_dt,
+                "cross_x": cross_x,
+                "cross_y": prev_total,
                 "date_str": surpass_date_2026.strftime("%B %d, %Y"),
                 "short_date_str": surpass_date_2026.strftime("%b %d"),
                 "cumulative_2026_val": cumulative_series["2026"][surpassed_idx]
@@ -2204,10 +2217,10 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
     for info in surpassed_info:
         prev_y = info["prev_year"]
         prev_total = info["prev_total"]
-        # Plot crossover star marker on 2026 curve
+        # Plot crossover star marker at the exact 2026 x guide intersection
         ax.plot(
-            info["ref_date"],
-            info["cumulative_2026_val"],
+            info["cross_x"],
+            info["cross_y"],
             marker="*",
             color="#FFBB33",
             markersize=14,
@@ -2223,7 +2236,7 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
 
         ax.annotate(
             f"Surpassed {prev_y} Total on {info['short_date_str']}",
-            xy=(info["ref_date"], info["cumulative_2026_val"]),
+            xy=(info["cross_x"], info["cross_y"]),
             xytext=(x_off, y_off),
             textcoords="offset points",
             ha=ha,
