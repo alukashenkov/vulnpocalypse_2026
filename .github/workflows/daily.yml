@@ -2,12 +2,16 @@ name: Build & deploy CVE dashboard
 
 on:
   schedule:
-    - cron: "0 7 * * *"   # daily at 07:00 UTC
+    # Hourly from 05:30 UTC. GitHub's scheduler is best-effort and drops ticks,
+    # so we retry every hour; the gate stops once a build has deployed that day.
+    - cron: "30 5-23 * * *"
   workflow_dispatch: {}
 
-# Read-only except for Pages; the run never commits to the repo.
+# Read-only (plus Pages); the gate reads run history to see if today already
+# deployed. The run never commits to the repo.
 permissions:
   contents: read
+  actions: read
   pages: write
   id-token: write
 
@@ -17,10 +21,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # The dashboard freezes on the full-2026 snapshot. Scheduled runs stop after
-  # 2027-01-01; the 2027-01-01 run (and any manual run in 2027) is pinned to the
-  # complete 2026 dataset via CVE_CUT_OFF_DATE=2026-12-31 (a naive year-boundary
-  # run would otherwise mishandle the "current month"). Manual runs stay allowed.
+  # Decide whether to build this tick. Scheduled runs retry hourly but deploy at
+  # most once per day (stop after the first success). The dashboard also freezes
+  # on the full-2026 snapshot: scheduled runs stop after 2027-01-01, and any run
+  # in 2027 is pinned to the complete 2026 dataset via CVE_CUT_OFF_DATE=2026-12-31
+  # (a naive year-boundary run would mishandle the "current month"). Manual runs
+  # (workflow_dispatch) always proceed.
   gate:
     runs-on: ubuntu-latest
     outputs:
@@ -28,14 +34,32 @@ jobs:
       cutoff: ${{ steps.check.outputs.cutoff }}
     steps:
       - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           today=$(date -u +%Y-%m-%d)
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" || "$today" < "2027-01-02" ]]; then
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Frozen on the full-2026 snapshot; skipping scheduled run."
-            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          proceed=true
+          if [[ "${{ github.event_name }}" != "workflow_dispatch" ]]; then
+            if [[ "$today" > "2027-01-01" ]]; then
+              echo "Frozen on the full-2026 snapshot; skipping."
+              proceed=false
+            else
+              # Stop retrying once a build has already deployed today.
+              ids=$(gh api "repos/$REPO/actions/workflows/daily.yml/runs?per_page=50" \
+                    --jq "[.workflow_runs[] | select(.created_at >= \"${today}T00:00:00Z\") | .id] | .[]")
+              for id in $ids; do
+                done_today=$(gh api "repos/$REPO/actions/runs/$id/jobs" \
+                  --jq 'any(.jobs[]; .name == "build-and-deploy" and .conclusion == "success")')
+                if [[ "$done_today" == "true" ]]; then
+                  echo "A build already deployed today (run $id); stopping retries."
+                  proceed=false
+                  break
+                fi
+              done
+            fi
           fi
+          echo "proceed=$proceed" >> "$GITHUB_OUTPUT"
           if [[ "$today" > "2026-12-31" ]]; then
             echo "cutoff=2026-12-31" >> "$GITHUB_OUTPUT"
           else
