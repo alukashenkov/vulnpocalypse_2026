@@ -2954,17 +2954,20 @@ def plot_candidate_track(candidate_stats, output_filename="cve_monthly_stats_com
 
     mlabels = [f"{datetime.strptime(m, '%Y-%m').strftime('%b')}\n{totals[m]:,} CVEs" for m in months]
     ax.set_xticks(range(len(months)))
-    ax.set_xticklabels(mlabels, fontsize=13, fontweight="bold", color="#FFFFFF")
+    ax.set_xticklabels(mlabels, fontsize=19.5, fontweight="bold", color="#FFFFFF")
     ax.set_yticks(range(len(rows)))
     ax.set_yticklabels(rows, fontsize=12.5, fontweight="bold", color="#FFFFFF")
-    ax.tick_params(length=0)
+    # Months and monthly totals across the top of the chart.
+    ax.xaxis.set_ticks_position("top")
+    ax.tick_params(axis="x", labeltop=True, labelbottom=False, length=0)
+    ax.tick_params(axis="y", length=0)
 
     for i in range(len(rows)):
         for j in range(len(months)):
             v = int(mat[i, j])
             if v > 0:
                 ax.text(
-                    j, i, f"{v}", ha="center", va="center", fontsize=10.5, fontweight="bold",
+                    j, i, f"{v}", ha="center", va="center", fontsize=16, fontweight="bold",
                     color="#111111" if mat[i, j] > vmax * 0.5 else "#EAEAEA",
                 )
 
@@ -2972,7 +2975,7 @@ def plot_candidate_track(candidate_stats, output_filename="cve_monthly_stats_com
     ax.set_title(
         f"Hidden Volume: Who Feeds the Reserved (Candidate) Backlog  ·  {grand_total:,} CVEs in {year}\n"
         "cell = reserved CVEs each source touches that month",
-        color="#FFFFFF", fontsize=18, fontweight="bold", pad=16,
+        color="#FFFFFF", fontsize=18, fontweight="bold", pad=64,
     )
     for s in ("top", "right", "left", "bottom"):
         ax.spines[s].set_visible(False)
