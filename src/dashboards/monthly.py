@@ -3044,12 +3044,22 @@ def _run_monthly(results, report_buf):
                 prev_others_count=prev_others_count,
             )
 
-            # Generate the incomplete-month Sankey chart (PNG). Include every top
-            # CNA of the previous month in the named set so MoM (rightmost stop)
-            # contributors are shown as their own lanes across all three stops.
+            # Generate the incomplete-month Sankey chart (PNG). It shows exactly
+            # three partial periods: previous month (left), current month (center)
+            # and last year's same range (right). Name a CNA only if it is a top-N
+            # contributor in one of those THREE DISPLAYED periods. `top_names`
+            # already covers the current-month and last-year columns; add the top
+            # CNAs of the displayed previous-month column (this year, same range).
+            # Do NOT use prev_month_top_names here — it includes the previous
+            # month's *full prior-year* leaders, which the chart never shows.
             prev_month_name = months_map.get(prev_month_str, prev_month_str)
             prev_range_label = f"{prev_month_name[:3]} 1-{current_day}"
-            sankey_named_cnas = set(top_names) | prev_month_top_names
+            prev_shown_top = {
+                k for k, v in sorted(
+                    prev_data_2026_partial.items(), key=lambda kv: kv[1], reverse=True
+                )[:TOP_N] if v > 0
+            }
+            sankey_named_cnas = set(top_names) | prev_shown_top
             plot_incomplete_month_sankey(
                 data_2025_partial,
                 data_2026_partial,
