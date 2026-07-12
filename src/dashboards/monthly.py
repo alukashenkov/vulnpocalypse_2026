@@ -1553,7 +1553,7 @@ def plot_custom_sankey_flow(
 
     # Plot
     plt.style.use("dark_background")
-    fig, ax = plt.subplots(figsize=(19.25, 17.5), facecolor="#1E1E1E")
+    fig, ax = plt.subplots(figsize=(19.25, 22.5), facecolor="#1E1E1E")
     ax.set_facecolor("#1E1E1E")
 
     def get_curve_points(x1, y1, x2, y2, num_points=100):
@@ -1788,7 +1788,7 @@ def plot_incomplete_month_sankey(
     # for the (left-column) CNA name labels to clear the neighbouring column.
     plt.style.use("dark_background")
     fig_width = 9.0 + 4.5 * (len(stages) - 1)
-    fig, ax = plt.subplots(figsize=(fig_width, 17.5), facecolor="#1E1E1E")
+    fig, ax = plt.subplots(figsize=(fig_width, 22.5), facecolor="#1E1E1E")
     ax.set_facecolor("#1E1E1E")
 
     def get_curve_points(x1, y1, x2, y2, num_points=100):
