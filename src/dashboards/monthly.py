@@ -1461,6 +1461,7 @@ def plot_custom_sankey_flow(
     })
 
     # Stages 1 to K: Jan 2026 to anchor_month 2026
+    anchor_day = int(anchor_date[8:10])
     for m_int in range(1, int(anchor_month_str) + 1):
         m_str = f"{m_int:02d}"
         m_label = months_abbrev[m_str]
@@ -1468,7 +1469,9 @@ def plot_custom_sankey_flow(
         if m_str < anchor_month_str:
             m_data = stats.get(m_str, {}).get("2026", {})
         else:
+            # Anchor month is incomplete — show its day range in the header.
             m_data = partial_stats.get(m_str, {}).get("2026", {})
+            m_label = f"{m_label} 1-{anchor_day}"
 
         stages.append({
             "label": m_label,
