@@ -1604,7 +1604,7 @@ def plot_custom_sankey_flow(
             rect = plt.Rectangle((x_pos - 0.04, y_start), 0.08, y_end - y_start, facecolor=colors.get(item, "#747D8C"), edgecolor="none", zorder=3)
             ax.add_patch(rect)
             
-            # Label contribution value if it is > 0 (placed to the left of the block)
+            # Label the monthly contribution value if > 0 (placed to the right of the block)
             if val > 0:
                 if item == "Others":
                     cna_count = sum(1 for k, v in stage_data.items() if k not in sorted_top_names and v > 0)
@@ -1612,10 +1612,10 @@ def plot_custom_sankey_flow(
                 else:
                     label_text = f"{val}"
                 txt = ax.text(
-                    x_pos - 0.06,
+                    x_pos + 0.06,
                     y_center,
                     label_text,
-                    ha="right",
+                    ha="left",
                     va="center",
                     color="#FFFFFF",
                     fontsize=14,
@@ -1626,14 +1626,14 @@ def plot_custom_sankey_flow(
                     path_effects.Stroke(linewidth=2, foreground='#1E1E1E'),
                     path_effects.Normal()
                 ])
-            
-            # Only label CNA name at the first column (lane), printed inside the starting flow to save margin space
+
+            # Only label the CNA name at the first column, in the left margin
             if s == 0:
                 ax.text(
-                    x_pos + 0.06,
+                    x_pos - 0.06,
                     y_center,
                     item,
-                    ha="left",
+                    ha="right",
                     va="center",
                     color="#FFFFFF",
                     fontsize=18,
@@ -1664,7 +1664,7 @@ def plot_custom_sankey_flow(
         style="italic"
     )
 
-    ax.set_xlim(-0.35, len(stages) - 0.65)
+    ax.set_xlim(-1.0, len(stages) - 0.4)
     ax.set_ylim(-50, 1120)
     ax.axis("off")
 
@@ -1844,10 +1844,10 @@ def plot_incomplete_month_sankey(
                 else:
                     label_text = f"{val}"
                 txt = ax.text(
-                    x_pos - 0.06,
+                    x_pos + 0.06,
                     y_center,
                     label_text,
-                    ha="right",
+                    ha="left",
                     va="center",
                     color="#FFFFFF",
                     fontsize=14,
@@ -1859,13 +1859,13 @@ def plot_incomplete_month_sankey(
                     path_effects.Normal()
                 ])
 
-            # Label the CNA name once, at the first (2025) column.
+            # Label the CNA name once, in the left margin at the first column.
             if s == 0:
                 ax.text(
-                    x_pos + 0.06,
+                    x_pos - 0.06,
                     y_center,
                     item,
-                    ha="left",
+                    ha="right",
                     va="center",
                     color="#FFFFFF",
                     fontsize=18,
@@ -1897,7 +1897,7 @@ def plot_incomplete_month_sankey(
         style="italic"
     )
 
-    ax.set_xlim(-0.55, len(stages) - 0.45)
+    ax.set_xlim(-1.1, len(stages) - 0.35)
     ax.set_ylim(-50, 1120)
     ax.axis("off")
 
