@@ -1507,7 +1507,7 @@ def plot_custom_sankey_flow(
     # Compute stacked positions centered at y = 500, scaled by absolute volumes
     gap = 12
     num_items = len(all_items)
-    max_avail_height = 1000 - (num_items - 1) * gap
+    max_avail_height = 1050 - (num_items - 1) * gap
 
     stage_positions = []
     for s, stage in enumerate(stages):
@@ -1520,7 +1520,7 @@ def plot_custom_sankey_flow(
         
         pos = {}
         # Center the stack vertically at y = 500
-        curr_y = 500.0 + stage_total_height / 2.0
+        curr_y = 475.0 + stage_total_height / 2.0
         for item in all_items:
             # Item's height is proportional to its absolute volume
             h = (volumes[item] / total_vol) * avail_height
@@ -1553,7 +1553,7 @@ def plot_custom_sankey_flow(
 
     # Plot
     plt.style.use("dark_background")
-    fig, ax = plt.subplots(figsize=(19.25, 22.5), facecolor="#1E1E1E")
+    fig, ax = plt.subplots(figsize=(19.25, 17.5), facecolor="#1E1E1E")
     ax.set_facecolor("#1E1E1E")
 
     def get_curve_points(x1, y1, x2, y2, num_points=100):
@@ -1744,7 +1744,7 @@ def plot_incomplete_month_sankey(
     # Compute stacked positions centered at y = 500, scaled by absolute volumes
     gap = 12
     num_items = len(all_items)
-    max_avail_height = 1000 - (num_items - 1) * gap
+    max_avail_height = 1050 - (num_items - 1) * gap
 
     stage_positions = []
     for s, stage in enumerate(stages):
@@ -1755,7 +1755,7 @@ def plot_incomplete_month_sankey(
         stage_total_height = avail_height + (num_items - 1) * gap
 
         pos = {}
-        curr_y = 500.0 + stage_total_height / 2.0
+        curr_y = 475.0 + stage_total_height / 2.0
         for item in all_items:
             h = (volumes[item] / total_vol) * avail_height
             y_start = curr_y - h
@@ -1788,7 +1788,7 @@ def plot_incomplete_month_sankey(
     # for the (left-column) CNA name labels to clear the neighbouring column.
     plt.style.use("dark_background")
     fig_width = 9.0 + 4.5 * (len(stages) - 1)
-    fig, ax = plt.subplots(figsize=(fig_width, 22.5), facecolor="#1E1E1E")
+    fig, ax = plt.subplots(figsize=(fig_width, 17.5), facecolor="#1E1E1E")
     ax.set_facecolor("#1E1E1E")
 
     def get_curve_points(x1, y1, x2, y2, num_points=100):
