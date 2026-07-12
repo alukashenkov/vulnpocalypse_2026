@@ -105,14 +105,14 @@ CHART_CAPTIONS = {
         "slope means call the cavalry."
     ),
     "cve_monthly_stats_comparison_candidate_track.png": (
-        "And here is the part nobody counts. Every bar is CVE IDs already handed "
-        "out and sitting reserved — placeholders with no published record yet, so "
-        "they never show up in the numbers above. This is the queue behind the "
-        "curtain, the storm still out at sea. The taller bars are the raw reserved "
-        "volume; the shorter ones are the ones already carrying an OSV or GitHub "
-        "reference, quietly wired up and waiting for the lights to come on. "
-        "Whatever the rest of this page frightened you with, remember it hasn't "
-        "counted these yet."
+        "And here is the part nobody counts. These are CVE IDs already reserved "
+        "but not yet published — the queue behind the curtain, the storm still out "
+        "at sea, none of it counted in the numbers above. Each month's column "
+        "ranks the sources feeding that backlog by how many reserved CVEs they "
+        "touch, and every source keeps the same color across months. So when a new "
+        "one shoulders into the top — a color that wasn't there last month — you "
+        "are watching the next wave form before it breaks. Whatever the rest of "
+        "this page frightened you with, it hasn't counted these yet."
     ),
 }
 
@@ -274,15 +274,20 @@ def count_monthly_cves(file_path, cut_off_date=None):
                     ):
                         mkey = published_date[:7]
                         candidate_stats[mkey]["rejected" if is_rejected else "active"] += 1
+                        # Count each source once per CVE (presence, not reference
+                        # multiplicity) so overlapping refs don't double-count.
                         ench = item.get("enchantments")
                         if isinstance(ench, dict):
                             deps = ench.get("dependencies")
                             if isinstance(deps, dict):
                                 refs = deps.get("references")
                                 if isinstance(refs, list):
-                                    for ref in refs:
-                                        if isinstance(ref, dict) and ref.get("type"):
-                                            candidate_stats[mkey]["ref_types"][ref["type"]] += 1
+                                    src_types = {
+                                        ref["type"] for ref in refs
+                                        if isinstance(ref, dict) and ref.get("type")
+                                    }
+                                    for t in src_types:
+                                        candidate_stats[mkey]["ref_types"][t] += 1
                     continue
 
                 if is_rejected:
@@ -2899,75 +2904,84 @@ def plot_cumulative_contribution_2026(daily_cna_counts_2026, anchor_date_str, ou
     saved_files_log.append(f"Yearly cumulative contribution chart saved to {os.path.abspath(output_filename)}")
 
 
+# Fixed color per source, so a source keeps its hue across every month and a
+# newcomer shows up as a colour that wasn't there before. Drawn from the same
+# family as the rest of the dashboard.
+SOURCE_PALETTE = [
+    C_RED, C_BLUE, C_GREEN, C_YELLOW, "#E84393", "#FF9F43",
+    "#9B59B6", "#00D2D3", "#A55EEA", "#1DD1A1", "#EE5253", "#10AC84",
+]
+_CAND_TOP_PER_MONTH = 6
+
+
 def plot_candidate_track(candidate_stats, output_filename="cve_monthly_stats_comparison_candidate_track.png"):
-    """Grouped monthly bar chart of the hidden reserved/candidate CVE volume:
-    total candidates plus how many already carry OSV / GitHub references."""
-    sorted_months = sorted(candidate_stats.keys())
-    if not sorted_months:
+    """Small multiples: for each month, the top sources feeding the reserved /
+    candidate CVE backlog, ranked by how many reserved CVEs each source touches.
+    Every source keeps a fixed colour across months, so a new source (a colour
+    that wasn't there last month) stands out."""
+    months = sorted(candidate_stats.keys())
+    if not months:
         return
 
-    total_candidates = [candidate_stats[m]["active"] + candidate_stats[m]["rejected"] for m in sorted_months]
-    osv_counts = [candidate_stats[m]["ref_types"].get("osv", 0) for m in sorted_months]
-    github_counts = [candidate_stats[m]["ref_types"].get("github", 0) for m in sorted_months]
+    totals = {m: candidate_stats[m]["active"] + candidate_stats[m]["rejected"] for m in months}
+    overall = collections.Counter()
+    for m in months:
+        overall.update(candidate_stats[m]["ref_types"])
+    grand_total = sum(totals.values())
 
-    series = [
-        ("Total Reserved", total_candidates, C_BLUE),
-        ("With OSV Reference", osv_counts, C_GREEN),
-        ("With GitHub Reference", github_counts, C_GRAY),
-    ]
+    # Assign a fixed colour to the biggest sources overall; the rest are gray.
+    top_overall = [s for s, _ in overall.most_common(len(SOURCE_PALETTE))]
+    source_color = {s: SOURCE_PALETTE[i] for i, s in enumerate(top_overall)}
+
+    max_val = max(
+        (max(candidate_stats[m]["ref_types"].values(), default=0) for m in months),
+        default=1,
+    )
 
     plt.style.use("dark_background")
-    fig, ax = plt.subplots(figsize=(14, 8), facecolor="#1E1E1E")
-    ax.set_facecolor("#1E1E1E")
+    fig, axes = plt.subplots(
+        1, len(months),
+        figsize=(max(14, len(months) * 2.4), 8.5),
+        facecolor="#1E1E1E",
+    )
+    if len(months) == 1:
+        axes = [axes]
 
-    x = np.arange(len(sorted_months))
-    n = len(series)
-    width = 0.8 / n
-    rects_list = []
-    for i, (name, counts, color) in enumerate(series):
-        offset = (i - (n - 1) / 2) * width
-        rects_list.append(ax.bar(x + offset, counts, width, label=f"{name} ({sum(counts):,})", color=color))
+    year = months[0][:4]
+    fig.suptitle(
+        f"Hidden Volume: Who Feeds the Reserved (Candidate) Backlog  ·  {grand_total:,} CVEs in {year}",
+        color="#FFFFFF", fontsize=21, fontweight="bold", y=0.98,
+    )
 
-    year = sorted_months[0][:4]
-    labels = [datetime.strptime(m, "%Y-%m").strftime("%b") for m in sorted_months]
-    ax.set_ylabel("Reserved CVE Count", fontsize=16, color="#E0E0E0", fontweight="bold", labelpad=10)
-    ax.set_title(f"Hidden Volume: Reserved (Candidate) CVEs by Month ({year})",
-                 fontsize=18, fontweight="bold", pad=20, color="#FFFFFF")
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=15, color="#E0E0E0", fontweight="bold")
-    ax.grid(True, linestyle="--", alpha=0.2, color="#888888")
-    ax.set_axisbelow(True)
-    ax.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda val, loc: f"{int(val):,}"))
-    ax.tick_params(colors="#E0E0E0", labelsize=15)
-    for lbl in ax.get_yticklabels():
-        lbl.set_fontweight("bold")
-    for spine in ("top", "right"):
-        ax.spines[spine].set_visible(False)
-    for spine in ("left", "bottom"):
-        ax.spines[spine].set_color("#777777")
-
-    legend = ax.legend(frameon=True, facecolor="#262626", edgecolor="#444444", fontsize=13, loc="upper left")
-    for text in legend.get_texts():
-        text.set_color("#E0E0E0")
-        text.set_fontweight("bold")
-
-    for rects in rects_list:
-        for rect in rects:
-            h = rect.get_height()
-            if h > 0:
-                ax.annotate(
-                    f"{int(h):,}",
-                    xy=(rect.get_x() + rect.get_width() / 2, h),
-                    xytext=(0, 4), textcoords="offset points",
-                    ha="center", va="bottom", fontsize=9, color="#FFFFFF", fontweight="semibold"
-                )
+    for ax, m in zip(axes, months):
+        ax.set_facecolor("#1E1E1E")
+        items = candidate_stats[m]["ref_types"].most_common(_CAND_TOP_PER_MONTH)
+        names = [n for n, _ in items][::-1]   # biggest at the top
+        vals = [v for _, v in items][::-1]
+        y = np.arange(len(names))
+        cols = [source_color.get(n, C_GRAY) for n in names]
+        ax.barh(y, vals, height=0.7, color=cols, zorder=3)
+        for yi, (n, v) in enumerate(zip(names, vals)):
+            label = n if len(n) <= 15 else n[:14] + "…"
+            txt = ax.text(v + max_val * 0.04, yi, f"{label}  {v}", va="center", ha="left",
+                          color="#E8E8E8", fontsize=10, fontweight="bold", zorder=4)
+            txt.set_path_effects([
+                path_effects.Stroke(linewidth=2, foreground="#1E1E1E"),
+                path_effects.Normal(),
+            ])
+        ml = datetime.strptime(m, "%Y-%m").strftime("%b")
+        ax.set_title(f"{ml}\n{totals[m]:,} CVEs", color="#FFFFFF", fontsize=14, fontweight="bold", pad=10)
+        ax.set_xlim(0, max_val * 2.2)
+        ax.set_ylim(-0.7, _CAND_TOP_PER_MONTH - 0.3)
+        ax.axis("off")
 
     plt.figtext(
-        0.5, 0.01,
+        0.5, 0.02,
+        "Bars = reserved CVEs each source touches (a CVE can be touched by several).  "
         f"Generated on {datetime.now().strftime('%Y-%m-%d')} | Data Source: Vulners CVE Archive",
-        ha="center", fontsize=12, color="#747D8C", style="italic", fontweight="bold"
+        ha="center", fontsize=12, color="#747D8C", style="italic", fontweight="bold",
     )
-    plt.tight_layout(rect=[0, 0.03, 1, 1])
+    plt.tight_layout(rect=[0, 0.05, 1, 0.93])
     _add_logo(fig)
     plt.savefig(output_filename, dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor(), edgecolor="none")
     plt.close()
