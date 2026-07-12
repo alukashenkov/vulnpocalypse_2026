@@ -52,6 +52,7 @@ CHART_FILES = [
     "cve_monthly_stats_comparison_incomplete_month.png",
     "cve_monthly_stats_comparison_sankey_monthly.png",
     "cve_monthly_stats_comparison_projection.png",
+    "cve_monthly_stats_comparison_candidate_track.png",
 ]
 
 MONTHLY_BLURB = (
@@ -102,6 +103,16 @@ CHART_CAPTIONS = {
         "baseline. Both land well above where the prior year finished, which "
         "already reads like the good old days. The asterisks mean projection. The "
         "slope means call the cavalry."
+    ),
+    "cve_monthly_stats_comparison_candidate_track.png": (
+        "And here is the part nobody counts. Every bar is CVE IDs already handed "
+        "out and sitting reserved — placeholders with no published record yet, so "
+        "they never show up in the numbers above. This is the queue behind the "
+        "curtain, the storm still out at sea. The taller bars are the raw reserved "
+        "volume; the shorter ones are the ones already carrying an OSV or GitHub "
+        "reference, quietly wired up and waiting for the lights to come on. "
+        "Whatever the rest of this page frightened you with, remember it hasn't "
+        "counted these yet."
     ),
 }
 
@@ -201,6 +212,11 @@ def count_monthly_cves(file_path, cut_off_date=None):
     daily_cna_counts_2026 = collections.defaultdict(collections.Counter)
     # daily_counts[year_str][month_day_str] = count
     daily_counts = collections.defaultdict(collections.Counter)
+    # candidate_stats["YYYY-MM"] = {"active", "rejected", "ref_types": Counter}
+    # The "hidden" reserved/candidate CVEs, excluded from the main counts.
+    candidate_stats = collections.defaultdict(
+        lambda: {"active": 0, "rejected": 0, "ref_types": collections.Counter()}
+    )
 
     if cut_off_date:
         now = datetime.strptime(cut_off_date, "%Y-%m-%d")
@@ -217,6 +233,7 @@ def count_monthly_cves(file_path, cut_off_date=None):
         current_day = now.day
 
     anchor_date_str = now.strftime("%Y-%m-%d")
+    anchor_year = anchor_date_str[:4]
 
     total_processed = 0
     relevant_found = 0
@@ -242,9 +259,33 @@ def count_monthly_cves(file_path, cut_off_date=None):
                 vuln_status = item.get("vulnStatus")
                 reporter = item.get("reporter")
 
-                if vuln_status and vuln_status.lower() == "rejected":
+                is_rejected = bool(vuln_status) and vuln_status.lower() == "rejected"
+                is_candidate = bool(reporter) and reporter.lower() == "candidate"
+
+                # Candidate (reserved / not-yet-published) CVEs are excluded from
+                # the main counts, but tracked separately as the "hidden" volume:
+                # active vs rejected, plus OSV/GitHub reference presence, by month
+                # of the current year up to the anchor date.
+                if is_candidate:
+                    if (
+                        published_date and len(published_date) >= 10
+                        and published_date[:4] == anchor_year
+                        and published_date[:10] <= anchor_date_str
+                    ):
+                        mkey = published_date[:7]
+                        candidate_stats[mkey]["rejected" if is_rejected else "active"] += 1
+                        ench = item.get("enchantments")
+                        if isinstance(ench, dict):
+                            deps = ench.get("dependencies")
+                            if isinstance(deps, dict):
+                                refs = deps.get("references")
+                                if isinstance(refs, list):
+                                    for ref in refs:
+                                        if isinstance(ref, dict) and ref.get("type"):
+                                            candidate_stats[mkey]["ref_types"][ref["type"]] += 1
                     continue
-                if reporter and reporter.lower() == "candidate":
+
+                if is_rejected:
                     continue
 
                 if published_date and len(published_date) >= 10:
@@ -302,6 +343,7 @@ def count_monthly_cves(file_path, cut_off_date=None):
         "daily_counts_2026": daily_counts_2026,
         "daily_counts": daily_counts,
         "daily_cna_counts_2026": daily_cna_counts_2026,
+        "candidate_stats": candidate_stats,
     }
 
 
@@ -2857,6 +2899,81 @@ def plot_cumulative_contribution_2026(daily_cna_counts_2026, anchor_date_str, ou
     saved_files_log.append(f"Yearly cumulative contribution chart saved to {os.path.abspath(output_filename)}")
 
 
+def plot_candidate_track(candidate_stats, output_filename="cve_monthly_stats_comparison_candidate_track.png"):
+    """Grouped monthly bar chart of the hidden reserved/candidate CVE volume:
+    total candidates plus how many already carry OSV / GitHub references."""
+    sorted_months = sorted(candidate_stats.keys())
+    if not sorted_months:
+        return
+
+    total_candidates = [candidate_stats[m]["active"] + candidate_stats[m]["rejected"] for m in sorted_months]
+    osv_counts = [candidate_stats[m]["ref_types"].get("osv", 0) for m in sorted_months]
+    github_counts = [candidate_stats[m]["ref_types"].get("github", 0) for m in sorted_months]
+
+    series = [
+        ("Total Reserved", total_candidates, C_BLUE),
+        ("With OSV Reference", osv_counts, C_GREEN),
+        ("With GitHub Reference", github_counts, C_GRAY),
+    ]
+
+    plt.style.use("dark_background")
+    fig, ax = plt.subplots(figsize=(14, 8), facecolor="#1E1E1E")
+    ax.set_facecolor("#1E1E1E")
+
+    x = np.arange(len(sorted_months))
+    n = len(series)
+    width = 0.8 / n
+    rects_list = []
+    for i, (name, counts, color) in enumerate(series):
+        offset = (i - (n - 1) / 2) * width
+        rects_list.append(ax.bar(x + offset, counts, width, label=f"{name} ({sum(counts):,})", color=color))
+
+    year = sorted_months[0][:4]
+    labels = [datetime.strptime(m, "%Y-%m").strftime("%b") for m in sorted_months]
+    ax.set_ylabel("Reserved CVE Count", fontsize=16, color="#E0E0E0", fontweight="bold", labelpad=10)
+    ax.set_title(f"Hidden Volume: Reserved (Candidate) CVEs by Month ({year})",
+                 fontsize=18, fontweight="bold", pad=20, color="#FFFFFF")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=15, color="#E0E0E0", fontweight="bold")
+    ax.grid(True, linestyle="--", alpha=0.2, color="#888888")
+    ax.set_axisbelow(True)
+    ax.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda val, loc: f"{int(val):,}"))
+    ax.tick_params(colors="#E0E0E0", labelsize=15)
+    for lbl in ax.get_yticklabels():
+        lbl.set_fontweight("bold")
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    for spine in ("left", "bottom"):
+        ax.spines[spine].set_color("#777777")
+
+    legend = ax.legend(frameon=True, facecolor="#262626", edgecolor="#444444", fontsize=13, loc="upper left")
+    for text in legend.get_texts():
+        text.set_color("#E0E0E0")
+        text.set_fontweight("bold")
+
+    for rects in rects_list:
+        for rect in rects:
+            h = rect.get_height()
+            if h > 0:
+                ax.annotate(
+                    f"{int(h):,}",
+                    xy=(rect.get_x() + rect.get_width() / 2, h),
+                    xytext=(0, 4), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=9, color="#FFFFFF", fontweight="semibold"
+                )
+
+    plt.figtext(
+        0.5, 0.01,
+        f"Generated on {datetime.now().strftime('%Y-%m-%d')} | Data Source: Vulners CVE Archive",
+        ha="center", fontsize=12, color="#747D8C", style="italic", fontweight="bold"
+    )
+    plt.tight_layout(rect=[0, 0.03, 1, 1])
+    _add_logo(fig)
+    plt.savefig(output_filename, dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.close()
+    saved_files_log.append(f"Saved candidate track chart to {os.path.abspath(output_filename)}")
+
+
 def generate(archive_path, out_dir):
     """Run the monthly analysis and build its charts + report.
 
@@ -3172,3 +3289,6 @@ def _run_monthly(results, report_buf):
         current_month_yoy_growth=current_month_yoy_growth,
         anchor_date=anchor_date,
     )
+
+    # Hidden volume: reserved/candidate CVEs (last chart on the dashboard).
+    plot_candidate_track(results.get("candidate_stats", {}))
