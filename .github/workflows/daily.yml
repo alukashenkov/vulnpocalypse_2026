@@ -2,9 +2,13 @@ name: Build & deploy CVE dashboard
 
 on:
   schedule:
-    # Hourly from 05:30 UTC. GitHub's scheduler is best-effort and drops ticks,
-    # so we retry every hour; the gate stops once a build has deployed that day.
-    - cron: "30 5-23 * * *"
+    # Hourly from 05:30 to 20:30 UTC. GitHub's scheduler is best-effort: it drops
+    # ticks and delivers others 1-2h late, so we retry every hour and the gate
+    # stops once a build has deployed that day. The early ticks are deliberate --
+    # a lagging 05:30 tick lands near the 07:00 UTC floor the gate enforces. The
+    # run stops at 20:30 so a delayed tick cannot arrive after midnight and claim
+    # the next day's build slot.
+    - cron: "30 5-20 * * *"
   workflow_dispatch: {}
 
 # Read-only (plus Pages); the gate reads run history to see if today already
@@ -22,11 +26,13 @@ concurrency:
 
 jobs:
   # Decide whether to build this tick. Scheduled runs retry hourly but deploy at
-  # most once per day (stop after the first success). The dashboard also freezes
-  # on the full-2026 snapshot: scheduled runs stop after 2027-01-01, and any run
-  # in 2027 is pinned to the complete 2026 dataset via CVE_CUT_OFF_DATE=2026-12-31
-  # (a naive year-boundary run would mishandle the "current month"). Manual runs
-  # (workflow_dispatch) always proceed.
+  # most once per day (stop after the first success), and never before 07:00 UTC:
+  # the analysis reports "through yesterday", and yesterday's upstream data is not
+  # settled until then, so an earlier build undercounts its own final day. The
+  # dashboard also freezes on the full-2026 snapshot: scheduled runs stop after
+  # 2027-01-01, and any run in 2027 is pinned to the complete 2026 dataset via
+  # CVE_CUT_OFF_DATE=2026-12-31 (a naive year-boundary run would mishandle the
+  # "current month"). Manual runs (workflow_dispatch) always proceed.
   gate:
     runs-on: ubuntu-latest
     outputs:
@@ -43,6 +49,12 @@ jobs:
           if [[ "${{ github.event_name }}" != "workflow_dispatch" ]]; then
             if [[ "$today" > "2027-01-01" ]]; then
               echo "Frozen on the full-2026 snapshot; skipping."
+              proceed=false
+            elif (( 10#$(date -u +%H) < 7 )); then
+              # Cron alone cannot hold this line: a tick scheduled for 20:30 can
+              # be delivered after midnight, and such a run would otherwise build
+              # pre-dawn and burn the new day's slot on undercounted data.
+              echo "Before 07:00 UTC; too early to build."
               proceed=false
             else
               # Stop retrying once a build has already deployed today.
