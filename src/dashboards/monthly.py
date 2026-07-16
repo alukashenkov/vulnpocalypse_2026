@@ -2264,41 +2264,6 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
             fontweight="bold"
         )
 
-    # Crossover stars + annotations for years 2026 has actually surpassed
-    for info in surpassed_info:
-        prev_y = info["prev_year"]
-        prev_total = info["prev_total"]
-        # Plot crossover star marker at the exact 2026 x guide intersection
-        ax.plot(
-            info["cross_x"],
-            info["cross_y"],
-            marker="*",
-            color="#FFBB33",
-            markersize=14,
-            markeredgecolor="#FFFFFF",
-            zorder=5
-        )
-
-        # Annotate crossover points with curved arrows
-        # Use a uniform offset to make the arrow lines parallel and prevent them from crossing
-        # and place them closer to the points.
-        x_off, y_off = -50, 35
-        ha, va = "right", "bottom"
-
-        ax.annotate(
-            f"Surpassed {prev_y} Total on {info['short_date_str']}",
-            xy=(info["cross_x"], info["cross_y"]),
-            xytext=(x_off, y_off),
-            textcoords="offset points",
-            ha=ha,
-            va=va,
-            fontsize=12,
-            fontweight="bold",
-            color="#FFFFFF",
-            bbox=dict(boxstyle="round,pad=0.4", fc="#262626", ec=colors[prev_y], alpha=0.9, lw=1.5),
-            arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=0.2", color=colors[prev_y], lw=1.5)
-        )
-
     ax.grid(True, color="#444444", linestyle="--", alpha=0.5)
     ax.set_ylabel("Cumulative CVE Count", fontsize=16, fontweight="bold", color="#FFFFFF")
     ax.set_title("Year-over-Year Cumulative CVE Publications Comparison", fontsize=18, fontweight="bold", color="#FFFFFF", pad=28)
@@ -2320,7 +2285,49 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
     ax.tick_params(colors="#CCCCCC", labelsize=13)
 
     # Add legend
-    ax.legend(loc="upper left", facecolor="#262626", edgecolor="#444444", fontsize=13)
+    legend = ax.legend(loc="upper left", facecolor="#262626", edgecolor="#444444", fontsize=13)
+
+    # Crossover stars + annotations for years 2026 has actually surpassed. These
+    # come last: the callouts are measured against the legend and the axes
+    # transform, so both must already be final.
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    legend_bbox = legend.get_window_extent(renderer)
+    for info in surpassed_info:
+        prev_y = info["prev_year"]
+        # Plot crossover star marker at the exact 2026 x guide intersection
+        ax.plot(
+            info["cross_x"],
+            info["cross_y"],
+            marker="*",
+            color="#FFBB33",
+            markersize=14,
+            markeredgecolor="#FFFFFF",
+            zorder=5
+        )
+
+        # Offset the callout up and to the left: a uniform offset keeps the arrow
+        # lines parallel and prevents them from crossing. A high crossing lands
+        # that box under the upper-left legend, so it flips to the clear space on
+        # the right instead (mirroring the arc so the arrow still bows outward).
+        ann = ax.annotate(
+            f"Surpassed {prev_y} Total on {info['short_date_str']}",
+            xy=(info["cross_x"], info["cross_y"]),
+            xytext=(-50, 35),
+            textcoords="offset points",
+            ha="right",
+            va="bottom",
+            fontsize=12,
+            fontweight="bold",
+            color="#FFFFFF",
+            bbox=dict(boxstyle="round,pad=0.4", fc="#262626", ec=colors[prev_y], alpha=0.9, lw=1.5),
+            arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=0.2", color=colors[prev_y], lw=1.5)
+        )
+        # Pad the measured text box to cover the rounded bbox drawn around it.
+        if ann.get_window_extent(renderer).expanded(1.08, 1.25).overlaps(legend_bbox):
+            ann.xyann = (50, 35)
+            ann.set_horizontalalignment("left")
+            ann.arrow_patch.set_connectionstyle("arc3,rad=-0.2")
 
     plt.figtext(
         0.5,
