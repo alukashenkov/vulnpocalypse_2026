@@ -2676,9 +2676,14 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
                 rr_offset_yoy, rr_va_yoy = -48, "top"
                 rr_offset_val, rr_va_val = -18, "top"
 
-            # Run-rate YoY% label
+            # Run-rate YoY% label. The current month's rate is measured against the
+            # same slice of last year (see current_month_yoy_growth), so it is an
+            # incomplete actual, not a forecast: keep the dotted frame to mark it
+            # partial, but drop the '*', which the footer defines as a projection.
+            # Later months' rates come off the regression and stay starred.
+            yoy_rr_text = f"{yoy_runrate:+5.1f}%" if i == cur_month_idx else f"{yoy_runrate:+5.1f}%*"
             ax.annotate(
-                f"{yoy_runrate:+5.1f}%*",
+                yoy_rr_text,
                 xy=(i, val_runrate),
                 xytext=(0, rr_offset_yoy),
                 textcoords="offset points",
