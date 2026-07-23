@@ -2238,7 +2238,7 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
             color=colors[y],
             linewidth=2.5,
             alpha=0.85,
-            label=f"{y} (Avg: {avg_speeds[y]:.1f}/day)"
+            label=f"{y} (Total: {totals[y]:,} | Avg: {avg_speeds[y]:.1f}/day)"
         )
 
     # Plot 2026 curve
@@ -2247,13 +2247,18 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
         cumulative_series["2026"],
         color=colors["2026"],
         linewidth=4.5,
-        label=f"{int(anchor_date_str[:4])} YTD (Avg: {avg_speeds['2026']:.1f}/day)"
+        label=(
+            f"{int(anchor_date_str[:4])} YTD "
+            f"(Total: {totals['2026']:,} | Avg: {avg_speeds['2026']:.1f}/day)"
+        )
     )
 
     # Horizontal guiding lines: any previous year whose full-year total 2026 has
     # already reached OR is within 95% of. Surpassed years additionally get a
     # star + "Surpassed ... on <date>" annotation below; approaching years
-    # (95%-100%) show the guiding line only.
+    # (95%-100%) show the guiding line only. The totals themselves live in the
+    # legend, where every year has one — the guides only mark the few that are
+    # in play, so labelling them on the right told a partial story twice.
     final_2026 = cumulative_series["2026"][-1] if cumulative_series["2026"] else 0
     guide_years = [
         y for y in ["2022", "2023", "2024", "2025"]
@@ -2274,17 +2279,6 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
             alpha=0.6,
             zorder=1
         )
-        # Label on the right margin
-        ax.text(
-            ref_dates[-1] + timedelta(days=2),
-            prev_total,
-            f"{prev_y} Total: {prev_total:,}",
-            color=colors[prev_y],
-            va="center",
-            ha="left",
-            fontsize=11,
-            fontweight="bold"
-        )
 
     ax.grid(True, color="#444444", linestyle="--", alpha=0.5)
     ax.set_ylabel("Cumulative CVE Count", fontsize=16, fontweight="bold", color="#FFFFFF")
@@ -2292,8 +2286,8 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
     ax.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, loc: f"{int(x):,}"))
     ax.set_ylim(bottom=0)
 
-    # Set x limits with right margin for text labels
-    ax.set_xlim(ref_dates[0], ref_dates[-1] + timedelta(days=22))
+    # No right-margin labels any more, so only enough room for the "Jan" tick.
+    ax.set_xlim(ref_dates[0], ref_dates[-1] + timedelta(days=6))
 
     # Format X-axis to show month names
     ax.xaxis.set_major_locator(mdates.MonthLocator())
