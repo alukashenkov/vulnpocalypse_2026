@@ -33,6 +33,11 @@ TOP_N = 15
 CUT_OFF_DATE = os.getenv("CVE_CUT_OFF_DATE") or None
 _WRITE_CSV = False   # published path writes no CSV; a local caller may flip this
 
+# Last day the numbers actually cover (the anchor). Set by count_monthly_cves()
+# and stamped into every chart footer next to the generation date; the two are
+# never the same day, and a stale upstream dump makes them drift further apart.
+_DATA_THROUGH = None
+
 # Frozen reference predictions calculated on June 6, 2026 (Jan-May completed).
 REFERENCE_PREDICTIONS = {
     "06": 7479,
@@ -193,6 +198,20 @@ def _add_logo(fig, corners=("bottom-left",)):
 saved_files_log = []
 
 
+def _stamp():
+    """Footer stamp: when the charts were drawn *and* what date the data runs to.
+
+    The build date alone is misleading — the counts stop at the anchor (the last
+    full day) and the upstream archive dump is cut a few hours before that, so a
+    rebuild always advances "Generated on" even when nothing new has landed.
+    Printing both makes a flat day read as flat data, not a broken build.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    if not _DATA_THROUGH:
+        return f"Generated on {today}"
+    return f"Generated on {today} | Data through {_DATA_THROUGH}"
+
+
 def count_monthly_cves(file_path, cut_off_date=None):
     """
     Counts CVEs published month-by-month for 2022 to 2026 using ijson.
@@ -235,6 +254,9 @@ def count_monthly_cves(file_path, cut_off_date=None):
 
     anchor_date_str = now.strftime("%Y-%m-%d")
     anchor_year = anchor_date_str[:4]
+
+    global _DATA_THROUGH
+    _DATA_THROUGH = anchor_date_str
 
     total_processed = 0
     relevant_found = 0
@@ -2082,7 +2104,7 @@ def plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str, outpu
     plt.figtext(
         0.5,
         0.01,
-        f"Generated on {datetime.now().strftime('%Y-%m-%d')} | Data Source: Vulners CVE Archive",
+        f"{_stamp()} | Data Source: Vulners CVE Archive",
         ha="center",
         fontsize=12,
         color="#747D8C",
@@ -2332,7 +2354,7 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
     plt.figtext(
         0.5,
         0.01,
-        f"Generated on {datetime.now().strftime('%Y-%m-%d')} | Data Source: Vulners CVE Archive",
+        f"{_stamp()} | Data Source: Vulners CVE Archive",
         ha="center",
         fontsize=12,
         color="#747D8C",
@@ -2751,10 +2773,12 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
         ax.spines[spine].set_color("#777777")
     ax.tick_params(colors="#CCCCCC", labelsize=18)  # 150% of 12
 
+    # Two lines: the legend notes already fill the width at this font size, so
+    # the date stamp gets its own line rather than overflowing the figure.
     footer_text = (
-        f"Generated on {datetime.now().strftime('%Y-%m-%d')} | "
         f"* Dashed/dash-dotted lines and '*' values = projections | "
-        f"YoY = Year-over-Year monthly growth"
+        f"YoY = Year-over-Year monthly growth\n"
+        f"{_stamp()}"
     )
     fig.text(
         0.5, 0.01,
@@ -2767,7 +2791,7 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
         fontweight="bold"
     )
 
-    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    plt.tight_layout(rect=[0, 0.07, 1, 1])  # room for the two-line footer
     _add_logo(fig)
     plt.savefig(
         output_filename,
@@ -2895,7 +2919,7 @@ def plot_cumulative_contribution_2026(daily_cna_counts_2026, anchor_date_str, ou
     plt.figtext(
         0.5,
         0.01,
-        f"Generated on {datetime.now().strftime('%Y-%m-%d')} | Data Source: Vulners CVE Archive",
+        f"{_stamp()} | Data Source: Vulners CVE Archive",
         ha="center",
         fontsize=12,
         color="#747D8C",
@@ -2998,7 +3022,7 @@ def plot_candidate_track(candidate_stats, output_filename="cve_monthly_stats_com
 
     plt.figtext(
         0.5, 0.02,
-        f"Generated on {datetime.now().strftime('%Y-%m-%d')} | Data Source: Vulners CVE Archive",
+        f"{_stamp()} | Data Source: Vulners CVE Archive",
         ha="center", fontsize=12, color="#747D8C", style="italic", fontweight="bold",
     )
     plt.tight_layout(rect=[0, 0.04, 1, 1])
