@@ -2748,16 +2748,29 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
             color_rr = "#FF4757"
             color_100k = "#2ED573"
 
+            # Both projected series ride the same steeply climbing segment, so a
+            # label centred on its own point gets crossed by the curve arriving
+            # from the lower left — and when the two curves nearly coincide their
+            # four labels pile into one stack that says nothing about which line
+            # owns which number. The two empty wedges around a rising point are
+            # above-left and below-right: put the upper series' labels in the
+            # first and the lower series' in the second. That clears the line and
+            # separates the two series horizontally as well as vertically.
+            LBL_DX = 12  # horizontal nudge, points
             if val_runrate >= val_100k:
-                # Run-rate is higher (or equal) -> run-rate above, baseline below
+                # Run-rate is higher (or equal) -> run-rate above-left, baseline below-right
+                rr_dx, rr_ha = -LBL_DX, "right"
                 rr_offset_yoy, rr_va_yoy = 42, "bottom"
                 rr_offset_val, rr_va_val = 12, "bottom"
+                bsl_dx, bsl_ha = LBL_DX, "left"
                 bsl_offset_yoy, bsl_va_yoy = -48, "top"
                 bsl_offset_val, bsl_va_val = -18, "top"
             else:
-                # Baseline is higher -> baseline above, run-rate below
+                # Baseline is higher -> baseline above-left, run-rate below-right
+                bsl_dx, bsl_ha = -LBL_DX, "right"
                 bsl_offset_yoy, bsl_va_yoy = 42, "bottom"
                 bsl_offset_val, bsl_va_val = 12, "bottom"
+                rr_dx, rr_ha = LBL_DX, "left"
                 rr_offset_yoy, rr_va_yoy = -48, "top"
                 rr_offset_val, rr_va_val = -18, "top"
 
@@ -2770,9 +2783,9 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
             ax.annotate(
                 yoy_rr_text,
                 xy=(i, val_runrate),
-                xytext=(0, rr_offset_yoy),
+                xytext=(rr_dx, rr_offset_yoy),
                 textcoords="offset points",
-                ha="center",
+                ha=rr_ha,
                 va=rr_va_yoy,
                 fontsize=15,
                 fontweight="bold",
@@ -2784,9 +2797,9 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
             ax.annotate(
                 f"{val_runrate:,}*",
                 xy=(i, val_runrate),
-                xytext=(0, rr_offset_val),
+                xytext=(rr_dx, rr_offset_val),
                 textcoords="offset points",
-                ha="center",
+                ha=rr_ha,
                 va=rr_va_val,
                 fontsize=15,
                 fontweight="bold" if i == 11 else "normal",
@@ -2797,9 +2810,9 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
             ax.annotate(
                 f"{yoy_100k_val:+5.1f}%*",
                 xy=(i, val_100k),
-                xytext=(0, bsl_offset_yoy),
+                xytext=(bsl_dx, bsl_offset_yoy),
                 textcoords="offset points",
-                ha="center",
+                ha=bsl_ha,
                 va=bsl_va_yoy,
                 fontsize=15,
                 fontweight="bold",
@@ -2811,9 +2824,9 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
             ax.annotate(
                 f"{val_100k:,}*",
                 xy=(i, val_100k),
-                xytext=(0, bsl_offset_val),
+                xytext=(bsl_dx, bsl_offset_val),
                 textcoords="offset points",
-                ha="center",
+                ha=bsl_ha,
                 va=bsl_va_val,
                 fontsize=15,
                 color="#FFFFFF"
@@ -2835,7 +2848,10 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
         + [v for v in y_2026_proj_cum if v is not None]
     )
     ax.set_ylim(bottom=0, top=max_val * 1.15)
-    ax.set_xlim(-0.3, 11.3)  # Tight x-axis limits to use full width
+    # Tight x-axis limits to use the full width, with enough room on the right
+    # for December's below-right labels to stay inside the plot rather than hang
+    # off the edge (and quietly widen the saved canvas via bbox_inches="tight").
+    ax.set_xlim(-0.3, 11.8)
 
     for spine in ["top", "right"]:
         ax.spines[spine].set_visible(False)
