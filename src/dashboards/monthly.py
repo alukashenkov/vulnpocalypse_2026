@@ -122,6 +122,19 @@ CHART_CAPTIONS = {
     ),
 }
 
+# The three-column comparison chart loses its "so far" framing on a run where the
+# anchor month has closed (the 1st of the following month): all three columns are
+# whole months then, so the caption is swapped for this one.
+COMPLETE_MONTH_CAPTION = (
+    "The month that just closed, boxed in on both sides: the finished month in "
+    "the middle, the month before it on the left, and the same month a year ago "
+    "on the right. Three whole months, nothing clipped to match, nothing still "
+    "to come in. It answers two questions at a glance, whether the month that "
+    "just ended outran the one before it, and how much further ahead of last "
+    "year the whole pipeline has drifted. The middle column is rarely the short "
+    "one."
+)
+
 # ── Shared chart palette ─────────────────────────────────────────────────────
 # Every chart draws its series colors from the Sankey "premium" palette so the
 # whole dashboard reads as one system. #FF4757 (the Sankey's first red) is the
@@ -255,6 +268,14 @@ def count_monthly_cves(file_path, cut_off_date=None):
     anchor_date_str = now.strftime("%Y-%m-%d")
     anchor_year = anchor_date_str[:4]
 
+    # True when the anchor lands on the last day of its month, i.e. the month the
+    # data ends in is *finished*. That is what a run on the 1st sees (the anchor
+    # is the last full day, so yesterday closed out the previous month), and what
+    # the pinned year-end cut-off sees. In that case there is no running partial
+    # month: the anchor month is presented as a completed month everywhere —
+    # counted as fact in the projection, drawn full-width in the Sankeys.
+    anchor_month_complete = (now + timedelta(days=1)).month != now.month
+
     global _DATA_THROUGH
     _DATA_THROUGH = anchor_date_str
 
@@ -367,6 +388,7 @@ def count_monthly_cves(file_path, cut_off_date=None):
         "current_month": current_month_str,
         "current_day": current_day,
         "anchor_date": anchor_date_str,
+        "anchor_month_complete": anchor_month_complete,
         "daily_counts_2025": daily_counts_2025,
         "daily_counts_2026": daily_counts_2026,
         "daily_counts": daily_counts,
@@ -419,18 +441,28 @@ def print_all_months_table(
     partial_stats=None,
     current_month_str=None,
     incomplete_month_print_fn=None,
+    current_month_is_partial=True,
 ):
     """
     Prints one compact 4-column sub-table per month (CNA | 2025 | 2026 | YoY%)
     followed by a cross-month totals summary.
     full_months: list of (month_str, month_name, data_2025, data_2026)
+
+    ``current_month_is_partial`` is False when the data anchor closed out its
+    month (a run on the 1st, or the pinned year-end cut-off): there is then no
+    month-to-date to report, every month with data is already in ``full_months``,
+    and the projections start at the month after the last of them.
     """
     if not full_months:
         return set()
 
     # Check if the current month actually has any 2026 records. If not, suppress incomplete month logic.
     current_month_has_data = False
-    if current_month_str and stats and current_month_str in stats and "2026" in stats[current_month_str]:
+    if (
+        current_month_is_partial
+        and current_month_str and stats and current_month_str in stats
+        and "2026" in stats[current_month_str]
+    ):
         current_month_has_data = sum(stats[current_month_str]["2026"].values()) > 0
 
     # Collect all CNAs across all months
@@ -626,9 +658,18 @@ def print_all_months_table(
         if g25 > 0:
             yoy_factors.append(g26 / g25)
 
+    # Pivot of the MoM prediction chain: the first month with no actuals of its
+    # own. That is the running month while one exists; once the anchor month has
+    # closed it is simply the month after the last completed one (and "13" — i.e.
+    # never — when the year itself is complete).
+    if current_month_is_partial:
+        cur_month_str = current_month_str or "13"
+    else:
+        nxt = int(completed_month_strs[-1]) + 1 if completed_month_strs else 13
+        cur_month_str = f"{nxt:02d}" if nxt <= 12 else "13"
+
     # If the current month has data, compute its actual partial YoY factor
     # and include it as a "fact" in the acceleration trend calculation
-    cur_month_str = current_month_str or "13"
     current_month_yoy_factor = None
     if current_month_has_data and partial_stats and cur_month_str != "13":
         partial_25 = sum(partial_stats[cur_month_str]["2025"].values()) if (cur_month_str in partial_stats and "2025" in partial_stats[cur_month_str]) else 0
@@ -1504,12 +1545,17 @@ def plot_custom_sankey_flow(
     partial_stats,
     top_names,
     anchor_date,
+    anchor_month_complete=False,
     output_filename="cve_monthly_stats_comparison_sankey_monthly.png",
 ):
     """
     Plots a custom Sankey flow visualization of CVE contributions for top YTD CNAs,
     starting from December 2025, flowing through each month of 2026, and ending at June 2026.
     Only labels CNAs at the first column (December 2025).
+
+    The last column is the anchor month. It is normally partial, and its header
+    carries the day range that says so; when ``anchor_month_complete`` it is a
+    whole month and gets a plain month header, like every column before it.
     """
     anchor_month_str = anchor_date[5:7]  # e.g., "06" for June
     current_year = int(anchor_date[:4])  # display year, derived from the data anchor
@@ -1536,7 +1582,7 @@ def plot_custom_sankey_flow(
         m_str = f"{m_int:02d}"
         m_label = months_abbrev[m_str]
 
-        if m_str < anchor_month_str:
+        if m_str < anchor_month_str or anchor_month_complete:
             m_data = stats.get(m_str, {}).get("2026", {})
         else:
             # Anchor month is incomplete — show its day range in the header.
@@ -1765,6 +1811,7 @@ def plot_incomplete_month_sankey(
     prev_year_str,
     anchor_date,
     output_filename="cve_monthly_stats_comparison_incomplete_month.png",
+    center_is_complete=False,
 ):
     """
     Plots a custom Sankey flow visualization of the incomplete (current) month
@@ -1772,6 +1819,10 @@ def plot_incomplete_month_sankey(
       1. previous month, same day-range (MoM)          — leftmost
       2. 2026, current incomplete month                — center (pivot)
       3. 2025, same day-range (YoY reference)          — rightmost
+
+    ``center_is_complete`` flips the wording for a run where the pivot month has
+    already ended (the 1st of the following month): the three columns are then
+    whole months rather than matching slices of them.
 
     So the previous month flows into the current month, which is then compared to
     the same range in 2025. This mirrors the visual style of
@@ -1959,10 +2010,20 @@ def plot_incomplete_month_sankey(
         fontsize=26,
         fontweight="bold"
     )
+    if center_is_complete:
+        subtitle = (
+            f"Left: previous month, {prev_range_label} (MoM).  Center: {range_label}, "
+            f"complete.  Right: {prev_year} same month (YoY).  "
+            f"Sized by volume, sorted by {range_label} volume."
+        )
+    else:
+        subtitle = (
+            f"Left: previous month {prev_range_label} (MoM).  Center: current incomplete month.  "
+            f"Right: {prev_year} same range (YoY).  Sized by volume, sorted by current-month volume."
+        )
     ax.text(
         title_x, 1065,
-        f"Left: previous month {prev_range_label} (MoM).  Center: current incomplete month.  "
-        f"Right: {prev_year} same range (YoY).  Sized by volume, sorted by current-month volume.",
+        subtitle,
         ha="center",
         va="bottom",
         color="#A4B0BE",
@@ -2399,8 +2460,16 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
     # Calculate total actual 2026
     all_g26_real = sum(y_2026_actual[:n_comp])
 
-    # Compute projection adjustment factor to land on exactly 100,000 total CVEs
-    cur_month_idx = int(current_month_str) - 1 if current_month_str else -1
+    # Compute projection adjustment factor to land on exactly 100,000 total CVEs.
+    # ``cur_month_idx`` marks the running partial month — the one month past the
+    # actuals whose rate is measured, not forecast. There is none when the anchor
+    # month has closed (a run on the 1st): then every month after the last actual
+    # is a pure projection and is starred as one.
+    cur_month_idx = (
+        int(current_month_str) - 1
+        if (current_month_str and current_month_yoy_growth is not None)
+        else -1
+    )
     unadj_proj_sum = 0
     remaining_2025_sum = 0
     for i in range(12):
@@ -2756,8 +2825,15 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
     ax.legend(loc="upper left", facecolor="#262626", edgecolor="#444444", fontsize=18)  # 150% of 12
     ax.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, loc: f"{int(x):,}"))
     
-    # Increase the y-axis limit by 15% to leave headroom at the top for labels, preventing overlap with the title
-    max_val = max(*y_2026_full_cum, *y_2026_runrate_cum)
+    # Increase the y-axis limit by 15% to leave headroom at the top for labels, preventing overlap with the title.
+    # The baseline curve has to be in the max as well: while any month is still
+    # projected the two agree at December, but once every month is actual (the
+    # frozen full-year run) the baseline is the only line reaching 100k and would
+    # otherwise be cropped out of the frame.
+    max_val = max(
+        [*y_2026_full_cum, *y_2026_runrate_cum]
+        + [v for v in y_2026_proj_cum if v is not None]
+    )
     ax.set_ylim(bottom=0, top=max_val * 1.15)
     ax.set_xlim(-0.3, 11.3)  # Tight x-axis limits to use full width
 
@@ -3049,8 +3125,12 @@ def generate(archive_path, out_dir):
     finally:
         os.chdir(prev_cwd)
 
+    captions = dict(CHART_CAPTIONS)
+    if results.get("anchor_month_complete"):
+        captions["cve_monthly_stats_comparison_incomplete_month.png"] = COMPLETE_MONTH_CAPTION
+
     charts = [
-        {"file": os.path.join(out_dir, name), "caption": CHART_CAPTIONS.get(name, "")}
+        {"file": os.path.join(out_dir, name), "caption": captions.get(name, "")}
         for name in CHART_FILES
         if os.path.exists(os.path.join(out_dir, name))
     ]
@@ -3079,6 +3159,7 @@ def _run_monthly(results, report_buf):
     current_month_str = results["current_month"]
     current_day = results["current_day"]
     anchor_date = results["anchor_date"]
+    anchor_month_complete = results.get("anchor_month_complete", False)
     daily_counts_2025 = results["daily_counts_2025"]
     daily_counts_2026 = results["daily_counts_2026"]
     daily_counts = results["daily_counts"]
@@ -3108,19 +3189,22 @@ def _run_monthly(results, report_buf):
 
     full_month_data = []  # collects (month_str, month_name, data_2025, data_2026)
 
+    # The anchor month is the running (partial) month only while it still has
+    # days left. When the anchor is its last day — a run on the 1st, or the
+    # pinned year-end cut-off — it is a finished month like any other, so it
+    # counts as fact in the YTD totals, the tables and the projection.
+    incomplete_month_str = None if anchor_month_complete else anchor_month_str
+
     sorted_months = sorted(stats.keys())
     for month_str in sorted_months:
-        if "2026" not in stats[month_str] and month_str > current_month_str:
-            continue
-        if month_str > current_month_str:
-            continue
-        # Skip the current month if we just rolled into a new month today
-        if month_str == current_month_str and month_str != anchor_month_str:
+        # Nothing after the anchor month is in play: the anchor is the last full
+        # day, so on the 1st the new month has no data to show yet.
+        if month_str > anchor_month_str:
             continue
 
         month_name = months_map.get(month_str, month_str)
 
-        if month_str < current_month_str:
+        if month_str != incomplete_month_str:
             # Full month — collect data and accumulate YTD
             data_2025 = stats[month_str].get("2025", {})
             data_2026 = stats[month_str].get("2026", {})
@@ -3241,6 +3325,61 @@ def _run_monthly(results, report_buf):
                 output_filename="cve_monthly_stats_comparison_incomplete_month.png",
             )
 
+    # A finished anchor month still gets the same three-column comparison chart —
+    # it is just no longer a slice of anybody's month: every column is a whole
+    # month (previous month | this month | the same month a year ago), so nothing
+    # has to be cut back to a shared day range.
+    if anchor_month_complete and anchor_month_str in stats:
+        month_name = months_map.get(anchor_month_str, anchor_month_str)
+        anchor_year_str = anchor_date[:4]
+        prev_display_year_str = str(int(anchor_year_str) - 1)
+
+        data_2025_full = stats[anchor_month_str].get(prev_display_year_str, {})
+        data_2026_full = stats[anchor_month_str].get(anchor_year_str, {})
+
+        prev_month_int = int(anchor_month_str) - 1
+        if prev_month_int < 1:
+            prev_month_str = "12"
+            prev_year_str = prev_display_year_str
+        else:
+            prev_month_str = f"{prev_month_int:02d}"
+            prev_year_str = anchor_year_str
+        prev_month_name = months_map.get(prev_month_str, prev_month_str)
+        prev_data_full = stats.get(prev_month_str, {}).get(prev_year_str, {})
+
+        # Same top-N union rule as the partial-month path: name a CNA if it leads
+        # any of the three columns actually drawn.
+        top_names = print_combined_incomplete_month_table(
+            f"Combined Stats for {month_name}",
+            data_2025_full,
+            data_2025_full,
+            data_2026_full,
+            ytd_2025,
+            ytd_2026,
+            f"{month_name[:3]} ’25",
+            f"{prev_display_year_str} ({month_name})",
+            f"{anchor_year_str} ({month_name})",
+            anchor_date,
+            print_table=False,
+            prev_data_2026_full=prev_data_full,
+        )
+        prev_shown_top = {
+            k for k, v in sorted(
+                prev_data_full.items(), key=lambda kv: kv[1], reverse=True
+            )[:TOP_N] if v > 0
+        }
+        plot_incomplete_month_sankey(
+            data_2025_full,
+            data_2026_full,
+            prev_data_full,
+            set(top_names) | prev_shown_top,
+            month_name,
+            prev_month_name,
+            prev_year_str,
+            anchor_date,
+            output_filename="cve_monthly_stats_comparison_incomplete_month.png",
+            center_is_complete=True,
+        )
 
     # Resolve the final cumulative YTD dictionary to use
     target_ytd_2025 = curr_ytd_2025 if "curr_ytd_2025" in locals() else ytd_2025
@@ -3260,6 +3399,7 @@ def _run_monthly(results, report_buf):
                 partial_stats,
                 current_month_str,
                 incomplete_month_print_fn=incomplete_month_print_fn,
+                current_month_is_partial=not anchor_month_complete,
             )
 
         # Final Summary
@@ -3278,6 +3418,7 @@ def _run_monthly(results, report_buf):
         partial_stats,
         ytd_top_cnas,
         anchor_date,
+        anchor_month_complete=anchor_month_complete,
     )
 
     # Generate YTD growth chart
@@ -3299,9 +3440,12 @@ def _run_monthly(results, report_buf):
 
     # If the current month has partial data, compute its actual YoY factor
     # and include it as a data point in the trend-line regression
+    # ...unless the anchor month has closed, in which case it is already one of
+    # the completed months above and must not be counted a second time.
     current_month_yoy_growth = None
     current_month_has_data_for_chart = (
-        current_month_str and stats
+        not anchor_month_complete
+        and current_month_str and stats
         and current_month_str in stats
         and "2026" in stats[current_month_str]
         and sum(stats[current_month_str]["2026"].values()) > 0
