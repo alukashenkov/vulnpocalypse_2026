@@ -1607,9 +1607,14 @@ def plot_custom_sankey_flow(
     # Month headers
     stage_labels = [s["label"] for s in stages]
 
-    # Calculate raw volumes and total volumes for each stage
+    # Calculate raw volumes and total volumes for each stage. The max(5, ...) floor
+    # is a drawing device — it keeps a near-empty lane visible — so it may size
+    # bands but must never be counted: summing the floored volumes reports a month
+    # that published 3 CVEs under some CNA as if it published 5. Column headers use
+    # `display_totals`, the untouched data.
     raw_data = []
     totals = []
+    display_totals = []
     for stage in stages:
         stage_data = stage["data"]
         volumes = {}
@@ -1617,9 +1622,10 @@ def plot_custom_sankey_flow(
             volumes[cna] = max(5, stage_data.get(cna, 0))
         others_val = sum(v for k, v in stage_data.items() if k not in sorted_top_names)
         volumes["Others"] = max(5, others_val)
-        
+
         raw_data.append(volumes)
         totals.append(sum(volumes.values()))
+        display_totals.append(sum(stage_data.values()))
 
     max_total_vol = max(totals) if totals else 1.0
 
@@ -1761,7 +1767,7 @@ def plot_custom_sankey_flow(
 
         # Label month header with month name and total count below it
         ax.text(s, 1040, stage_labels[s], ha="center", va="bottom", color="#FFFFFF", fontsize=22.5, fontweight="bold")
-        ax.text(s, 1012, f"({totals[s]:,})", ha="center", va="bottom", color="#A4B0BE", fontsize=18, fontweight="normal")
+        ax.text(s, 1012, f"({display_totals[s]:,})", ha="center", va="bottom", color="#A4B0BE", fontsize=18, fontweight="normal")
 
     # Title & Subtitle
     ax.text(
@@ -1849,9 +1855,14 @@ def plot_incomplete_month_sankey(
 
     stage_labels = [s["label"] for s in stages]
 
-    # Calculate raw volumes and total volumes for each stage
+    # As in plot_custom_sankey_flow: the max(5, ...) floor sizes the bands so a
+    # near-empty lane stays visible, but the header must report the real data.
+    # This chart names more CNAs than the monthly flow — including ones that lead
+    # only the previous-month or last-year column — so a CNA sitting at 0 in the
+    # pivot month is routine here, and every one of them added 5 to the header.
     raw_data = []
     totals = []
+    display_totals = []
     for stage in stages:
         stage_data = stage["data"]
         volumes = {}
@@ -1862,6 +1873,7 @@ def plot_incomplete_month_sankey(
 
         raw_data.append(volumes)
         totals.append(sum(volumes.values()))
+        display_totals.append(sum(stage_data.values()))
 
     max_total_vol = max(totals) if totals else 1.0
 
@@ -1997,7 +2009,7 @@ def plot_incomplete_month_sankey(
                 )
 
         ax.text(s, 1040, stage_labels[s], ha="center", va="bottom", color="#FFFFFF", fontsize=22.5, fontweight="bold")
-        ax.text(s, 1012, f"({totals[s]:,})", ha="center", va="bottom", color="#A4B0BE", fontsize=18, fontweight="normal")
+        ax.text(s, 1012, f"({display_totals[s]:,})", ha="center", va="bottom", color="#A4B0BE", fontsize=18, fontweight="normal")
 
     # Title & Subtitle
     title_x = (len(stages) - 1) / 2.0
