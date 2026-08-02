@@ -155,6 +155,27 @@ YEAR_COLORS = {
     "2026": C_RED,
 }
 
+# ── Cumulative-chart geometry ────────────────────────────────────────────────
+# The year-over-year cumulative chart is drawn at a *fixed* vertical scale: one
+# inch of axes height is always _CUM_CVES_PER_INCH CVEs. A record year therefore
+# makes the picture taller rather than squashing every earlier curve towards the
+# floor — the whole point of the chart is that the gap between the years is
+# legible, and an autoscaled axis erases exactly that as the top curve runs away.
+#
+# Growth cannot go on forever, so it stops once the saved PNG is square. From
+# there the figure is frozen and the axis compresses the way an autoscaled one
+# always would.
+_CUM_FIG_W = 14.0            # inches; the chart's width never changes
+_CUM_FIG_H_MIN = 9.0         # the shape the chart had before it started growing
+_CUM_FIG_H_MAX = 14.151      # tallest figure whose tight-cropped PNG is square
+_CUM_AXES_TOP_IN = 0.909     # inches reserved above the axes for the title
+_CUM_AXES_BOTTOM_IN = 0.701  # inches below it: month ticks + the footer stamp
+# 50,571 CVEs — 2025's full-year total plus the headroom below — over 7.3905in of
+# axes. That is the scale the chart already had when this was introduced, so
+# locking it left the picture of the day untouched and only bites later.
+_CUM_CVES_PER_INCH = 6842.8
+_CUM_HEADROOM = 1.05         # blank space kept above the tallest curve
+
 # ── Watermark logo ───────────────────────────────────────────────────────────
 # Square, transparent-background Vulners logo, overlaid bottom-left on every
 # chart. Drop the file at src/assets/vulners_logo.png; if it is missing the
@@ -204,6 +225,38 @@ def _add_logo(fig, corners=("bottom-left",)):
         ax_logo = fig.add_axes([x0, y0, w, h], zorder=1000)
         ax_logo.imshow(logo, interpolation="antialiased")
         ax_logo.axis("off")
+
+
+def _cumulative_layout(max_total):
+    """Axis top and figure height for a cumulative chart peaking at ``max_total``.
+
+    Returns ``(y_top, fig_h)``. The height tracks the data at a fixed
+    CVEs-per-inch scale until the picture is square; beyond that the figure is
+    pinned at its maximum and the caller's axis simply holds more per inch.
+    """
+    y_top = max(max_total, 1) * _CUM_HEADROOM
+    chrome = _CUM_AXES_TOP_IN + _CUM_AXES_BOTTOM_IN
+    fig_h = chrome + y_top / _CUM_CVES_PER_INCH
+    return y_top, min(max(fig_h, _CUM_FIG_H_MIN), _CUM_FIG_H_MAX)
+
+
+def _pin_axes_height(fig, ax):
+    """Freeze the axes' vertical extent to absolute inches.
+
+    ``tight_layout`` sizes its padding as a *fraction* of the figure, which would
+    quietly change the CVEs-per-inch scale the moment the figure grows taller.
+    The horizontal box it worked out is kept as-is — that one should keep
+    following the width of the y tick labels, which do get wider as the counts
+    gain a digit.
+    """
+    _, fig_h = fig.get_size_inches()
+    pos = ax.get_position()
+    ax.set_position([
+        pos.x0,
+        _CUM_AXES_BOTTOM_IN / fig_h,
+        pos.width,
+        (fig_h - _CUM_AXES_TOP_IN - _CUM_AXES_BOTTOM_IN) / fig_h,
+    ])
 
 
 # Plotting functions below append their saved-file messages here. Kept so those
@@ -2291,8 +2344,12 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
                 "cumulative_2026_val": cumulative_series["2026"][surpassed_idx]
             })
 
+    # The tallest curve sets the axis, and the axis sets the figure height — at a
+    # scale that never changes until the picture is square. See _cumulative_layout.
+    y_top, fig_h = _cumulative_layout(max(totals.values()) if totals else 0)
+
     plt.style.use("dark_background")
-    fig, ax = plt.subplots(figsize=(14, 9), facecolor="#1E1E1E")
+    fig, ax = plt.subplots(figsize=(_CUM_FIG_W, fig_h), facecolor="#1E1E1E")
     ax.set_facecolor("#1E1E1E")
 
     colors = {
@@ -2357,7 +2414,9 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
     ax.set_ylabel("Cumulative CVE Count", fontsize=16, fontweight="bold", color="#FFFFFF")
     ax.set_title("Year-over-Year Cumulative CVE Publications Comparison", fontsize=18, fontweight="bold", color="#FFFFFF", pad=28)
     ax.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, loc: f"{int(x):,}"))
-    ax.set_ylim(bottom=0)
+    # Explicit, not autoscaled: the figure height was computed from this exact
+    # top, and letting matplotlib pick its own would break the two apart.
+    ax.set_ylim(0, y_top)
 
     # No right-margin labels any more, so only enough room for the "Jan" tick.
     ax.set_xlim(ref_dates[0], ref_dates[-1] + timedelta(days=6))
@@ -2420,7 +2479,7 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
 
     plt.figtext(
         0.5,
-        0.01,
+        0.09 / fig_h,  # 0.09in off the bottom, wherever the bottom now is
         f"{_stamp()} | Data Source: Vulners CVE Archive",
         ha="center",
         fontsize=12,
@@ -2430,6 +2489,7 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
     )
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.98])
+    _pin_axes_height(fig, ax)
     _add_logo(fig)
     plt.savefig(
         output_filename,
