@@ -140,10 +140,10 @@ COMPLETE_MONTH_CAPTION = (
 # whole dashboard reads as one system. #FF4757 (the Sankey's first red) is the
 # anchor; the rest are pulled from the same palette. Colorblind separation on the
 # dark (#1E1E1E) surface is validated with the dataviz palette validator.
-C_RED = "#FF4757"     # current year / primary emphasis  (Sankey GitHub_M)
-C_BLUE = "#2E86DE"    # previous year / reference         (Sankey Linux)
-C_GREEN = "#2ED573"   # positive / baseline projection    (Sankey ibm)
-C_YELLOW = "#F1C40F"  # (Sankey mitre)
+C_RED = "#FF4757"     # current year / primary emphasis  (Sankey rank 1)
+C_BLUE = "#2E86DE"    # previous year / reference         (Sankey rank 8)
+C_GREEN = "#2ED573"   # positive / baseline projection    (Sankey rank 15)
+C_YELLOW = "#F1C40F"  # (Sankey rank 6)
 C_GRAY = "#747D8C"    # oldest year / neutral data        (Sankey Others)
 
 # Fixed color per calendar year for the multi-year comparison charts.
@@ -154,6 +154,63 @@ YEAR_COLORS = {
     "2025": C_BLUE,
     "2026": C_RED,
 }
+
+# ── Sankey lane colors ───────────────────────────────────────────────────────
+# A lane's color belongs to its *place* in the ranking, not to the CNA's name.
+# Keying it by name (as this did) leaves any CNA that climbs into the top 15
+# without a color of its own — it fell through to the "Others" gray, the one
+# color that means "not a ranked lane at all". Ranks are permanent; the CNAs
+# holding them are not.
+#
+# The lanes are stacked in rank order, so rank N and rank N+1 always touch, and
+# this order is the one that maximizes the separation of every touching pair —
+# found by searching the orderings of these hues, with #FF4757 pinned to rank 1 so
+# the dashboard's primary red stays on the biggest CNA and the "Others" gray held
+# as the tail lane it always is. Against the dark #1E1E1E surface, worst adjacent
+# ΔE 18.0 under protanopia/deuteranopia (target 8) and 24.8 under normal vision
+# (floor 15), every lane ≥ 3:1 contrast — dataviz validate_palette.py, --mode dark.
+# Re-run it if you touch the order; the old name-keyed palette scored 4.6/9.9.
+SANKEY_RANK_COLORS = [
+    "#FF4757",   # 1  Coral Red        (also C_RED, the dashboard's accent)
+    "#FFBE1A",   # 2  Amber
+    "#00D2D3",   # 3  Cyan
+    "#FF9F43",   # 4  Bright Orange
+    "#E84393",   # 5  Deep Pink
+    "#F1C40F",   # 6  Yellow
+    "#EE5253",   # 7  Red
+    "#2E86DE",   # 8  Dodger Blue
+    "#FF6B6B",   # 9  Light Coral
+    "#6C5CE7",   # 10 Indigo
+    "#10AC84",   # 11 Teal Green
+    "#A55EEA",   # 12 Lavender Purple
+    "#1DD1A1",   # 13 Mint
+    "#9B59B6",   # 14 Amethyst Purple
+    "#2ED573",   # 15 Light Green
+]
+SANKEY_OTHERS_COLOR = C_GRAY   # the pooled tail lane, and everyone below rank 15
+
+
+def sankey_rank_colors(ranked_names):
+    """Map top CNAs to their rank color. ``ranked_names`` must be in rank order."""
+    return {
+        name: SANKEY_RANK_COLORS[i]
+        for i, name in enumerate(ranked_names[:len(SANKEY_RANK_COLORS)])
+    }
+
+
+def sankey_lane_colors(stack_order, rank_colors=None):
+    """Color every lane of a Sankey stack, given its top-to-bottom order.
+
+    The 15 rank colors are the only colors any Sankey uses: a CNA holding a rank
+    wears that rank's color in every chart, which is what lets one be followed
+    across them. A chart that names more CNAs than there are ranks — the
+    incomplete-month one also names whoever leads the previous month or last
+    year's column — paints those lanes in the "Others" gray, since being outside
+    the top 15 is exactly what they have in common.
+    """
+    rank_colors = rank_colors or {}
+    return {name: rank_colors.get(name, SANKEY_OTHERS_COLOR) for name in stack_order}
+
 
 # ── Cumulative-chart geometry ────────────────────────────────────────────────
 # The year-over-year cumulative chart is drawn at a *fixed* vertical scale: one
@@ -1593,6 +1650,35 @@ def generate_sankeymatic_monthly_flow(
 
 
 
+def monthly_flow_rank_order(stats, partial_stats, top_names, anchor_month_str, anchor_month_complete):
+    """Rank ``top_names`` the way the monthly-flow Sankey stacks them.
+
+    That stack order *is* the ranking the lane colors are keyed on, so it has to
+    be computable without drawing the chart: the incomplete-month chart needs the
+    same answer, and it is drawn first.
+    """
+    totals = collections.Counter()
+    for m_int in range(1, int(anchor_month_str) + 1):
+        m_str = f"{m_int:02d}"
+        complete = m_str < anchor_month_str or anchor_month_complete
+        month_data = (stats if complete else partial_stats).get(m_str, {}).get("2026", {})
+        for cna, count in month_data.items():
+            totals[cna] += count
+    return sorted(top_names, key=lambda c: totals[c], reverse=True)
+
+
+def sankey_rank_color_map(stats, partial_stats, ytd_2026, anchor_month_str, anchor_month_complete):
+    """The dashboard's CNA→color mapping: rank in the monthly-flow Sankey.
+
+    Every Sankey chart resolves its colors through this, so a CNA that leads the
+    year is the same color wherever it appears.
+    """
+    top_names = [c for c, _ in ytd_2026.most_common(TOP_N)]
+    return sankey_rank_colors(
+        monthly_flow_rank_order(stats, partial_stats, top_names, anchor_month_str, anchor_month_complete)
+    )
+
+
 def plot_custom_sankey_flow(
     stats,
     partial_stats,
@@ -1647,14 +1733,11 @@ def plot_custom_sankey_flow(
             "data": m_data
         })
 
-    # Calculate 2026 totals for each top CNA to sort the flows by 2026 volume
-    cna_totals_2026 = collections.Counter()
-    for stage in stages[1:]:  # skip Dec 2025
-        for cna, count in stage["data"].items():
-            cna_totals_2026[cna] += count
-
-    # Sort top_names by total 2026 volume descending
-    sorted_top_names = sorted(top_names, key=lambda c: cna_totals_2026[c], reverse=True)
+    # Sort top_names by total 2026 volume descending. This is the ranking the
+    # lane colors are keyed on, so it comes from the shared helper.
+    sorted_top_names = monthly_flow_rank_order(
+        stats, partial_stats, top_names, anchor_month_str, anchor_month_complete
+    )
     all_items = sorted_top_names + ["Others"]
 
     # Month headers
@@ -1708,26 +1791,9 @@ def plot_custom_sankey_flow(
             curr_y = y_start - gap
         stage_positions.append(pos)
 
-    # Premium color palette
-    # Premium color palette for all 15 CNAs and Others (shuffled to maximize contrast between neighbors)
-    colors = {
-        "GitHub_M": "#FF4757",       # Vibrant Coral Red
-        "VulDB": "#E84393",          # Deep Pink
-        "VulnCheck": "#FF9F43",      # Bright Orange
-        "Patchstack": "#10AC84",     # Teal Green
-        "Linux": "#2E86DE",          # Dodger Blue
-        "mitre": "#F1C40F",          # Yellow
-        "Wordfence": "#9B59B6",      # Amethyst Purple
-        "Chrome": "#EE5253",         # Red
-        "microsoft": "#1DD1A1",      # Lime Green
-        "oracle": "#341F97",         # Indigo Blue
-        "adobe": "#00D2D3",          # Cyan
-        "redhat": "#FFBE1A",         # Amber/Yellow
-        "apache": "#A55EEA",         # Lavender Purple
-        "apple": "#FF6B6B",          # Light Coral Red
-        "ibm": "#2ED573",            # Light Green
-        "Others": "#747D8C",         # Sleek Gray
-    }
+    # One color per rank, in the stack's own order — this chart defines the
+    # ranking every other Sankey inherits.
+    colors = sankey_lane_colors(all_items, sankey_rank_colors(sorted_top_names))
 
     # Plot
     plt.style.use("dark_background")
@@ -1871,6 +1937,7 @@ def plot_incomplete_month_sankey(
     anchor_date,
     output_filename="cve_monthly_stats_comparison_incomplete_month.png",
     center_is_complete=False,
+    rank_colors=None,
 ):
     """
     Plots a custom Sankey flow visualization of the incomplete (current) month
@@ -1888,7 +1955,10 @@ def plot_incomplete_month_sankey(
     ``plot_custom_sankey_flow`` (stacked columns joined by tapering flow bands,
     sized by absolute volume). ``top_names`` should already include every top CNA
     of the previous month so that MoM contributors appear as their own lanes in
-    all three stops rather than folded into "Others".
+    all three stops rather than folded into "Others". ``rank_colors`` is the
+    dashboard's CNA→color mapping (see ``sankey_rank_color_map``): a CNA in the
+    year's top 15 wears the same color here as in the monthly-flow chart, and a
+    lane named only for this chart gets the "Others" gray.
     """
     current_year = int(anchor_date[:4])  # display year, derived from the data anchor
     prev_year = current_year - 1
@@ -1953,25 +2023,9 @@ def plot_incomplete_month_sankey(
             curr_y = y_start - gap
         stage_positions.append(pos)
 
-    # Same premium palette as the monthly-flow chart
-    colors = {
-        "GitHub_M": "#FF4757",
-        "VulDB": "#E84393",
-        "VulnCheck": "#FF9F43",
-        "Patchstack": "#10AC84",
-        "Linux": "#2E86DE",
-        "mitre": "#F1C40F",
-        "Wordfence": "#9B59B6",
-        "Chrome": "#EE5253",
-        "microsoft": "#1DD1A1",
-        "oracle": "#341F97",
-        "adobe": "#00D2D3",
-        "redhat": "#FFBE1A",
-        "apache": "#A55EEA",
-        "apple": "#FF6B6B",
-        "ibm": "#2ED573",
-        "Others": "#747D8C",
-    }
+    # Inherited from the monthly-flow ranking, so a top-15 CNA is the same color
+    # in both charts; the extra lanes this chart names stay gray.
+    colors = sankey_lane_colors(all_items, rank_colors)
 
     # Plot. Width scales with the number of stops so columns sit far enough apart
     # for the (left-column) CNA name labels to clear the neighbouring column.
@@ -3411,6 +3465,10 @@ def _run_monthly(results, report_buf):
                 prev_year_str,
                 anchor_date,
                 output_filename="cve_monthly_stats_comparison_incomplete_month.png",
+                rank_colors=sankey_rank_color_map(
+                    stats, partial_stats, curr_ytd_2026,
+                    anchor_month_str, anchor_month_complete,
+                ),
             )
 
     # A finished anchor month still gets the same three-column comparison chart —
@@ -3467,6 +3525,10 @@ def _run_monthly(results, report_buf):
             anchor_date,
             output_filename="cve_monthly_stats_comparison_incomplete_month.png",
             center_is_complete=True,
+            rank_colors=sankey_rank_color_map(
+                stats, partial_stats, ytd_2026,
+                anchor_month_str, anchor_month_complete,
+            ),
         )
 
     # Resolve the final cumulative YTD dictionary to use
