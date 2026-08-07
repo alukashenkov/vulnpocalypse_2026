@@ -2000,9 +2000,17 @@ def plot_incomplete_month_sankey(
         {"label": f"{prev_year} ({range_label})", "data": data_2025_partial},
     ]
 
-    # Sort top CNAs by their current-month (pivot) volume.
+    # Sort top CNAs by their current-month (pivot) volume, and drop the ones that
+    # published nothing in it. ``top_names`` also carries the leaders of the
+    # previous month and of last year, so a CNA can be named here purely for a
+    # column that is not the subject of the chart; with no pivot volume its lane
+    # is drawn at the minimum band height across all three stops and reads as a
+    # flow that does not exist. What it did publish in the other two columns is
+    # not lost — it joins "Others" there.
     sorted_top_names = sorted(
-        top_names, key=lambda c: data_2026_partial.get(c, 0), reverse=True
+        (c for c in top_names if data_2026_partial.get(c, 0) > 0),
+        key=lambda c: data_2026_partial.get(c, 0),
+        reverse=True,
     )
     all_items = sorted_top_names + ["Others"]
 
@@ -2010,9 +2018,9 @@ def plot_incomplete_month_sankey(
 
     # As in plot_custom_sankey_flow: the max(5, ...) floor sizes the bands so a
     # near-empty lane stays visible, but the header must report the real data.
-    # This chart names more CNAs than the monthly flow — including ones that lead
-    # only the previous-month or last-year column — so a CNA sitting at 0 in the
-    # pivot month is routine here, and every one of them added 5 to the header.
+    # Every lane now has pivot-month volume, but the flanking columns can still
+    # sit at 0 (a CNA that started publishing this month, say), and each of those
+    # would otherwise add 5 to that column's header.
     raw_data = []
     totals = []
     display_totals = []
