@@ -233,6 +233,23 @@ _CUM_AXES_BOTTOM_IN = 0.701  # inches below it: month ticks + the footer stamp
 _CUM_CVES_PER_INCH = 6842.8
 _CUM_HEADROOM = 1.05         # blank space kept above the tallest curve
 
+# ── Publishing-speed-chart geometry ──────────────────────────────────────────
+# Same idea for the YoY publishing-speed chart: one inch of axes height is always
+# _SPEED_PER_INCH CVEs/day, so a faster year lifts the red curve off the blue one
+# instead of pressing both towards the floor, and the two years stay comparable
+# against the same ruler from one run to the next. It grows until the saved PNG
+# is square, then the figure is frozen and the axis compresses as before.
+_SPEED_FIG_W = 14.0            # inches; the chart's width never changes
+_SPEED_FIG_H_MIN = 7.0         # the shape the chart had before it started growing
+_SPEED_FIG_H_MAX = 14.085      # tallest figure whose tight-cropped PNG is square
+_SPEED_AXES_TOP_IN = 0.6467    # inches reserved above the axes for the title
+_SPEED_AXES_BOTTOM_IN = 0.6406 # inches below it: month ticks + the footer stamp
+# 346.7 CVEs/day — the 2026 peak of the 30-day average plus the headroom below —
+# over 5.7127in of axes, i.e. the scale the chart already had when this was
+# introduced. Locking it left the picture of the day untouched.
+_SPEED_PER_INCH = 60.69
+_SPEED_HEADROOM = 1.05         # blank space kept above the fastest curve
+
 # ── Watermark logo ───────────────────────────────────────────────────────────
 # Square, transparent-background Vulners logo, overlaid bottom-left on every
 # chart. Drop the file at src/assets/vulners_logo.png; if it is missing the
@@ -297,11 +314,24 @@ def _cumulative_layout(max_total):
     return y_top, min(max(fig_h, _CUM_FIG_H_MIN), _CUM_FIG_H_MAX)
 
 
-def _pin_axes_height(fig, ax):
+def _speed_layout(max_speed):
+    """Axis top and figure height for the speed chart peaking at ``max_speed``.
+
+    The cumulative chart's rule (see ``_cumulative_layout``) applied to CVEs/day:
+    a fixed number of CVEs/day per inch of axes until the picture is square,
+    then a frozen figure and an axis that holds more per inch.
+    """
+    y_top = max(max_speed, 1) * _SPEED_HEADROOM
+    chrome = _SPEED_AXES_TOP_IN + _SPEED_AXES_BOTTOM_IN
+    fig_h = chrome + y_top / _SPEED_PER_INCH
+    return y_top, min(max(fig_h, _SPEED_FIG_H_MIN), _SPEED_FIG_H_MAX)
+
+
+def _pin_axes_height(fig, ax, top_in, bottom_in):
     """Freeze the axes' vertical extent to absolute inches.
 
     ``tight_layout`` sizes its padding as a *fraction* of the figure, which would
-    quietly change the CVEs-per-inch scale the moment the figure grows taller.
+    quietly change the units-per-inch scale the moment the figure grows taller.
     The horizontal box it worked out is kept as-is — that one should keep
     following the width of the y tick labels, which do get wider as the counts
     gain a digit.
@@ -310,9 +340,9 @@ def _pin_axes_height(fig, ax):
     pos = ax.get_position()
     ax.set_position([
         pos.x0,
-        _CUM_AXES_BOTTOM_IN / fig_h,
+        bottom_in / fig_h,
         pos.width,
-        (fig_h - _CUM_AXES_TOP_IN - _CUM_AXES_BOTTOM_IN) / fig_h,
+        (fig_h - top_in - bottom_in) / fig_h,
     ])
 
 
@@ -2234,8 +2264,12 @@ def plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str, outpu
     final_speed_25 = cumulative_2025 / days_count if days_count > 0 else 0.0
     final_speed_26 = cumulative_2026 / days_count if days_count > 0 else 0.0
 
+    # The fastest curve sets the axis, and the axis sets the figure height — at a
+    # scale that never changes until the picture is square. See _speed_layout.
+    y_top, fig_h = _speed_layout(max(ma_2025 + ma_2026, default=0))
+
     plt.style.use("dark_background")
-    fig, ax = plt.subplots(1, 1, figsize=(14, 7), facecolor="#1E1E1E")
+    fig, ax = plt.subplots(1, 1, figsize=(_SPEED_FIG_W, fig_h), facecolor="#1E1E1E")
     ax.set_facecolor("#1E1E1E")
 
     ax.plot(date_series, ma_2025, color=C_BLUE, label=f"{prev_year} Daily Speed (30-day MA)", linewidth=2.5, alpha=0.85)
@@ -2268,8 +2302,10 @@ def plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str, outpu
     ax.set_title("CVE Publishing Speed YoY (30-Day Moving Average)", fontsize=18, fontweight="bold", color="#FFFFFF", pad=12)
     ax.grid(True, color="#444444", linestyle="--", alpha=0.5)
 
-    # Set bottom of y-axis to 0 to prevent negative speeds
-    ax.set_ylim(bottom=0)
+    # Explicit, not autoscaled: the figure height was computed from this exact
+    # top, and letting matplotlib pick its own would break the two apart. The
+    # bottom stays at 0 so no curve can read as a negative speed.
+    ax.set_ylim(0, y_top)
 
     ax.xaxis.set_major_locator(mdates.MonthLocator())
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
@@ -2283,7 +2319,7 @@ def plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str, outpu
 
     plt.figtext(
         0.5,
-        0.01,
+        0.07 / fig_h,  # 0.07in off the bottom, wherever the bottom now is
         f"{_stamp()} | Data Source: Vulners CVE Archive",
         ha="center",
         fontsize=12,
@@ -2293,6 +2329,7 @@ def plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str, outpu
     )
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.98])
+    _pin_axes_height(fig, ax, _SPEED_AXES_TOP_IN, _SPEED_AXES_BOTTOM_IN)
 
     _add_logo(fig)
     plt.savefig(
@@ -2543,7 +2580,7 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
     )
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.98])
-    _pin_axes_height(fig, ax)
+    _pin_axes_height(fig, ax, _CUM_AXES_TOP_IN, _CUM_AXES_BOTTOM_IN)
     _add_logo(fig)
     plt.savefig(
         output_filename,
