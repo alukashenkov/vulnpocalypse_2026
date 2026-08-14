@@ -54,8 +54,8 @@ REFERENCE_PREDICTIONS = {
 CHART_FILES = [
     "cve_monthly_stats_comparison_yearly_cumulative.png",
     "cve_monthly_stats_comparison_ytd_growth.png",
-    "cve_monthly_stats_comparison_incomplete_month.png",
     "cve_monthly_stats_comparison_sankey_monthly.png",
+    "cve_monthly_stats_comparison_incomplete_month.png",
     "cve_monthly_stats_comparison_projection.png",
     "cve_monthly_stats_comparison_candidate_track.png",
 ]
@@ -66,8 +66,8 @@ CHART_FILES = [
 CHART_LINKS = {
     "cve_monthly_stats_comparison_yearly_cumulative.png": ("cumulative", "Cumulative CVEs by year"),
     "cve_monthly_stats_comparison_ytd_growth.png": ("pace", "Year-over-year pace"),
-    "cve_monthly_stats_comparison_incomplete_month.png": ("month-comparison", "Month-to-month comparison"),
     "cve_monthly_stats_comparison_sankey_monthly.png": ("cna-flow", "Monthly flow by CNA"),
+    "cve_monthly_stats_comparison_incomplete_month.png": ("month-comparison", "Month-to-month comparison"),
     "cve_monthly_stats_comparison_projection.png": ("projection", "Year-end projections"),
     "cve_monthly_stats_comparison_candidate_track.png": ("reserved", "Reserved but unpublished"),
 }
@@ -98,21 +98,23 @@ CHART_CAPTIONS = {
         "well above the prior year's line and stays there. The two lines shook "
         "hands once, early on, and have not spoken since."
     ),
+    "cve_monthly_stats_comparison_sankey_monthly.png": (
+        "The lines above tell you how fast; this one tells you who. The same "
+        "firehose, sliced by month and split by CNA, so you can watch the ribbons "
+        "swell. Each column is a month; the taller it stacks, the more CVEs that "
+        "month shipped. Trace any single CNA's band across the months to see how its "
+        'output rises and falls. This is what "more of everything, from everyone" '
+        "looks like when you actually draw it."
+    ),
     "cve_monthly_stats_comparison_incomplete_month.png": (
-        "Three snapshots of the exact same slice of the calendar, lined up side "
+        "Down from the whole year to a single window. Three snapshots of the exact "
+        "same slice of the calendar, lined up side "
         "by side: this month so far in the middle, the same days of last month on "
         "the left, and the same stretch a year ago on the right. Same window, "
         "three different levels of pain. It answers two questions at a glance, "
         "whether the current month is already outrunning the one before it, and "
         "how much further ahead of last year the whole pipeline has drifted. The "
         "current column is rarely the short one."
-    ),
-    "cve_monthly_stats_comparison_sankey_monthly.png": (
-        "The same firehose, sliced by month, so you can watch the ribbons swell. "
-        "Each column is a month; the taller it stacks, the more CVEs that month "
-        "shipped. Trace any single CNA's band across the months to see how its "
-        'output rises and falls. This is what "more of everything, from everyone" '
-        "looks like when you actually draw it."
     ),
     "cve_monthly_stats_comparison_projection.png": (
         "Two ways to guess where this ends, and neither one lets you sleep. One "
@@ -138,7 +140,8 @@ CHART_CAPTIONS = {
 # anchor month has closed (the 1st of the following month): all three columns are
 # whole months then, so the caption is swapped for this one.
 COMPLETE_MONTH_CAPTION = (
-    "The month that just closed, boxed in on both sides: the finished month in "
+    "Down from the whole year to a single window. The month that just closed, "
+    "boxed in on both sides: the finished month in "
     "the middle, the month before it on the left, and the same month a year ago "
     "on the right. Three whole months, nothing clipped to match, nothing still "
     "to come in. It answers two questions at a glance, whether the month that "
