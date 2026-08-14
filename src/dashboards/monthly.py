@@ -60,6 +60,18 @@ CHART_FILES = [
     "cve_monthly_stats_comparison_candidate_track.png",
 ]
 
+# Per-chart anchor (the shareable ``#monthly-<anchor>`` fragment on the page) and
+# the short name shown in the section's jump list. Anchors are part of published
+# URLs — rename a chart file freely, but keep these stable.
+CHART_LINKS = {
+    "cve_monthly_stats_comparison_yearly_cumulative.png": ("cumulative", "Cumulative CVEs by year"),
+    "cve_monthly_stats_comparison_ytd_growth.png": ("pace", "Year-over-year pace"),
+    "cve_monthly_stats_comparison_incomplete_month.png": ("month-comparison", "Month-to-month comparison"),
+    "cve_monthly_stats_comparison_sankey_monthly.png": ("cna-flow", "Monthly flow by CNA"),
+    "cve_monthly_stats_comparison_projection.png": ("projection", "Year-end projections"),
+    "cve_monthly_stats_comparison_candidate_track.png": ("reserved", "Reserved but unpublished"),
+}
+
 MONTHLY_BLURB = (
     "Welcome to the Vulnpocalypse. This is the counter I keep running in the "
     "corner of the screen so I can watch the CVE pipeline lap every year that "
@@ -3317,7 +3329,12 @@ def generate(archive_path, out_dir):
         captions["cve_monthly_stats_comparison_incomplete_month.png"] = COMPLETE_MONTH_CAPTION
 
     charts = [
-        {"file": os.path.join(out_dir, name), "caption": captions.get(name, "")}
+        {
+            "file": os.path.join(out_dir, name),
+            "caption": captions.get(name, ""),
+            "anchor": CHART_LINKS.get(name, ("", ""))[0],
+            "label": CHART_LINKS.get(name, ("", ""))[1],
+        }
         for name in CHART_FILES
         if os.path.exists(os.path.join(out_dir, name))
     ]

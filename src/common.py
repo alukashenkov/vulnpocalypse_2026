@@ -14,6 +14,7 @@ merged.
 import html
 import json
 import os
+import re
 import sys
 import time
 import zlib
@@ -511,11 +512,35 @@ section h2 { font-size: 1.4rem; margin: 0 0 .5rem; border-bottom: 1px solid rgba
 hr.sep { border: none; border-top: 1px solid rgba(128,128,128,.28); margin: 2.5rem 0; }
 figure { margin: 0; }
 figcaption { margin-bottom: 1rem; opacity: .82; line-height: 1.6; }
+/* Anchored jumps land below the top edge instead of flush against it. */
+section, figure { scroll-margin-top: 1.5rem; }
+a.permalink { margin-left: .35rem; text-decoration: none; opacity: .45; font-weight: 600; }
+a.permalink:hover, a.permalink:focus { opacity: 1; }
+.chart-index { margin: 1.25rem 0 0; padding-left: 1.2rem; opacity: .9; }
+.chart-index li { margin: .15rem 0; }
 img { max-width: 100%; height: auto; border: 1px solid rgba(128,128,128,.2); border-radius: 6px; }
 a { color: #3b82f6; }
 pre { overflow-x: auto; padding: 1rem; border: 1px solid rgba(128,128,128,.3); border-radius: 6px; background: rgba(128,128,128,.08); font-size: 12.5px; line-height: 1.45; }
 footer { margin-top: 3rem; color: #888; font-size: .85rem; border-top: 1px solid rgba(128,128,128,.3); padding-top: 1rem; }
 """
+
+
+def _slugify(text):
+    """Lowercase ``text`` down to the ``[a-z0-9-]`` an HTML id/URL fragment wants."""
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+def chart_anchor(result, chart):
+    """The ``id`` (and URL fragment) for one chart on ``index.html``.
+
+    Always namespaced by the dashboard slug, so anchors stay unique once more
+    dashboards land on the page. A chart may name its own short ``anchor`` (the
+    stable, shareable one — ``{"anchor": "projection"}`` becomes
+    ``#monthly-projection``); without it the anchor is derived from the PNG
+    filename, which is stable too but long.
+    """
+    short = chart.get("anchor") or os.path.splitext(os.path.basename(chart["file"]))[0]
+    return f"{_slugify(result.slug)}-{_slugify(short)}"
 
 
 def _html_page(title, body):
@@ -542,22 +567,43 @@ def build_site(results, out_dir):
     index_sections = []
     for r in results:
         figures = []
+        jumps = []
         for c in r.charts:
-            caption = c.get("caption", "")
+            anchor = html.escape(chart_anchor(r, c))
+            label = c.get("label", "")
+            if label:
+                jumps.append(
+                    f'    <li><a href="#{anchor}">{html.escape(label)}</a></li>'
+                )
+            # The permalink sits with the caption when there is one, and on its
+            # own line above the image when there is not.
+            permalink = (
+                f'<a class="permalink" href="#{anchor}" '
+                f'aria-label="Link to this chart"'
+                + (f' title="{html.escape(label)}"' if label else "")
+                + ">#</a>"
+            )
             cap_html = (
-                f"<figcaption>{html.escape(caption)}</figcaption>\n    " if caption else ""
+                f"<figcaption>{html.escape(c['caption'])}{permalink}</figcaption>\n    "
+                if c.get("caption")
+                else f'<figcaption class="blurb">{permalink}</figcaption>\n    '
             )
             # A divider before each chart also separates the intro from the first
             # chart and each chart from the next. Caption sits above the image.
             figures.append(
                 '  <hr class="sep">\n'
-                f'  <figure>\n    {cap_html}'
+                f'  <figure id="{anchor}">\n    {cap_html}'
                 f'<img src="{html.escape(os.path.basename(c["file"]))}" '
-                f'alt="{html.escape(r.title)} chart">\n  </figure>'
+                f'alt="{html.escape(label or r.title)} chart">\n  </figure>'
             )
         index_sections.append(
             f'<section id="{html.escape(r.slug)}">\n'
             f'  <p class="intro">{html.escape(r.blurb)}</p>\n'
+            + (
+                f'  <ul class="chart-index">\n' + "\n".join(jumps) + "\n  </ul>\n"
+                if jumps
+                else ""
+            )
             + "\n".join(figures)
             + f'\n  <p><a href="tables.html#{html.escape(r.slug)}">View the full data tables &rarr;</a></p>\n'
             f"</section>"
@@ -581,7 +627,9 @@ def build_site(results, out_dir):
             f.write(r.report_text)
         table_sections.append(
             f'<section id="{html.escape(r.slug)}">\n'
-            f"  <h2>{html.escape(r.title)}</h2>\n"
+            f"  <h2>{html.escape(r.title)}"
+            f'<a class="permalink" href="#{html.escape(r.slug)}" '
+            'aria-label="Link to this section">#</a></h2>\n'
             f'  <p class="blurb"><a href="{txt_name}">Download as plain text</a></p>\n'
             f"  <pre>{html.escape(r.report_text)}</pre>\n"
             f"</section>"
