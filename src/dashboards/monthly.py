@@ -265,6 +265,15 @@ _SPEED_AXES_BOTTOM_IN = 0.6406 # inches below it: month ticks + the footer stamp
 _SPEED_PER_INCH = 60.69
 _SPEED_HEADROOM = 1.05         # blank space kept above the fastest curve
 
+# Monthly-flow Sankey: the two text gutters flanking the columns. Both hold text
+# sized in points, so they are reserved in inches and converted to data units at
+# draw time (see ``plot_custom_sankey_flow``) — a data-unit margin would mean
+# something different in January than in December. The left gutter holds the CNA
+# names, the right the last column's values plus the overhang of its header, which
+# is the widest of them ("Aug 1-15" while the month is still running).
+_SANKEY_GUTTER_IN = 1.90     # inches reserved left of the first column
+_SANKEY_VALUES_IN = 0.95     # inches reserved right of the last column
+
 # ── Watermark logo ───────────────────────────────────────────────────────────
 # Square, transparent-background Vulners logo, overlaid bottom-left on every
 # chart. Drop the file at src/assets/vulners_logo.png; if it is missing the
@@ -1845,6 +1854,23 @@ def plot_custom_sankey_flow(
     fig, ax = plt.subplots(figsize=(19.25, 17.5), facecolor="#1E1E1E")
     ax.set_facecolor("#1E1E1E")
 
+    # Horizontal extent. The columns sit at x = 0 .. len(stages)-1; the only things
+    # outside that span are text — CNA names in the left gutter, the last column's
+    # values and its header overhang on the right — and text is sized in points, so
+    # it needs the same *inches* whatever the month count is. Sizing the margins in
+    # data units instead (as a hardcoded -1.0 did) silently overpays: in January,
+    # with two columns, one data unit is most of the picture and the gutter swallows
+    # it. So reserve inches, then solve for the data range that yields them:
+    #   range = span + (gutter + values) * range / fig_w
+    # Everything that centers on the picture centers on x_center — not on a constant
+    # that only ever held for one particular month count.
+    span = len(stages) - 1
+    fig_w = fig.get_size_inches()[0]
+    x_range = span / (1.0 - (_SANKEY_GUTTER_IN + _SANKEY_VALUES_IN) / fig_w)
+    x_left = -_SANKEY_GUTTER_IN * x_range / fig_w
+    x_right = span + _SANKEY_VALUES_IN * x_range / fig_w
+    x_center = (x_left + x_right) / 2.0
+
     def get_curve_points(x1, y1, x2, y2, num_points=100):
         cx1 = x1 + (x2 - x1) * 0.4
         cy1 = y1
@@ -1935,7 +1961,7 @@ def plot_custom_sankey_flow(
 
     # Title & Subtitle
     ax.text(
-        3.0, 1090,
+        x_center, 1090,
         f"Monthly CVE Contributions of Top CNAs (Dec {prev_year} - {months_abbrev[anchor_month_str]} {current_year})",
         ha="center",
         va="bottom",
@@ -1944,7 +1970,7 @@ def plot_custom_sankey_flow(
         fontweight="bold"
     )
     ax.text(
-        3.0, 1065,
+        x_center, 1065,
         f"Visualizing monthly CVE publications. Sized by absolute volume contribution. Sorted by total number of CVEs in {current_year}.",
         ha="center",
         va="bottom",
@@ -1953,11 +1979,15 @@ def plot_custom_sankey_flow(
         style="italic"
     )
 
-    ax.set_xlim(-1.0, len(stages) - 0.4)
+    ax.set_xlim(x_left, x_right)
     ax.set_ylim(-50, 1120)
     ax.axis("off")
 
-    plt.tight_layout()
+    # With the frame off there is nothing for the default subplot margins to hold,
+    # and they only pushed the flows inward — roughly a tenth of the picture on the
+    # left went to padding the logo sits in. Spanning the figure hands that width
+    # back to the bands and the CNA names.
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
     _add_logo(fig)
     plt.savefig(
         output_filename,
