@@ -49,6 +49,19 @@ REFERENCE_PREDICTIONS = {
     "12": 16634,
 }
 
+
+def clamp_growth(g_m):
+    """Bound a projected YoY growth factor.
+
+    The fitted trend is extrapolated as-is — there is no ceiling. Only the floor
+    is real: below -100% a month would publish a negative number of CVEs. An
+    earlier version also capped growth at +300%, which silently flattened the
+    tail of the year once the regression line climbed past it (December 2026
+    reached +299.5%, half a point from being truncated without any visible sign).
+    """
+    return max(-1.0, g_m)
+
+
 # Charts, in the order they appear on the page (written into the out_dir given
 # to generate()). These filenames match what the plotting functions emit.
 CHART_FILES = [
@@ -902,7 +915,7 @@ def print_all_months_table(
             g_m = intercept
         else:
             g_m = 0.0
-        g_m = max(-0.9, min(3.0, g_m))
+        g_m = clamp_growth(g_m)
         
         g25 = 0
         if stats and month_str in stats and "2025" in stats[month_str]:
@@ -929,7 +942,7 @@ def print_all_months_table(
             g_m = intercept
         else:
             g_m = 0.0
-        g_m = max(-0.9, min(3.0, g_m)) + d_adj
+        g_m = clamp_growth(g_m) + d_adj
         
         g25 = 0
         if stats and month_str in stats and "2025" in stats[month_str]:
@@ -991,7 +1004,7 @@ def print_all_months_table(
             g_m = intercept
         else:
             g_m = 0.0
-        g_m = max(-0.9, min(3.0, g_m)) + d_adj
+        g_m = clamp_growth(g_m) + d_adj
         
         g25 = 0
         if stats and month_str in stats and "2025" in stats[month_str]:
@@ -2701,7 +2714,7 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
                 g_m = intercept
             else:
                 g_m = 0.0
-            g_m = max(-0.9, min(3.0, g_m))
+            g_m = clamp_growth(g_m)
             
             g25 = y_2025[i]
             unadj_proj_sum += g25 * (1 + g_m)
@@ -2736,7 +2749,7 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
             g_m = intercept
         else:
             g_m = 0.0
-        g_m = max(-0.9, min(3.0, g_m)) + d_adj
+        g_m = clamp_growth(g_m) + d_adj
         
         g25 = y_2025[i]
         g26_proj = int(round(g25 * (1 + g_m)))
@@ -2764,7 +2777,7 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
             g_m = intercept
         else:
             g_m = 0.0
-        g_m = max(-0.9, min(3.0, g_m))
+        g_m = clamp_growth(g_m)
         g25 = y_2025[i]
         g26_proj = int(round(g25 * (1 + g_m)))
         y_2026_runrate.append(g26_proj)
