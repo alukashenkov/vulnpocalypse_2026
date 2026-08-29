@@ -2,13 +2,16 @@ name: Build & deploy CVE dashboard
 
 on:
   schedule:
-    # Hourly from 05:30 to 20:30 UTC. GitHub's scheduler is best-effort: it drops
-    # ticks and delivers others 1-2h late, so we retry every hour and the gate
-    # stops once a build has deployed that day. The 05:30 tick is the first the
-    # gate will pass, so an on-time delivery builds straight away. The run stops
-    # at 20:30 so a delayed tick cannot arrive after midnight and claim the next
-    # day's build slot.
-    - cron: "30 5-20 * * *"
+    # Hourly, around the clock. The dashboard reports through the last full UTC
+    # day, so the day's build wants to land shortly after midnight; the gate
+    # passes the first tick delivered at or after 00:30 UTC and stops once that
+    # build has run. GitHub's scheduler is best-effort — it drops ticks and
+    # delivers others hours late, sometimes leaving whole stretches of a day
+    # empty — so every hour is another chance rather than a wasted run: a tick
+    # that finds the day already built exits in seconds. Covering the late hours
+    # is safe now: a tick delivered after midnight no longer burns a slot, it
+    # simply becomes the new day's build.
+    - cron: "30 0-23 * * *"
   workflow_dispatch: {}
 
 # Read-only (plus Pages); the gate reads run history to see if today already
@@ -25,12 +28,19 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Decide whether to build this tick. Scheduled runs retry hourly but deploy at
-  # most once per day (stop after the first success), and never before 05:00 UTC.
-  # That floor is only about the day boundary, not data freshness: it keeps a
-  # tick delivered after midnight from building pre-dawn and burning the new
-  # day's slot. The dashboard also freezes on the full-2026 snapshot: scheduled
-  # runs stop after 2027-01-01, and any run in 2027 is pinned to the 2026 set via
+  # Decide whether to build this tick. Scheduled runs retry hourly and deploy at
+  # most once per day (stop after the first success), so the day's build lands on
+  # the first tick GitHub actually delivers after 00:30 UTC.
+  #
+  # Data freshness plays no part in that timing: every run downloads a fresh
+  # snapshot and then applies a collection-update delta, so the archive is live
+  # to the second whenever it runs. What the floor protects is the *window* — the
+  # dashboard reports through the last full UTC day, so the run has to sit after
+  # midnight, with a short margin for records published in the day's final
+  # minutes to reach the archive.
+  #
+  # The dashboard also freezes on the full-2026 snapshot: scheduled runs stop
+  # after 2027-01-01, and any run in 2027 is pinned to the 2026 set via
   # CVE_CUT_OFF_DATE=2026-12-31 (a naive year-boundary run would mishandle the
   # "current month"). Manual runs (workflow_dispatch) always proceed.
   gate:
@@ -50,21 +60,25 @@ jobs:
             if [[ "$today" > "2027-01-01" ]]; then
               echo "Frozen on the full-2026 snapshot; skipping."
               proceed=false
-            elif (( 10#$(date -u +%H) < 5 )); then
-              # Cron alone cannot hold this line: a tick scheduled for 20:30 can
-              # be delivered after midnight, and such a run would otherwise build
-              # pre-dawn and burn the new day's slot.
-              echo "Before 05:00 UTC; too early to build."
+            elif (( 10#$(date -u +%H%M) < 30 )); then
+              # Yesterday has only just closed; give records published in its
+              # last minutes time to reach the archive. A tick this early is a
+              # delayed one from yesterday — the 00:30 tick is right behind it.
+              echo "Before 00:30 UTC; too early to build."
               proceed=false
             else
-              # Stop retrying once a build has already deployed today.
+              # Stop retrying once today's build has deployed — or is under way,
+              # since ticks now cluster around midnight and two arriving minutes
+              # apart would otherwise both build. The current run is excluded:
+              # its own build job is already pending while this gate runs, and
+              # would veto itself.
               ids=$(gh api "repos/$REPO/actions/workflows/daily.yml/runs?per_page=50" \
-                    --jq "[.workflow_runs[] | select(.created_at >= \"${today}T00:00:00Z\") | .id] | .[]")
+                    --jq "[.workflow_runs[] | select(.created_at >= \"${today}T00:00:00Z\" and .id != ${{ github.run_id }}) | .id] | .[]")
               for id in $ids; do
-                done_today=$(gh api "repos/$REPO/actions/runs/$id/jobs" \
-                  --jq 'any(.jobs[]; .name == "build-and-deploy" and .conclusion == "success")')
-                if [[ "$done_today" == "true" ]]; then
-                  echo "A build already deployed today (run $id); stopping retries."
+                taken=$(gh api "repos/$REPO/actions/runs/$id/jobs" \
+                  --jq 'any(.jobs[]; .name == "build-and-deploy" and (.conclusion == "success" or .status != "completed"))')
+                if [[ "$taken" == "true" ]]; then
+                  echo "Today's build already ran or is running (run $id); stopping retries."
                   proceed=false
                   break
                 fi
