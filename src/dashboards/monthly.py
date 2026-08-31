@@ -114,10 +114,14 @@ CHART_CAPTIONS = {
     "cve_monthly_stats_comparison_sankey_monthly.png": (
         "The lines above tell you how fast; this one tells you who. The same "
         "firehose, sliced by month and split by CNA, so you can watch the ribbons "
-        "swell. Each column is a month; the taller it stacks, the more CVEs that "
-        "month shipped. Trace any single CNA's band across the months to see how its "
-        'output rises and falls. This is what "more of everything, from everyone" '
-        "looks like when you actually draw it."
+        "swell. Every column hangs from the same line and is drawn to one scale, "
+        "so a height means the same number of CVEs wherever it sits: trace one "
+        "CNA's band across the months, or measure a handful of the newest month's "
+        "publishers against everything an earlier month managed. The dashed line "
+        "carries one whole month across the picture for exactly that — wherever "
+        "it crosses, everything above it is that month's worth of CVEs. This is "
+        'what "more of everything, from everyone" looks like when you actually '
+        "draw it."
     ),
     "cve_monthly_stats_comparison_incomplete_month.png": (
         "Down from the whole year to a single window. Three snapshots of the exact "
@@ -282,10 +286,62 @@ _SPEED_HEADROOM = 1.05         # blank space kept above the fastest curve
 # sized in points, so they are reserved in inches and converted to data units at
 # draw time (see ``plot_custom_sankey_flow``) — a data-unit margin would mean
 # something different in January than in December. The left gutter holds the CNA
-# names, the right the last column's values plus the overhang of its header, which
-# is the widest of them ("Aug 1-15" while the month is still running).
-_SANKEY_GUTTER_IN = 1.90     # inches reserved left of the first column
-_SANKEY_VALUES_IN = 0.95     # inches reserved right of the last column
+# names, the right the last column's values, the cumulative ruler, and the
+# overhang of the last header, which is the widest of them ("Aug 1-15" while the
+# month is still running).
+_SANKEY_GUTTER_IN = 2.55     # inches reserved left of the first column
+_SANKEY_VALUES_IN = 1.45     # inches reserved right of the last column
+
+# Monthly-flow Sankey: the vertical frame. The columns all hang from
+# ``_SANKEY_Y_TOP`` and the busiest one reaches ``_SANKEY_Y_FLOOR``, which fixes
+# the CVEs-per-y-unit scale for the whole picture; everything below the floor is
+# the room the callout and the logo sit in. The figure is sized so the y unit
+# keeps the value it had at 17.5in (66.86 units per inch) — point-sized text then
+# occupies the same fraction of the picture as before, and the extra height goes
+# entirely to the bands, which is what it was asked for.
+_SANKEY_FIG_W = 19.25
+_SANKEY_FIG_H = 20.5
+_SANKEY_Y_TOP = 985.0        # the shared baseline every column starts from
+_SANKEY_Y_FLOOR = -205.0     # where the busiest column's underside lands
+_SANKEY_Y_BOTTOM = -250.0    # bottom of the axis
+# Lanes are separated by shrinking each band inward by this much rather than by
+# spacing them apart: spacing would push every boundary below it off the CVE
+# scale, an inset costs no layout at all. ``_SANKEY_MIN_BAND`` keeps a lane too
+# thin to survive the inset visible as a hairline.
+_SANKEY_BAND_INSET = 1.8
+_SANKEY_MIN_BAND = 1.0
+_SANKEY_LABEL_MIN_H = 12.5   # y units a lane needs before its value is printed
+_SANKEY_CALLOUT_Y = 5.0      # where the callout sits inside the empty wedge
+# How close to a whole reference month still counts as carrying one. The callout
+# names the *fewest* CNAs that clear this: three names that come to nine tenths
+# of January is the sharper sentence, and a fourth that tips the sum over the
+# line only blunts it.
+_SANKEY_ALMOST = 0.85
+
+
+def _spread_label_ys(targets, min_gap, lo, hi):
+    """Nudge labels apart without reordering them.
+
+    ``targets`` is the y each label wants — its lane's center — listed
+    top-to-bottom; the return is the y each one gets: as close to its target as
+    a ``min_gap`` spacing inside ``[lo, hi]`` allows. Lanes drawn to a true
+    scale stack the small ones far tighter than their own text, and this is what
+    keeps that text readable without handing those lanes height they did not
+    earn.
+    """
+    ys = list(targets)
+    n = len(ys)
+    if n == 0:
+        return ys
+    for i in range(1, n):                 # settle downward from the top
+        ys[i] = min(ys[i], ys[i - 1] - min_gap)
+    ys[-1] = max(ys[-1], lo)              # then back up off the floor
+    for i in range(n - 2, -1, -1):
+        ys[i] = max(ys[i], ys[i + 1] + min_gap)
+    ys[0] = min(ys[0], hi)                # and down again if that broke the ceiling
+    for i in range(1, n):
+        ys[i] = min(ys[i], ys[i - 1] - min_gap)
+    return ys
 
 # ── Watermark logo ───────────────────────────────────────────────────────────
 # Square, transparent-background Vulners logo, overlaid bottom-left on every
@@ -1755,9 +1811,21 @@ def plot_custom_sankey_flow(
     output_filename="cve_monthly_stats_comparison_sankey_monthly.png",
 ):
     """
-    Plots a custom Sankey flow visualization of CVE contributions for top YTD CNAs,
-    starting from December 2025, flowing through each month of 2026, and ending at June 2026.
-    Only labels CNAs at the first column (December 2025).
+    Plots a custom Sankey flow visualization of CVE contributions for top YTD
+    CNAs, starting from December of the previous year, flowing through each
+    month of the current year, and ending at the anchor month.
+
+    Every column hangs from one shared baseline and is drawn to one scale, so a
+    height means the same number of CVEs wherever it sits: a lane can be read
+    against another lane, against the ruler on the right, and against a whole
+    column of some other month. That last comparison is the reason for the
+    layout. The columns used to be centered on one another with a fixed gap
+    between lanes, and both of those broke it — a centered column has no shared
+    origin to measure from, and 15 gaps of padding made a full column stand
+    taller than the CVEs in it, by more the further down you counted. So the
+    gaps are gone (the separation is now taken from *inside* each band, which
+    costs no layout) and the counts are used unfloored. The dashed guide carries
+    the first month of the year across the picture for exactly that comparison.
 
     The last column is the anchor month. It is normally partial, and its header
     carries the day range that says so; when ``anchor_month_complete`` it is a
@@ -1810,53 +1878,52 @@ def plot_custom_sankey_flow(
     # Month headers
     stage_labels = [s["label"] for s in stages]
 
-    # Calculate raw volumes and total volumes for each stage. The max(5, ...) floor
-    # is a drawing device — it keeps a near-empty lane visible — so it may size
-    # bands but must never be counted: summing the floored volumes reports a month
-    # that published 3 CVEs under some CNA as if it published 5. Column headers use
-    # `display_totals`, the untouched data.
+    # Per-stage volumes, exact. There is no minimum-height floor here on
+    # purpose: with the columns hung from a common baseline the vertical axis
+    # *is* the CVE axis, so padding a near-empty lane to keep it visible would
+    # shift every boundary below it and break the one thing the layout is for.
+    # Lanes too thin to see are handled at draw time instead (``_draw_span``),
+    # which changes the ink without moving the boundaries.
     raw_data = []
     totals = []
-    display_totals = []
     for stage in stages:
         stage_data = stage["data"]
-        volumes = {}
-        for cna in sorted_top_names:
-            volumes[cna] = max(5, stage_data.get(cna, 0))
-        others_val = sum(v for k, v in stage_data.items() if k not in sorted_top_names)
-        volumes["Others"] = max(5, others_val)
-
+        volumes = {cna: stage_data.get(cna, 0) for cna in sorted_top_names}
+        volumes["Others"] = sum(
+            v for k, v in stage_data.items() if k not in sorted_top_names
+        )
         raw_data.append(volumes)
         totals.append(sum(volumes.values()))
-        display_totals.append(sum(stage_data.values()))
 
-    max_total_vol = max(totals) if totals else 1.0
+    max_total = max(totals) if totals else 1
+    # y-units per CVE — the scale of the whole picture, one number.
+    unit = (_SANKEY_Y_TOP - _SANKEY_Y_FLOOR) / max(max_total, 1)
 
-    # Compute stacked positions centered at y = 500, scaled by absolute volumes
-    gap = 12
-    num_items = len(all_items)
-    max_avail_height = 1050 - (num_items - 1) * gap
-
+    # Stack every column downward from the same baseline.
     stage_positions = []
-    for s, stage in enumerate(stages):
-        volumes = raw_data[s]
-        total_vol = totals[s]
-        
-        # Scale available height for this stage based on its absolute volume relative to the max month
-        avail_height = (total_vol / max_total_vol) * max_avail_height
-        stage_total_height = avail_height + (num_items - 1) * gap
-        
+    for volumes in raw_data:
         pos = {}
-        # Center the stack vertically at y = 500
-        curr_y = 475.0 + stage_total_height / 2.0
+        cursor = _SANKEY_Y_TOP
         for item in all_items:
-            # Item's height is proportional to its absolute volume
-            h = (volumes[item] / total_vol) * avail_height
-            y_start = curr_y - h
-            y_end = curr_y
-            pos[item] = (y_start, y_end)
-            curr_y = y_start - gap
+            h = volumes[item] * unit
+            pos[item] = (cursor - h, cursor)
+            cursor -= h
         stage_positions.append(pos)
+
+    def _draw_span(y0, y1):
+        """The ink for a lane whose exact extent is ``y0..y1``.
+
+        Bands are separated by shrinking them inward rather than by spacing them
+        apart, so the separation costs no layout and the boundaries stay on the
+        CVE scale. A lane thinner than the inset keeps a hairline instead of
+        vanishing — the only place the drawing departs from the data, and it
+        moves nothing.
+        """
+        h = y1 - y0
+        if h <= 0:
+            return y0, y1
+        d = min(_SANKEY_BAND_INSET, max(0.0, (h - _SANKEY_MIN_BAND) / 2.0))
+        return y0 + d, y1 - d
 
     # One color per rank, in the stack's own order — this chart defines the
     # ranking every other Sankey inherits.
@@ -1864,16 +1931,19 @@ def plot_custom_sankey_flow(
 
     # Plot
     plt.style.use("dark_background")
-    fig, ax = plt.subplots(figsize=(19.25, 17.5), facecolor="#1E1E1E")
+    fig, ax = plt.subplots(
+        figsize=(_SANKEY_FIG_W, _SANKEY_FIG_H), facecolor="#1E1E1E"
+    )
     ax.set_facecolor("#1E1E1E")
 
     # Horizontal extent. The columns sit at x = 0 .. len(stages)-1; the only things
     # outside that span are text — CNA names in the left gutter, the last column's
-    # values and its header overhang on the right — and text is sized in points, so
-    # it needs the same *inches* whatever the month count is. Sizing the margins in
-    # data units instead (as a hardcoded -1.0 did) silently overpays: in January,
-    # with two columns, one data unit is most of the picture and the gutter swallows
-    # it. So reserve inches, then solve for the data range that yields them:
+    # values, the cumulative ruler and its header overhang on the right — and text
+    # is sized in points, so it needs the same *inches* whatever the month count
+    # is. Sizing the margins in data units instead (as a hardcoded -1.0 did)
+    # silently overpays: in January, with two columns, one data unit is most of the
+    # picture and the gutter swallows it. So reserve inches, then solve for the
+    # data range that yields them:
     #   range = span + (gutter + values) * range / fig_w
     # Everything that centers on the picture centers on x_center — not on a constant
     # that only ever held for one particular month count.
@@ -1883,6 +1953,13 @@ def plot_custom_sankey_flow(
     x_left = -_SANKEY_GUTTER_IN * x_range / fig_w
     x_right = span + _SANKEY_VALUES_IN * x_range / fig_w
     x_center = (x_left + x_right) / 2.0
+    # Everything placed *beside* a column — the node block, its value, the CNA
+    # names and their leaders, the ruler — is text or text-sized furniture, so it
+    # is offset in inches for the same reason the gutters are. Written in data
+    # units it would grow with the month count: at two columns one data unit is
+    # most of the picture, and a name offset that reads as a hair's breadth in
+    # December pushes the label clean off the canvas in January.
+    x_in = x_range / fig_w  # data units per inch
 
     def get_curve_points(x1, y1, x2, y2, num_points=100):
         cx1 = x1 + (x2 - x1) * 0.4
@@ -1894,54 +1971,151 @@ def plot_custom_sankey_flow(
         y = (1-t)**3 * y1 + 3*(1-t)**2*t * cy1 + 3*(1-t)*t**2 * cy2 + t**3 * y2
         return x, y
 
+    # ── The ruler ────────────────────────────────────────────────────────────
+    # Depth below the baseline, in CVEs. It is what turns "that band looks about
+    # as tall as that column" into a number, and it only reads because every
+    # column starts at the same line.
+    grid_x0, grid_x1 = -0.10 * x_in, span + 0.72 * x_in
+    ax.plot(
+        [grid_x0, grid_x1], [_SANKEY_Y_TOP] * 2,
+        color="#FFFFFF", alpha=0.22, linewidth=1.4, zorder=0.5,
+    )
+    step = next(
+        (s for s in (250, 500, 1000, 2000, 2500, 5000, 10000, 20000)
+         if max_total / s <= 6),
+        20000,
+    )
+    ruler_x = span + 0.80 * x_in
+    for depth in range(0, int(max_total) + 1, step):
+        y = _SANKEY_Y_TOP - depth * unit
+        if depth:
+            ax.plot(
+                [grid_x0, grid_x1], [y] * 2,
+                color="#FFFFFF", alpha=0.10, linewidth=1.0, zorder=0.5,
+            )
+        tick = f"{depth // 1000}k" if step >= 1000 and depth else f"{depth:,}"
+        ax.text(
+            ruler_x, y, tick,
+            ha="left", va="center", color="#6E7A88", fontsize=13,
+        )
+    ax.text(
+        ruler_x, _SANKEY_Y_TOP + 14, "CVEs\ndeep",
+        ha="left", va="bottom", color="#6E7A88", fontsize=12.5, style="italic",
+        linespacing=1.15,
+    )
+
     # Draw flow bands between stages
     for s in range(len(stages) - 1):
         x_s = s
         x_s1 = s + 1
         pos_s = stage_positions[s]
         pos_s1 = stage_positions[s + 1]
-        
+
         for item in all_items:
-            y_start_s, y_end_s = pos_s[item]
-            y_start_s1, y_end_s1 = pos_s1[item]
-            
+            y_start_s, y_end_s = _draw_span(*pos_s[item])
+            y_start_s1, y_end_s1 = _draw_span(*pos_s1[item])
+
             x_top, y_top = get_curve_points(x_s, y_end_s, x_s1, y_end_s1)
             x_bot, y_bot = get_curve_points(x_s, y_start_s, x_s1, y_start_s1)
-            
+
             x_poly = np.concatenate([x_top, x_bot[::-1]])
             y_poly = np.concatenate([y_top, y_bot[::-1]])
-            
-            ax.fill(x_poly, y_poly, color=colors.get(item, "#747D8C"), alpha=0.35, edgecolor="none")
+
+            ax.fill(x_poly, y_poly, color=colors.get(item, "#747D8C"), alpha=0.38, edgecolor="none")
+
+        # The underside of the last lane is the month total, so tracing it is
+        # tracing the growth curve. Worth a line of its own.
+        y_low_s = stage_positions[s][all_items[-1]][0]
+        y_low_s1 = stage_positions[s + 1][all_items[-1]][0]
+        cx, cy = get_curve_points(x_s, y_low_s, x_s1, y_low_s1)
+        ax.plot(cx, cy, color="#FFFFFF", alpha=0.22, linewidth=1.2, zorder=2)
+
+    # ── The reference guide ──────────────────────────────────────────────────
+    # One month's entire output, carried across every column at the depth it
+    # reaches. The first month of the current year is the natural yardstick: the
+    # dashed line leaves that column's own underside, so wherever it crosses a
+    # later column it says "this many CNAs, and you have already matched it".
+    ref_idx = 1 if len(stages) > 1 else None
+    ref_total = totals[ref_idx] if ref_idx is not None else 0
+    ref_label = stage_labels[ref_idx] if ref_idx is not None else ""
+    ref_y = _SANKEY_Y_TOP - ref_total * unit
+    # Only meaningful once a later month has grown clear of the yardstick.
+    show_ref = (
+        ref_idx is not None
+        and len(stages) >= 4
+        and ref_total > 0
+        and totals[-1] >= 1.25 * ref_total
+    )
+    if show_ref:
+        ax.plot(
+            [grid_x0, span + 0.58 * x_in], [ref_y] * 2,
+            color=C_YELLOW, alpha=0.55, linewidth=1.8,
+            linestyle=(0, (7, 5)), zorder=2.2,
+        )
+        tag = ax.text(
+            ref_idx + 0.13 * x_in, ref_y - 6, f"all of {ref_label} ({ref_total:,})",
+            ha="left", va="top", color=C_YELLOW, fontsize=15,
+            fontweight="bold", zorder=4,
+        )
+        tag.set_path_effects([
+            path_effects.Stroke(linewidth=3, foreground="#1E1E1E"),
+            path_effects.Normal(),
+        ])
 
     # Draw stage blocks and labels
+    last_s = len(stages) - 1
     for s, stage in enumerate(stages):
         x_pos = s
         pos = stage_positions[s]
+        volumes = raw_data[s]
         stage_data = stage["data"]
-        for item in all_items:
+
+        # The last column carries the numbers people actually read, so its
+        # labels are nudged apart rather than dropped; elsewhere a value is
+        # printed only where its own lane has the room, which keeps the small
+        # lanes honest instead of padding them out to fit their text.
+        spread = None
+        if s == last_s:
+            centers = [sum(pos[item]) / 2.0 for item in all_items]
+            spread = _spread_label_ys(
+                centers, 14.5, _SANKEY_Y_FLOOR - 18, _SANKEY_Y_TOP
+            )
+
+        for i, item in enumerate(all_items):
             y_start, y_end = pos[item]
             y_center = (y_start + y_end) / 2.0
-            
-            # Get actual raw monthly contribution count
-            if item == "Others":
-                val = sum(v for k, v in stage_data.items() if k not in sorted_top_names)
-            else:
-                val = stage_data.get(item, 0)
-            
+            d_start, d_end = _draw_span(y_start, y_end)
+            val = volumes[item]
+
             # Draw block
-            rect = plt.Rectangle((x_pos - 0.04, y_start), 0.08, y_end - y_start, facecolor=colors.get(item, "#747D8C"), edgecolor="none", zorder=3)
-            ax.add_patch(rect)
-            
-            # Label the monthly contribution value if > 0 (placed to the right of the block)
             if val > 0:
+                rect = plt.Rectangle(
+                    (x_pos - 0.077 * x_in, d_start), 0.154 * x_in, d_end - d_start,
+                    facecolor=colors.get(item, "#747D8C"), edgecolor="none", zorder=3,
+                )
+                ax.add_patch(rect)
+
+            # Label the monthly contribution value if there is one to show and
+            # somewhere to put it.
+            if val > 0 and (spread is not None or y_end - y_start >= _SANKEY_LABEL_MIN_H):
                 if item == "Others":
-                    cna_count = sum(1 for k, v in stage_data.items() if k not in sorted_top_names and v > 0)
+                    cna_count = sum(
+                        1 for k, v in stage_data.items()
+                        if k not in sorted_top_names and v > 0
+                    )
                     label_text = f"{val}\n[{cna_count}]"
                 else:
                     label_text = f"{val}"
+                label_y = spread[i] if spread is not None else y_center
+                label_x = x_pos + (0.20 if spread is not None else 0.115) * x_in
+                if spread is not None and abs(label_y - y_center) > 5:
+                    ax.plot(
+                        [label_x - 0.02 * x_in, x_pos + 0.095 * x_in], [label_y, y_center],
+                        color="#FFFFFF", alpha=0.35, linewidth=0.9, zorder=3.5,
+                    )
                 txt = ax.text(
-                    x_pos + 0.06,
-                    y_center,
+                    label_x,
+                    label_y,
                     label_text,
                     ha="left",
                     va="center",
@@ -1955,22 +2129,91 @@ def plot_custom_sankey_flow(
                     path_effects.Normal()
                 ])
 
-            # Only label the CNA name at the first column, in the left margin
-            if s == 0:
-                ax.text(
-                    x_pos - 0.06,
-                    y_center,
-                    item,
-                    ha="right",
-                    va="center",
-                    color="#FFFFFF",
-                    fontsize=18,
-                    fontweight="bold"
-                )
-
         # Label month header with month name and total count below it
         ax.text(s, 1040, stage_labels[s], ha="center", va="bottom", color="#FFFFFF", fontsize=22.5, fontweight="bold")
-        ax.text(s, 1012, f"({display_totals[s]:,})", ha="center", va="bottom", color="#A4B0BE", fontsize=18, fontweight="normal")
+        ax.text(s, 1012, f"({totals[s]:,})", ha="center", va="bottom", color="#A4B0BE", fontsize=18, fontweight="normal")
+
+    # CNA names, in the left gutter beside the first column. Drawn to scale the
+    # tail lanes stack tighter than their own names, so the names are nudged
+    # apart and a leader points back at the lane each one belongs to.
+    first_pos = stage_positions[0]
+    name_centers = [sum(first_pos[item]) / 2.0 for item in all_items]
+    name_ys = _spread_label_ys(
+        name_centers, 16.5,
+        min(name_centers[-1], _SANKEY_Y_TOP - totals[0] * unit) - 30,
+        _SANKEY_Y_TOP,
+    )
+    for item, center, label_y in zip(all_items, name_centers, name_ys):
+        if abs(label_y - center) > 3:
+            ax.plot(
+                [-0.82 * x_in, -0.25 * x_in, -0.086 * x_in],
+                [label_y, label_y, center],
+                color="#FFFFFF", alpha=0.3, linewidth=0.9,
+                solid_joinstyle="round", zorder=3.5,
+            )
+        ax.text(
+            -0.86 * x_in,
+            label_y,
+            item,
+            ha="right",
+            va="center",
+            color="#FFFFFF",
+            fontsize=16.5,
+            fontweight="bold",
+        )
+
+    # ── The callout ──────────────────────────────────────────────────────────
+    # The picture's whole point, said once in words, in the space the growth
+    # curve leaves empty. How many of the newest month's top CNAs it takes to
+    # cover an entire earlier month is read off the same numbers the chart is
+    # drawn from, so it can never drift from what is on screen.
+    if show_ref:
+        cum = 0
+        n_cnas = 0
+        for name in sorted_top_names:
+            cum += raw_data[-1][name]
+            n_cnas += 1
+            if cum >= _SANKEY_ALMOST * ref_total:
+                break
+        ref_publishers = sum(1 for v in stages[ref_idx]["data"].values() if v > 0)
+        pct = round(cum / ref_total * 100)
+        verb = (
+            "out-publish" if pct >= 102 else
+            "match" if pct >= 98 else
+            "nearly match"
+        )
+        # The callout lives in the empty wedge under the growth curve. Early in
+        # the year there is no wedge yet, and text dropped there would land on
+        # the bands — so it is drawn only where the columns it would run beneath
+        # are short enough to clear it.
+        head = (
+            f"{stage_labels[-1]}: the top {n_cnas} CNAs alone "
+            f"{verb} all of {ref_label}"
+        )
+        head_w = 0.20 * len(head) * x_in     # ~0.2in per character at 25pt bold
+        head_top = _SANKEY_CALLOUT_Y + 26 + 34
+        room = all(
+            _SANKEY_Y_TOP - totals[c] * unit > head_top
+            for c in range(min(len(stages), int(head_w) + 2))
+        )
+        if room and cum >= _SANKEY_ALMOST * ref_total and n_cnas < len(sorted_top_names):
+            body = (
+                f"{cum:,} CVEs from {n_cnas} publishers, against {ref_total:,} "
+                f"from {ref_publishers} in {ref_label} — {pct}% of the month.\n"
+                f"The dashed line is {ref_label}'s entire month, carried across "
+                f"every column — wherever it\ncrosses, everything above it is "
+                f"one {ref_label} of CVEs."
+            )
+            ax.text(
+                0.04 * x_in, _SANKEY_CALLOUT_Y + 26, head,
+                ha="left", va="bottom", color="#FFFFFF", fontsize=25,
+                fontweight="bold",
+            )
+            ax.text(
+                0.04 * x_in, _SANKEY_CALLOUT_Y + 6, body,
+                ha="left", va="top", color="#A4B0BE", fontsize=17,
+                linespacing=1.6,
+            )
 
     # Title & Subtitle
     ax.text(
@@ -1984,16 +2227,17 @@ def plot_custom_sankey_flow(
     )
     ax.text(
         x_center, 1065,
-        f"Visualizing monthly CVE publications. Sized by absolute volume contribution. Sorted by total number of CVEs in {current_year}.",
+        "Every column hangs from the same baseline at one scale, so equal heights "
+        f"mean equal CVE counts. Lanes ordered by total {current_year} volume.",
         ha="center",
         va="bottom",
         color="#A4B0BE",
-        fontsize=19.5,
+        fontsize=18.5,
         style="italic"
     )
 
     ax.set_xlim(x_left, x_right)
-    ax.set_ylim(-50, 1120)
+    ax.set_ylim(_SANKEY_Y_BOTTOM, 1120)
     ax.axis("off")
 
     # With the frame off there is nothing for the default subplot margins to hold,
