@@ -49,6 +49,13 @@ REFERENCE_PREDICTIONS = {
     "12": 16634,
 }
 
+# Index of the first month REFERENCE_PREDICTIONS forecasts. The 100k-baseline
+# curve rides the actuals up to the month before it and the reference numbers
+# from there to December, so this is also the first month whose baseline point
+# is a projection worth labelling as one. Derived from the table rather than
+# written down twice, so extending the table moves the boundary with it.
+_BASELINE_PROJ_IDX = min(int(m) for m in REFERENCE_PREDICTIONS) - 1
+
 
 def clamp_growth(g_m):
     """Bound a projected YoY growth factor.
@@ -3062,13 +3069,19 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
             y_2026_runrate_proj_cum.append(y_2026_runrate_cum[i])
             y_2026_actual_cum.append(None)
 
-    start_proj_idx = min(4, last_comp_idx)
-    # The green curve uses actual values up to May (index 4) and then projects using REFERENCE_PREDICTIONS from June (index 5) onwards
-    for i in range(start_proj_idx, 5):
+    start_proj_idx = min(_BASELINE_PROJ_IDX - 1, last_comp_idx)
+    # The green curve rides the actuals up to the month before _BASELINE_PROJ_IDX,
+    # then projects with REFERENCE_PREDICTIONS from there to December.
+    for i in range(start_proj_idx, _BASELINE_PROJ_IDX):
         y_2026_proj_cum[i] = y_2026_full_cum[i]
-        
-    cum_proj = y_2026_proj_cum[4] if y_2026_proj_cum[4] is not None else y_2026_full_cum[4]
-    for i in range(5, 12):
+
+    anchor_i = _BASELINE_PROJ_IDX - 1
+    cum_proj = (
+        y_2026_proj_cum[anchor_i]
+        if y_2026_proj_cum[anchor_i] is not None
+        else y_2026_full_cum[anchor_i]
+    )
+    for i in range(_BASELINE_PROJ_IDX, 12):
         month_str = months_list[i]
         pred_val = REFERENCE_PREDICTIONS.get(month_str, 0)
         cum_proj += pred_val
@@ -3162,8 +3175,13 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
                 color="#A0A0A0"
             )
 
-            # If this is June (last completed month), also print the baseline projection label under the curve
-            if i == last_comp_idx:
+            # The baseline curve is a forecast for every month from
+            # _BASELINE_PROJ_IDX on, including the ones the calendar has since
+            # overtaken — that is the whole point of a fixed reference: you can
+            # still see what it called for July once July has been and gone, and
+            # how far the actual ran ahead of it. So each of those months keeps
+            # its own label under the curve, not just the newest one.
+            if i >= _BASELINE_PROJ_IDX:
                 color_100k = "#2ED573"
                 val_100k = y_2026_proj_cum[i]
                 yoy_100k_val = yoy_2026_green[i]
