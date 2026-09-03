@@ -2,20 +2,28 @@
 
 Generation logic extracted verbatim from the original
 cve_monthly_stats_comparison.py so both the site orchestrator (``python -m src``)
-and the thin local wrapper drive one copy of the code. Produces the six charts
-and the aligned-table report; no CSV/TXT outputs, no tqdm, no stdout-teeing on the
+and the thin local wrapper drive one copy of the code. Produces the eight charts
+(six monthly ones plus the two NVD-status ones that used to live in
+cve_status_stats.py) and the aligned-table report; no CSV/TXT outputs, no tqdm, no stdout-teeing on the
 published path.
 '''
 import collections
 import csv
 import io
+import json
 import os
+import re
 import time
 from contextlib import redirect_stdout
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
+import glob
+import gzip
 import ijson
 import numpy as np
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import matplotlib
 matplotlib.use("Agg")  # headless: never needs a display in CI
 import matplotlib.pyplot as plt
@@ -32,6 +40,10 @@ TOP_N = 15
 # year) — the workflow sets CVE_CUT_OFF_DATE at the year boundary.
 CUT_OFF_DATE = os.getenv("CVE_CUT_OFF_DATE") or None
 _WRITE_CSV = False   # published path writes no CSV; a local caller may flip this
+# Also render every chart a second time as a 16:9 presentation slide (see
+# ``monthly_slides``). Off on the published path — the page shows only the six
+# charts in CHART_FILES — and flipped on by the local wrapper.
+_SLIDES = False
 
 # Last day the numbers actually cover (the anchor). Set by count_monthly_cves()
 # and stamped into every chart footer next to the generation date; the two are
@@ -77,6 +89,8 @@ CHART_FILES = [
     "cve_monthly_stats_comparison_sankey_monthly.png",
     "cve_monthly_stats_comparison_incomplete_month.png",
     "cve_monthly_stats_comparison_projection.png",
+    "cve_monthly_stats_comparison_status_yearly.png",
+    "cve_monthly_stats_comparison_status_weekly.png",
     "cve_monthly_stats_comparison_candidate_track.png",
 ]
 
@@ -89,6 +103,8 @@ CHART_LINKS = {
     "cve_monthly_stats_comparison_sankey_monthly.png": ("cna-flow", "Monthly flow by CNA"),
     "cve_monthly_stats_comparison_incomplete_month.png": ("month-comparison", "Month-to-month comparison"),
     "cve_monthly_stats_comparison_projection.png": ("projection", "Year-end projections"),
+    "cve_monthly_stats_comparison_status_yearly.png": ("nvd-status-yearly", "NVD status by year"),
+    "cve_monthly_stats_comparison_status_weekly.png": ("nvd-status-weekly", "NVD status by week"),
     "cve_monthly_stats_comparison_candidate_track.png": ("reserved", "Reserved but unpublished"),
 }
 
@@ -147,6 +163,23 @@ CHART_CAPTIONS = {
         "already reads like the good old days. The asterisks mean projection. The "
         "slope means call the cavalry."
     ),
+    "cve_monthly_stats_comparison_status_yearly.png": (
+        "Counting is one thing; looking is another. Every CVE published carries an "
+        "NVD status that says how far the analysts got with it, and this stacks a "
+        "year's worth of them into one bar. The blue is what NVD has actually "
+        "analysed. The gray at the top is Deferred: waved through without a look. "
+        "The warm colors are the queue, everything still waiting its turn. Watch "
+        "how the bars grow, and watch how much of each new bar is anything other "
+        "than blue."
+    ),
+    "cve_monthly_stats_comparison_status_weekly.png": (
+        "The same statuses, week by week, full weeks only. The top chart is the "
+        "raw count, so the spikes are the weeks that hurt. The bottom chart "
+        "squeezes every week to the same height, so what is left is the mix: how "
+        "much of each week's output got analysed, how much was deferred, and how "
+        "much is still sitting in the queue. When the warm band at the top grows, "
+        "the backlog is growing faster than the analysts."
+    ),
     "cve_monthly_stats_comparison_candidate_track.png": (
         "And here is the part nobody counts. These are CVE IDs already reserved "
         "but not yet published — the queue behind the curtain, the storm still out "
@@ -193,6 +226,769 @@ YEAR_COLORS = {
     "2025": C_BLUE,
     "2026": C_RED,
 }
+
+# ── Chrome releases ──────────────────────────────────────────────────────────
+# The Chrome CNA as the dashboard names it: ``count_monthly_cves`` takes the
+# record's ``cna`` field and falls back to ``reporter`` — Chrome's records carry
+# no ``cna`` and ``reporter == "Chrome"``, which is the Sankey's "Chrome" lane.
+# For the anchor year every Chrome CVE's release facts are kept for the fan-in
+# slide: the Chrome security advisory it references (``type: chrome`` in
+# enchantments.dependencies.references, a ``GCSA-…`` id — one advisory is one
+# release) and the Chrome version named by its Nessus plugin id.
+CHROME_CNA = "Chrome"
+_CHROME_NESSUS_VER = re.compile(r"^(?:MACOSX_)?GOOGLE_CHROME_(\d+)_(\d+)_(\d+)_(\d+)\.NASL$")
+
+# ── Fan-out: one CVE, many downstream advisories ─────────────────────────────
+# The fan-out slide takes one CVE and counts the distinct downstream records
+# that reference it — a distribution's advisory, a vendor's bulletin, an
+# ecosystem's advisory — grouped by who issued them. The CVE was picked once,
+# offline, from the 2026 CVEs with the most such references (see
+# FANOUT_SHORTLIST, whose counts the local run writes to CSV); the picture is
+# then drawn from the archive record on every run.
+FANOUT_CVE = "CVE-2026-31431"
+FANOUT_SHORTLIST = [
+    "CVE-2026-31431",   # Linux kernel, KEV
+    "CVE-2026-43284",   # Linux kernel, KEV
+    "CVE-2026-46300",   # Linux kernel, KEV
+    "CVE-2026-42945",   # NGINX, KEV
+    "CVE-2025-69419",   # OpenSSL (published Jan 2026)
+    "CVE-2026-28390",   # OpenSSL
+    "CVE-2026-45447",   # OpenSSL
+    "CVE-2026-25210",   # libexpat
+    "CVE-2026-35385",   # OpenSSH
+    "CVE-2026-5450",    # glibc
+    "CVE-2026-35535",   # sudo
+    "CVE-2026-11822",   # SQLite
+    "CVE-2026-33845",   # GnuTLS
+    "CVE-2026-8286",    # curl
+    "CVE-2025-14524",   # curl (published Jan 2026)
+    "CVE-2026-34743",   # XZ Utils
+    "CVE-2026-3381",    # Compress::Raw::Zlib (zlib class)
+    "CVE-2026-11979",   # libxml2
+    "CVE-2026-4480",    # Samba, KEV
+]
+# Reference types that are not downstream changes: scanners and detection
+# content, CVE mirrors and aggregators, exploit and news feeds, KEV lists.
+FANOUT_EXCLUDE = {
+    "nessus", "openvas", "nuclei", "tenable", "qualysblog", "veracode", "snyk",
+    "ptsecurity", "cvelist", "nvd", "euvd", "vulnrichment", "circl", "cnnvd", "cnvd",
+    "bdu_fstec", "attackerkb", "ncsc", "jvn", "kaspersky", "cve", "vulnersosv", "cert",
+    "githubexploit", "gitee", "kitploit", "packetstorm", "packetstormnews", "exploitdb",
+    "metasploit", "seebug", "zdt", "thn", "talosblog", "rapid7blog", "avleonov",
+    "hackerone", "zdi", "wizblog", "akamaiblog", "nodejsblog", "vulncheck_kev", "ics",
+    "wordfence", "patchstack", "chrome", "epss", "cisa", "cisa_kev", "mssecure", "securelist",
+    "wired", "impervablog", "anthropic", "krebs", "threatpost", "malwarebytes", "schneier",
+    "trendmicroblog", "googleprojectzero", "checkpoint_advisories",
+}
+# Per-CVE tracker pages of vendors that also issue advisories — a page, not a
+# change; the advisories are counted instead.
+FANOUT_TRACKERS = {"redhatcve", "ubuntucve", "susecve", "debiancve"}
+# Reference type -> who issued the record.
+FANOUT_GROUPS = {
+    "redhat": "Red Hat", "ubuntu": "Ubuntu", "suse": "SUSE", "opensuse": "SUSE",
+    "debian": "Debian", "amazon": "Amazon Linux", "oraclelinux": "Oracle Linux",
+    "rocky": "Rocky Linux", "almalinux": "AlmaLinux", "fedora": "Fedora", "mageia": "Mageia",
+    "alpinelinux": "Alpine", "cgr": "Chainguard", "wolfi": "Chainguard",
+    "cbl_mariner": "Azure Linux", "photon": "VMware Photon", "rosalinux": "ROSA Linux",
+    "redos": "RED OS", "astralinux": "Astra Linux", "slackware": "Slackware",
+    "freebsd": "FreeBSD", "freebsd_advisory": "FreeBSD", "virtuozzo": "Virtuozzo",
+    "cloudlinux": "CloudLinux", "gentoo": "Gentoo", "archlinux": "Arch Linux",
+    "ibm": "IBM", "aix": "IBM", "hpe": "HPE", "f5": "F5 / NGINX", "nginx": "F5 / NGINX",
+    "broadcom": "Broadcom", "arista": "Arista", "cisco": "Cisco", "nvidia": "NVIDIA",
+    "oracle": "Oracle", "acronis": "Acronis", "mscve": "Microsoft", "mskb": "Microsoft",
+    "apple": "Apple", "mozilla": "Mozilla", "atlassian": "Atlassian", "gitlab": "GitLab",
+    "juniper": "Juniper", "paloalto": "Palo Alto", "fortinet": "Fortinet", "huawei": "Huawei",
+    "github": "GitHub Advisory Database", "pypa": "PyPI", "rubygems": "RubyGems",
+    "friendsofphp": "Packagist (PHP)", "spring": "Spring", "npm": "npm",
+    "ivanti": "Ivanti", "samba": "Samba", "sqlite": "SQLite", "curl": "curl", "openssl": "OpenSSL",
+    "kernel": "kernel.org", "xen": "Xen", "qemu": "QEMU", "vmware": "VMware", "citrix": "Citrix",
+    "dell": "Dell", "lenovo": "Lenovo", "intel": "Intel", "amd": "AMD", "sap": "SAP", "siemens": "Siemens",
+    "schneider": "Schneider Electric", "jenkins": "Jenkins", "drupal": "Drupal", "joomla": "Joomla",
+    "moodle": "Moodle", "nodejs": "Node.js", "php": "PHP", "postgresql": "PostgreSQL", "mysql": "MySQL",
+    "kubernetes": "Kubernetes", "docker": "Docker", "haproxy": "HAProxy", "openbsd": "OpenBSD", "netbsd": "NetBSD",
+}
+# OSV mirrors many of the above under its own ids; the prefix says whose
+# record it is. ``None`` = not a downstream change (per-CVE tracker entries,
+# OSS-Fuzz, malicious-package reports, upstream's own advisories).
+FANOUT_OSV_PREFIXES = [
+    ("RHSA-", "Red Hat"), ("RHBA-", "Red Hat"), ("RHEA-", "Red Hat"),
+    ("USN-", "Ubuntu"), ("LSN-", "Ubuntu"), ("UBUNTU-CVE-", None),
+    ("DSA-", "Debian"), ("DLA-", "Debian"), ("DTSA-", "Debian"), ("DEBIAN-CVE-", None),
+    ("SUSE-", "SUSE"), ("OPENSUSE-", "SUSE"),
+    ("ALSA-", "AlmaLinux"), ("ALBA-", "AlmaLinux"), ("ALEA-", "AlmaLinux"),
+    ("RLSA-", "Rocky Linux"), ("RXSA-", "Rocky Linux"), ("ELSA-", "Oracle Linux"),
+    ("MGASA-", "Mageia"), ("ALPINE-", "Alpine"), ("CGA-", "Chainguard"), ("GLSA-", "Gentoo"),
+    ("ASA-", "Arch Linux"), ("BIT-", "Bitnami"), ("MINI-", "Minimus"),
+    ("CLSA-", "CloudLinux"), ("OESA-", "openEuler"), ("AZL-", "Azure Linux"), ("ROOT-OS-", "Root OS"),
+    ("BELL-", "BellSoft"), ("ECHO-", "Echo"), ("CLEANSTART-", "CleanStart"), ("JLSEC-", "Jetify"),
+    ("GHSA-", "GitHub Advisory Database"), ("GO-", "Go (pkg.go.dev)"), ("PYSEC-", "PyPI"),
+    ("RUSTSEC-", "crates.io"), ("HSEC-", "Haskell"), ("PSF-", "Python (PSF)"), ("RSEC-", "R (CRAN)"),
+    ("MAL-", None), ("CURL-", None), ("OSV-", None), ("GSD-", None), ("UVI-", None),
+    ("EUVD-", None), ("CVE-", None),
+]
+_FANOUT_RHSA = re.compile(r"^(RH[SBE]A-\d{4}:\d+)")
+
+
+def _fanout_route(ref_type, ref_id):
+    """(issuer, canonical id) for one reference, or ``None`` when it is not a
+    downstream record. Canonical ids let the same advisory seen through two
+    sources (a vendor feed and OSV) count once."""
+    rid = str(ref_id).strip().upper()
+    if ref_type in FANOUT_EXCLUDE or ref_type in FANOUT_TRACKERS:
+        return None
+    if ref_type == "osv":
+        rid = rid[4:] if rid.startswith("OSV:") else rid
+        for prefix, group in FANOUT_OSV_PREFIXES:
+            if rid.startswith(prefix):
+                if group is None:
+                    return None
+                break
+        else:
+            group = "OSV (other ecosystems)"
+    else:
+        group = FANOUT_GROUPS.get(ref_type)
+        if group is None:
+            group = f"other: {ref_type}"
+    # Canonical forms.
+    if group == "Red Hat":
+        mr = _FANOUT_RHSA.match(rid)
+        rid = mr.group(1) if mr else rid
+    elif group == "Debian":
+        rid = re.sub(r"^DEBIAN:", "", rid)
+        rid = re.sub(r":[0-9A-F]+$", "", rid)
+    elif group == "Alpine":
+        rid = "ALPINE-" + re.sub(r"^ALPINE[:-]", "", rid)
+    elif group == "Chainguard":
+        rid = re.sub(r"^(CHAINGUARD|WOLFI):", "", rid)
+    elif group == "FreeBSD":
+        rid = re.sub(r"^FREEBSD_ADVISORY:", "", rid)
+    elif group == "Azure Linux":          # CBLMARINER:83249 and AZL-83249 are one record
+        rid = re.sub(r"^(CBLMARINER:|AZL-)", "AZL-", rid)
+    elif group == "CloudLinux":           # CLSA-2026:177… and CLSA-2026-177… are one record
+        rid = rid.replace(":", "-")
+    return group, rid
+
+
+# ── Fan-out, the accurate way: Vulners ``audit/cve`` ─────────────────────────
+# ``POST /api/v4/audit/cve {"cve": id}`` returns ``affectedPackages``: one entry
+# per fixed package per distro release — ``{id: advisory, name: package,
+# range, registry, distro: [family, release]}``. That is the downstream
+# picture at the resolution a fleet schedules it: a package update on a
+# product release. Responses are cached for a day in DATA_DIR; the archive
+# references (``fanout_breakdown``) stay as the offline fallback.
+VULNERS_AUDIT_URL = "https://vulners.com/api/v4/audit/cve"
+AUDIT_CACHE_BASENAME = "vulners_audit_cache.json"
+AUDIT_CACHE_MAX_AGE_H = 24
+
+# distro family (as ``audit/cve`` names it) -> product name on the slide
+FANOUT_PRODUCTS = {
+    "rhel": "Red Hat Enterprise Linux", "almalinux": "AlmaLinux", "rocky": "Rocky Linux",
+    "ubuntu": "Ubuntu", "ubuntu-pro": "Ubuntu Pro (ESM)", "debian": "Debian",
+    "sles": "SUSE Linux Enterprise (SLES)", "sled": "SUSE Linux Enterprise Desktop",
+    "sle-rt": "SUSE Linux Enterprise Real Time", "sl-micro": "SUSE Linux Micro",
+    "opensuse-leap": "openSUSE Leap", "opensuse-tumbleweed": "openSUSE Tumbleweed",
+    "amzn": "Amazon Linux", "fedora": "Fedora", "oracle": "Oracle Linux", "oraclelinux": "Oracle Linux",
+    "astra": "Astra Linux", "mageia": "Mageia", "openeuler": "openEuler", "alpine": "Alpine Linux",
+    "wolfi": "Wolfi (Chainguard)", "chainguard": "Chainguard", "minimos": "MinimOS (Minimus)",
+    "hummingbird": "Hummingbird", "freebsd": "FreeBSD", "photon": "VMware Photon OS",
+    "gentoo": "Gentoo", "arch": "Arch Linux", "cbl-mariner": "Azure Linux", "azurelinux": "Azure Linux",
+    "rosa": "ROSA Linux", "redos": "RED OS", "cloudlinux": "CloudLinux", "virtuozzo": "Virtuozzo",
+}
+FANOUT_REGISTRIES = {"golang": "Go modules", "npm": "npm", "pypi": "PyPI", "maven": "Maven",
+                     "cargo": "crates.io", "rubygems": "RubyGems", "composer": "Packagist", "nuget": "NuGet"}
+# Package-name suffixes that are the same build, not another product to patch.
+_PKG_VARIANT_SUFFIX = re.compile(r"-(debuginfo|debugsource|devel|doc|docs|headers|source|dbg|dbgsym|common|libs)$")
+
+
+def _audit_cache_path():
+    return os.path.join(os.path.abspath(os.getenv("DATA_DIR") or os.getcwd()), AUDIT_CACHE_BASENAME)
+
+
+def fetch_audit_cve(cve_id):
+    """``audit/cve`` result for one CVE (``{"cve", "affectedPackages", "affectedCpe"}``),
+    from the day's cache or the API. ``None`` without an API key or on failure —
+    the caller falls back to the archive references."""
+    path = _audit_cache_path()
+    cache = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+        except (OSError, ValueError):
+            cache = {}
+    hit = cache.get(cve_id)
+    if hit and isinstance(hit, dict) and "fetched" in hit:
+        try:
+            age_h = (datetime.now() - datetime.fromisoformat(hit["fetched"])).total_seconds() / 3600
+        except ValueError:
+            age_h = float("inf")
+        if age_h < AUDIT_CACHE_MAX_AGE_H and hit.get("result") is not None:
+            return hit["result"]
+    api_key = os.getenv("VULNERS_API_KEY")
+    if not api_key:
+        print("VULNERS_API_KEY not set; fan-out slide falls back to archive references.")
+        return hit.get("result") if hit else None
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=Retry(
+        total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["POST"],
+    )))
+    try:
+        r = session.post(
+            VULNERS_AUDIT_URL, headers={"X-Api-Key": api_key, "Content-Type": "application/json"},
+            json={"cve": cve_id}, timeout=60,
+        )
+        r.raise_for_status()
+        result = r.json().get("result")
+    except (requests.RequestException, ValueError) as e:
+        print(f"audit/cve failed for {cve_id}: {e}")
+        return hit.get("result") if hit else None
+    if not isinstance(result, dict):
+        return hit.get("result") if hit else None
+    cache[cve_id] = {"fetched": datetime.now().isoformat(timespec="seconds"), "result": result}
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except OSError as e:
+        print(f"Could not write {path}: {e}")
+    return result
+
+
+def fanout_packages(audit_result):
+    """Downstream package updates per product, from an ``audit/cve`` result.
+
+    One update = one package name on one product release; the same package
+    listed under two advisories (a vendor's own id and OSV's mirror) is one
+    update. Returns ``(rows, totals)``: ``rows`` sorted by updates, each
+    ``{"product", "updates", "releases", "advisories", "packages": [base names by
+    frequency]}``; ``totals`` = ``{"updates", "products", "releases", "advisories"}``.
+    """
+    per = {}
+    all_releases, all_advisories, all_updates = set(), set(), set()
+    for p in (audit_result or {}).get("affectedPackages") or []:
+        if not isinstance(p, dict) or not p.get("name"):
+            continue
+        distro = p.get("distro") or []
+        family = distro[0] if distro else None
+        release = distro[1] if len(distro) > 1 else (family or p.get("registry") or "?")
+        if family:
+            product = FANOUT_PRODUCTS.get(family, family)
+        else:
+            product = FANOUT_REGISTRIES.get(p.get("registry"), f"{p.get('registry') or 'other'} packages")
+        row = per.setdefault(product, {"updates": set(), "releases": set(), "advisories": set(),
+                                       "packages": collections.Counter()})
+        update = (release, p["name"])
+        row["updates"].add(update)
+        row["releases"].add(release)
+        adv = _fanout_route_advisory(p.get("id"))
+        row["advisories"].add(adv)
+        row["packages"][_PKG_VARIANT_SUFFIX.sub("", p["name"])] += 1
+        all_updates.add((product,) + update)
+        all_releases.add((product, release))
+        all_advisories.add(adv)
+    rows = [{
+        "product": product, "updates": len(r["updates"]), "releases": len(r["releases"]),
+        "advisories": len(r["advisories"]),
+        "packages": [n for n, _ in r["packages"].most_common()],
+    } for product, r in per.items()]
+    rows.sort(key=lambda r: (-r["updates"], r["product"]))
+    totals = {"updates": len(all_updates), "products": len(rows), "releases": len(all_releases),
+              "advisories": len(all_advisories)}
+    return rows, totals
+
+
+def _fanout_route_advisory(adv_id):
+    """Canonical advisory id for an ``affectedPackages`` entry: OSV mirrors and
+    Red Hat's per-CVE suffixes collapse onto the vendor's own id."""
+    rid = str(adv_id or "").upper()
+    rid = rid[4:] if rid.startswith("OSV:") else rid
+    mr = _FANOUT_RHSA.match(rid)
+    if mr:
+        return mr.group(1)
+    rid = re.sub(r"^DEBIAN:", "", rid)
+    rid = re.sub(r":[0-9A-F]{5}$", "", rid)
+    return rid
+
+
+def fanout_breakdown(references):
+    """Distinct downstream records per issuer for one CVE's
+    ``enchantments.dependencies.references``. Returns ``{issuer: set(ids)}``."""
+    groups = collections.defaultdict(set)
+    for ref in references if isinstance(references, list) else ():
+        if not isinstance(ref, dict):
+            continue
+        for rid in ref.get("idList") or []:
+            routed = _fanout_route(ref.get("type"), rid)
+            if routed:
+                groups[routed[0]].add(routed[1])
+    return dict(groups)
+
+
+# ── Exploitation signals vs publication volume ───────────────────────────────
+# CISA KEV additions by ``dateAdded`` are set against the monthly publication
+# count; the catalog is fetched the way cve_epss_comparison.py does it, once a
+# day into DATA_DIR. (The archive's ``wildExploited`` flag was tried as a second
+# series and dropped: dated by its sources' ``firstSeen`` it spikes when a source
+# is onboarded, and by publication month it says little the KEV series does not.)
+EXPLOIT_START_MONTH = "2024-01"
+KEV_CATALOG_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+KEV_CATALOG_BASENAME = "known_exploited_vulnerabilities.json"
+
+
+def download_cisa_kev(data_dir=None):
+    """Path to today's copy of the CISA KEV catalog in ``data_dir`` (DATA_DIR by
+    default); re-downloaded once a day, else the local copy is kept. ``None``
+    when neither a download nor a local copy is available."""
+    import urllib.error
+    import urllib.request
+
+    data_dir = os.path.abspath(data_dir or os.getenv("DATA_DIR") or os.getcwd())
+    target_path = os.path.join(data_dir, KEV_CATALOG_BASENAME)
+    if os.path.exists(target_path):
+        if datetime.fromtimestamp(os.path.getmtime(target_path)).date() == datetime.now().date():
+            return target_path
+    print(f"Downloading CISA KEV catalog from: {KEV_CATALOG_URL}")
+    try:
+        req = urllib.request.Request(
+            KEV_CATALOG_URL, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as response:
+            payload = response.read()
+        os.makedirs(data_dir, exist_ok=True)
+        with open(target_path, "wb") as out_file:
+            out_file.write(payload)
+        return target_path
+    except Exception as e:  # noqa: BLE001 - any failure falls back to the local copy
+        print(f"Failed to download CISA KEV catalog: {e}")
+        return target_path if os.path.exists(target_path) else None
+
+
+def load_cisa_kev_cves(data_dir=None):
+    """The set of CVE ids in the CISA KEV catalog (upper-cased), or an empty set
+    when the catalog is unavailable. Ported from cve_epss_comparison.py."""
+    path = download_cisa_kev(data_dir)
+    if not path:
+        return set()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"Could not read KEV catalog {path}: {e}")
+        return set()
+    return {str(v.get("cveID")).upper().strip() for v in data.get("vulnerabilities", []) if v.get("cveID")}
+
+
+def kev_additions_by_month(data_dir=None):
+    """``{"YYYY-MM": additions}`` from the CISA KEV catalog's ``dateAdded``, plus
+    the catalog's release date; ``({}, None)`` when the catalog is unavailable."""
+    path = download_cisa_kev(data_dir)
+    if not path:
+        return {}, None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"Could not read KEV catalog {path}: {e}")
+        return {}, None
+    counts = collections.Counter()
+    for vuln in data.get("vulnerabilities", []):
+        added = str(vuln.get("dateAdded") or "")
+        if len(added) >= 7:
+            counts[added[:7]] += 1
+    return dict(counts), (data.get("dateReleased") or "")[:10] or None
+
+
+# ── Kernel bug-fix discovery vs CVE publishing ───────────────────────────────
+# HAND-TRANSCRIBED DATA. The top panel of the kernel-fixes slide is not in the
+# archive: it comes from LWN's chart "Bugs introduced and fixed by release",
+# Jonathan Corbet, "Development statistics for the 7.2 kernel", LWN.net,
+# 2026-08-17, file fixes-7.2.svg (CC BY-SA 4.0). The SVG is matplotlib output,
+# so the values below were read off its polylines against the y-axis ticks
+# (0..4000, 38.786 px per 1000) rather than estimated by eye; they are still a
+# transcription of a published chart, not LWN's underlying data, and are
+# rounded to the nearest commit. One release = one x position, v4.0 .. v7.2.
+# The four series carry LWN's own legend names.
+# The article's text gives 4,830 commits with Fixes tags in 7.2; the chart's
+# "Bugs Fixed" polyline reads 4,549 at 7.2 (and "Commits fixed" 4,306). The
+# chart evidently counts on a narrower basis than the prose — likely only Fixes
+# tags whose target commit lies within the plotted history. The slide draws the
+# chart's numbers, since that is what was transcribed, and says so.
+LWN_FIXES_SOURCE_URL = "https://lwn.net/Articles/1088776/"   # "Development statistics for the 7.2 kernel", 2026-08-17
+LWN_FIXES_ARTICLE_72_COMMITS = 4830   # the prose figure, for the record; not drawn
+LWN_FIXES_RELEASES = [
+    "4.0", "4.1", "4.2", "4.3", "4.4", "4.5", "4.6", "4.7", "4.8", "4.9", "4.10", "4.11", "4.12", "4.13",
+    "4.14", "4.15", "4.16", "4.17", "4.18", "4.19", "4.20",
+    "5.0", "5.1", "5.2", "5.3", "5.4", "5.5", "5.6", "5.7", "5.8", "5.9", "5.10", "5.11", "5.12", "5.13",
+    "5.14", "5.15", "5.16", "5.17", "5.18", "5.19",
+    "6.0", "6.1", "6.2", "6.3", "6.4", "6.5", "6.6", "6.7", "6.8", "6.9", "6.10", "6.11", "6.12", "6.13",
+    "6.14", "6.15", "6.16", "6.17", "6.18", "6.19",
+    "7.0", "7.1", "7.2",
+]
+LWN_FIXES_SERIES = {
+    # green, thick — Fixes: tags in the release, i.e. bugs fixed
+    "Bugs Fixed": [
+        239, 272, 355, 361, 380, 400, 435, 598, 628, 785, 804, 991, 884, 927, 1073, 1201, 1198, 1056, 1088, 1161, 1208,
+        1222, 1420, 1420, 1458, 1604, 1651, 1548, 1551, 1771, 1700, 2001, 1717, 1740, 1976, 1872, 1667, 2031, 1918, 1993, 1903,
+        2112, 2211, 2334, 2089, 1951, 2029, 1991, 1793, 2036, 2134, 1910, 1923, 2151, 2021, 1958, 2036, 2043, 2041, 2121, 2197,
+        2940, 3714, 4549,
+    ],
+    # blue, thin — distinct commits named by those Fixes: tags
+    "Commits fixed": [
+        229, 263, 345, 350, 365, 389, 427, 579, 607, 744, 765, 945, 853, 875, 1016, 1135, 1155, 1016, 1053, 1120, 1153,
+        1165, 1357, 1378, 1398, 1506, 1573, 1472, 1473, 1660, 1602, 1894, 1635, 1690, 1886, 1787, 1564, 1933, 1827, 1885, 1820,
+        2021, 2102, 2220, 1992, 1833, 1914, 1867, 1704, 1930, 2019, 1844, 1841, 2049, 1929, 1868, 1952, 1968, 1966, 2028, 2088,
+        2797, 3547, 4306,
+    ],
+    # brown, thick — bugs introduced in the release (found so far)
+    "Bugs introduced": [
+        733, 754, 1216, 1100, 1015, 1100, 1353, 1219, 1636, 1555, 1494, 1452, 1725, 1455, 1580, 1621, 1559, 1485, 1497, 1788, 1743,
+        1647, 1630, 1657, 1648, 1799, 1790, 1761, 1944, 1918, 1574, 1903, 1632, 1576, 1811, 1771, 1734, 1484, 1455, 1570, 1763,
+        1699, 1353, 1422, 1430, 1342, 1387, 1265, 1336, 1698, 1197, 1144, 1295, 1110, 1029, 869, 1163, 1073, 818, 842, 839,
+        548, 331, 1,
+    ],
+    # orange, thin — commits in the release later named by a Fixes: tag
+    "Buggy commits introduced": [
+        500, 546, 778, 707, 646, 725, 868, 767, 984, 924, 905, 876, 1035, 920, 969, 975, 967, 964, 964, 1060, 1087,
+        1081, 1064, 1080, 1065, 1065, 1125, 989, 1161, 1228, 1051, 1173, 1028, 1002, 1141, 1099, 996, 992, 947, 1057, 1110,
+        1042, 897, 905, 893, 919, 908, 861, 841, 950, 852, 765, 857, 737, 739, 605, 780, 726, 614, 607, 583,
+        417, 273, 1,
+    ],
+}
+# Mainline release dates, so the x-axis is time. 4.x and 5.16–5.19 from the
+# kernel's release history; 5.0–5.15, 6.x and 7.x from the kernel.org tarball
+# listing (mirrors.edge.kernel.org/pub/linux/kernel/v*.x/, which stamps the
+# day after a Sunday release — a day's drift that does not show on this axis).
+LWN_FIXES_RELEASE_DATES = {
+    "4.0": "2015-04-12", "4.1": "2015-06-21", "4.2": "2015-08-30", "4.3": "2015-11-01", "4.4": "2016-01-10",
+    "4.5": "2016-03-13", "4.6": "2016-05-15", "4.7": "2016-07-24", "4.8": "2016-10-02", "4.9": "2016-12-11",
+    "4.10": "2017-02-19", "4.11": "2017-04-30", "4.12": "2017-07-02", "4.13": "2017-09-03", "4.14": "2017-11-12",
+    "4.15": "2018-01-28", "4.16": "2018-04-01", "4.17": "2018-06-03", "4.18": "2018-08-12", "4.19": "2018-10-22",
+    "4.20": "2018-12-23",
+    "5.0": "2019-03-04", "5.1": "2019-05-06", "5.2": "2019-07-08", "5.3": "2019-09-16", "5.4": "2019-11-25",
+    "5.5": "2020-01-27", "5.6": "2020-03-30", "5.7": "2020-06-01", "5.8": "2020-08-03", "5.9": "2020-10-12",
+    "5.10": "2020-12-14", "5.11": "2021-02-15", "5.12": "2021-04-26", "5.13": "2021-06-28", "5.14": "2021-08-30",
+    "5.15": "2021-10-31", "5.16": "2022-01-09", "5.17": "2022-03-20", "5.18": "2022-05-22", "5.19": "2022-07-31",
+    "6.0": "2022-10-03", "6.1": "2022-12-12", "6.2": "2023-02-20", "6.3": "2023-04-24", "6.4": "2023-06-26",
+    "6.5": "2023-08-27", "6.6": "2023-10-30", "6.7": "2024-01-08", "6.8": "2024-03-10", "6.9": "2024-05-13",
+    "6.10": "2024-07-15", "6.11": "2024-09-15", "6.12": "2024-11-18", "6.13": "2025-01-20", "6.14": "2025-03-24",
+    "6.15": "2025-05-26", "6.16": "2025-07-28", "6.17": "2025-09-29", "6.18": "2025-12-01", "6.19": "2026-02-09",
+    "7.0": "2026-04-13", "7.1": "2026-06-14", "7.2": "2026-08-17",
+}
+KERNEL_FIXES_SERIES = "Bugs Fixed"     # the series drawn: Fixes: tags per release
+KERNEL_FIXES_WINDOW_START = "2022-01-01"   # the archive's daily counts begin here
+# The kernel's own CNA, as the dashboard names it (record ``cna``/``reporter``
+# "Linux"); it began assigning CVEs in February 2024, so cycles before that
+# carry no kernel CVEs and are excluded from the CVE plateau.
+KERNEL_CNA = "Linux"
+KERNEL_CNA_START = "2024-02-01"
+
+
+def daily_publication_series(daily_counts, start_date, end_date):
+    """Continuous daily publication counts from ``daily_counts[year][mm-dd]``
+    between two ISO dates inclusive, as ``(dates, counts)``."""
+    start = date.fromisoformat(start_date)
+    end = date.fromisoformat(end_date[:10])
+    dates, counts = [], []
+    cur = start
+    while cur <= end:
+        dates.append(datetime(cur.year, cur.month, cur.day))
+        counts.append(daily_counts.get(str(cur.year), {}).get(cur.strftime("%m-%d"), 0))
+        cur += timedelta(days=1)
+    return dates, counts
+
+
+# ── EPSS: recency penalty and recall ─────────────────────────────────────────
+# Two slides re-render panels of cve_epss_comparison.py's dashboards from the
+# monthly pass. The archive side is collected here (``epss_rows``: one row per
+# CVE of the last seven years — id, publication day, exploited-in-the-wild
+# flag); the EPSS side is the daily score feeds from empiricalsec/epss_scores,
+# fetched and read exactly as that script does (the helpers below are ported
+# from it). The feeds are only touched when the slides render, i.e. locally.
+EPSS_HIGH_CUTOFF = 0.10            # "EPSS flagged it": score at/above this
+EPSS_FEED_BASE_URL = "https://raw.githubusercontent.com/empiricalsec/epss_scores/main"
+AGING_SNAPSHOTS_BACK = 3           # snapshots at the anchor feed date, -1y, -2y, -3y
+AGING_MAX_AGE = 3                  # cohort ages 0..3 tracked per snapshot
+AGING_MAX_DATE_DRIFT_DAYS = 14     # reject a resolved snapshot further than this from target
+EPSS_RECALL_YEARS_BACK = 3         # recall slide: anchor year and the three before it
+# Rows are kept for cohorts the oldest snapshot can see: anchor year - 3 (oldest
+# snapshot) - 3 (its oldest cohort).
+EPSS_ROWS_YEARS_BACK = AGING_SNAPSHOTS_BACK + AGING_MAX_AGE
+
+
+def _epss_data_dir():
+    return os.path.abspath(os.getenv("DATA_DIR") or os.getcwd())
+
+
+def download_latest_epss_scores(data_dir=None):
+    """Path to the newest EPSS daily feed (today, walking back up to 7 days),
+    downloaded into ``data_dir`` unless already there; falls back to the newest
+    local feed. Ported from cve_epss_comparison.py."""
+    import urllib.error
+    import urllib.request
+
+    data_dir = os.path.abspath(data_dir or _epss_data_dir())
+    os.makedirs(data_dir, exist_ok=True)
+    today = datetime.now()
+    for i in range(7):
+        date_check = today - timedelta(days=i)
+        file_name = f"epss_scores-{date_check.strftime('%Y-%m-%d')}.csv.gz"
+        target_path = os.path.join(data_dir, file_name)
+        if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
+            return target_path
+        url = f"{EPSS_FEED_BASE_URL}/{date_check.strftime('%Y')}/{file_name}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            with urllib.request.urlopen(req, timeout=15) as response:
+                payload = response.read()
+            with open(target_path, "wb") as out_file:
+                out_file.write(payload)
+            print(f"Downloaded EPSS feed {file_name}")
+            return target_path
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                print(f"HTTP error downloading {file_name}: {e}")
+        except Exception as e:  # noqa: BLE001
+            print(f"Error downloading {file_name}: {e}")
+    existing = sorted(glob.glob(os.path.join(data_dir, "epss_scores-*.csv.gz")))
+    if existing:
+        print(f"EPSS feed download failed; using newest local feed {os.path.basename(existing[-1])}")
+        return existing[-1]
+    raise RuntimeError("No EPSS feed could be downloaded and none is present locally.")
+
+
+def download_historical_epss_scores(data_dir, target_date_str):
+    """``(path, actual_date)`` for the EPSS feed nearest ``target_date_str``
+    (exact day first, then ±1..7 days). Ported from cve_epss_comparison.py."""
+    import urllib.error
+    import urllib.request
+
+    target_date = datetime.strptime(target_date_str, "%Y-%m-%d")
+    for offset in [0] + [d for i in range(1, 8) for d in (-i, i)]:
+        date_check = target_date + timedelta(days=offset)
+        date_str = date_check.strftime("%Y-%m-%d")
+        file_name = f"epss_scores-{date_str}.csv.gz"
+        target_path = os.path.join(data_dir, file_name)
+        if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
+            return target_path, date_str
+        url = f"{EPSS_FEED_BASE_URL}/{date_check.strftime('%Y')}/{file_name}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            with urllib.request.urlopen(req, timeout=60) as response:
+                payload = response.read()
+            with open(target_path, "wb") as out_file:
+                out_file.write(payload)
+            print(f"Downloaded EPSS feed {file_name}")
+            return target_path, date_str
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                print(f"HTTP error downloading {file_name}: {e}")
+        except Exception as e:  # noqa: BLE001
+            print(f"Error downloading {file_name}: {e}")
+    existing = sorted(glob.glob(os.path.join(data_dir, target_date.strftime("epss_scores-%Y-*.csv.gz"))))
+    if existing:
+        best = existing[-1]
+        return best, os.path.basename(best).replace("epss_scores-", "").replace(".csv.gz", "")
+    raise RuntimeError(f"No EPSS feed near {target_date_str} could be downloaded and none is present locally.")
+
+
+def load_epss_scores_csv(csv_gz_path):
+    """``{CVE-ID: epss}`` from one daily feed. Ported from cve_epss_comparison.py."""
+    epss_map = {}
+    with gzip.open(csv_gz_path, "rt", encoding="utf-8") as f:
+        first_line = f.readline()
+        if not first_line.startswith("#"):
+            f.seek(0)
+        for row in csv.DictReader(f):
+            cve = row.get("cve")
+            epss_val = row.get("epss")
+            if cve and epss_val is not None:
+                try:
+                    epss_map[cve.upper()] = float(epss_val)
+                except ValueError:
+                    pass
+    return epss_map
+
+
+def read_epss_model_version(csv_gz_path):
+    """The feed's model version from its leading comment line, or ``None``."""
+    try:
+        with gzip.open(csv_gz_path, "rt", encoding="utf-8") as f:
+            first_line = f.readline()
+    except Exception:  # noqa: BLE001
+        return None
+    if not first_line.startswith("#"):
+        return None
+    mv = re.search(r"model_version\s*:\s*([^,\s]+)", first_line)
+    return mv.group(1) if mv else None
+
+
+def epss_date_from_filename(csv_gz_path):
+    mv = re.search(r"epss_scores-(\d{4}-\d{2}-\d{2})\.csv\.gz$", os.path.basename(csv_gz_path or ""))
+    return mv.group(1) if mv else None
+
+
+def _shift_years(date_obj, years_back):
+    try:
+        return date_obj.replace(year=date_obj.year - years_back)
+    except ValueError:
+        return date_obj.replace(year=date_obj.year - years_back, day=28)
+
+
+def resolve_aging_snapshots(data_dir, anchor_date_str, anchor_path):
+    """The anchor feed plus ``AGING_SNAPSHOTS_BACK`` feeds exactly one year apart
+    (oldest first), each ``{target, date, path, model_version}``; a feed that
+    cannot be fetched or drifts too far from its target is skipped. Ported from
+    cve_epss_comparison.py."""
+    anchor_date = datetime.strptime(anchor_date_str, "%Y-%m-%d")
+    snapshots = [{"target": anchor_date_str, "date": anchor_date_str, "path": anchor_path,
+                  "model_version": read_epss_model_version(anchor_path)}]
+    for years_back in range(1, AGING_SNAPSHOTS_BACK + 1):
+        target_dt = _shift_years(anchor_date, years_back)
+        target_str = target_dt.strftime("%Y-%m-%d")
+        try:
+            path, actual_date = download_historical_epss_scores(data_dir, target_str)
+        except Exception as e:  # noqa: BLE001
+            print(f"EPSS snapshot {target_str} unavailable ({e}); skipped.")
+            continue
+        drift = abs((datetime.strptime(actual_date, "%Y-%m-%d") - target_dt).days)
+        if drift > AGING_MAX_DATE_DRIFT_DAYS:
+            print(f"EPSS snapshot {target_str} resolved to {actual_date}, {drift} days off; skipped.")
+            continue
+        snapshots.append({"target": target_str, "date": actual_date, "path": path,
+                          "model_version": read_epss_model_version(path)})
+    snapshots.sort(key=lambda snap: snap["date"])
+    return snapshots
+
+
+def cohort_aging_from_rows(epss_rows, snapshots):
+    """Phase two of cve_epss_comparison.py's ``load_epss_cohort_aging_data``, run
+    over the rows the monthly pass already holds instead of a second archive
+    scan: for every (snapshot, publication-year cohort) the scores that snapshot
+    gave the cohort's CVEs published on or before the snapshot date. Returns
+    ``{snapshot_date: {year: {"scores", "eligible", "missing"}}}``; one feed is
+    loaded at a time."""
+    for snap in snapshots:
+        snap_year = int(snap["date"][:4])
+        snap["cohort_years"] = [str(snap_year - age) for age in range(AGING_MAX_AGE + 1)]
+    res = {}
+    for snap in snapshots:
+        snap_date = snap["date"]
+        snap_years = set(snap["cohort_years"])
+        epss_map = load_epss_scores_csv(snap["path"])
+        snap["n_scores"] = len(epss_map)
+        scores = {y: [] for y in snap_years}
+        eligible = {y: 0 for y in snap_years}
+        missing = {y: 0 for y in snap_years}
+        for cve_key, published_day, _wild in epss_rows:
+            year = published_day[:4]
+            if year not in snap_years or published_day > snap_date:
+                continue
+            eligible[year] += 1
+            epss_val = epss_map.get(cve_key)
+            if epss_val is not None:
+                scores[year].append(epss_val)
+            else:
+                missing[year] += 1
+        del epss_map
+        res[snap_date] = {
+            year: {"scores": np.array(scores[year]), "eligible": eligible[year], "missing": missing[year]}
+            for year in snap_years
+        }
+    return res
+
+
+def calculate_cohort_aging_stats(aging_data, snapshots):
+    """Ported verbatim in substance from cve_epss_comparison.py: share of each
+    scored cohort at/above ``EPSS_HIGH_CUTOFF`` by publication year and by cohort
+    age at scoring time, plus each snapshot's own oldest-to-newest fall."""
+    cells = {}
+    by_age = {age: {} for age in range(AGING_MAX_AGE + 1)}
+    for snap in snapshots:
+        snap_date = snap["date"]
+        snap_year = int(snap_date[:4])
+        cells[snap_date] = {}
+        for year, bucket in aging_data[snap_date].items():
+            year_scores = bucket["scores"]
+            n_scored = len(year_scores)
+            age = snap_year - int(year)
+            if n_scored == 0:
+                cells[snap_date][year] = None
+                continue
+            pct_ge_cutoff = float(np.sum(year_scores >= EPSS_HIGH_CUTOFF)) / n_scored * 100
+            cells[snap_date][year] = {
+                "age": age, "year": year, "n_scored": n_scored, "eligible": bucket["eligible"],
+                "missing": bucket["missing"],
+                "unscored_pct": bucket["missing"] / bucket["eligible"] * 100 if bucket["eligible"] else 0.0,
+                "pct_ge_cutoff": pct_ge_cutoff,
+                "median": float(np.median(year_scores)), "mean": float(np.mean(year_scores)),
+            }
+            by_age[age][snap_date] = pct_ge_cutoff
+    age_spread = {}
+    for age, per_snapshot in by_age.items():
+        if per_snapshot:
+            values = list(per_snapshot.values())
+            age_spread[age] = {"min": min(values), "max": max(values), "spread": max(values) - min(values),
+                               "mean": sum(values) / len(values), "n_snapshots": len(values)}
+    oldest_age = max(age_spread) if age_spread else AGING_MAX_AGE
+    drops = {}
+    for snap_date, snap_cells in cells.items():
+        snap_year = int(snap_date[:4])
+        base = snap_cells.get(str(snap_year - oldest_age))
+        newest = snap_cells.get(str(snap_year))
+        if base and newest and base["pct_ge_cutoff"] > 0:
+            ratio = newest["pct_ge_cutoff"] / base["pct_ge_cutoff"]
+            drops[snap_date] = {"ratio": ratio, "drop_pct": (1 - ratio) * 100, "from_age": oldest_age}
+    return {"cells": cells, "by_age": by_age, "age_spread": age_spread, "drops": drops, "oldest_age": oldest_age}
+
+
+def epss_recall_by_year(epss_rows, epss_map, anchor_date, years, exploited_ids=None):
+    """Per publication year, the same-period (Jan 1 → anchor month-day) sets
+    cve_epss_comparison.py's overlap chart uses: CVEs the latest feed scores above
+    ``EPSS_HIGH_CUTOFF`` and exploited CVEs, and the share of the exploited ones
+    EPSS flagged (recall). "Exploited" is membership of ``exploited_ids`` (the
+    CISA KEV catalog on the slide) when given, else the archive's wildExploited
+    flag as the standalone script uses."""
+    cutoff_md = anchor_date[5:10]
+    out = []
+    for year in years:
+        epss_set, wild_set, pop = set(), set(), 0
+        for cve_key, published_day, wild in epss_rows:
+            if published_day[:4] != year or published_day[5:10] > cutoff_md:
+                continue
+            pop += 1
+            val = epss_map.get(cve_key)
+            if val is not None and val > EPSS_HIGH_CUTOFF:
+                epss_set.add(cve_key)
+            if (cve_key in exploited_ids) if exploited_ids is not None else wild:
+                wild_set.add(cve_key)
+        both = epss_set & wild_set
+        out.append({
+            "year": year, "pop": pop, "n_epss": len(epss_set), "n_wild": len(wild_set), "both": len(both),
+            "epss_only": len(epss_set - wild_set), "expl_only": len(wild_set - epss_set),
+            "recall": (len(both) / len(wild_set) * 100.0) if wild_set else 0.0,
+        })
+    return out, cutoff_md
+
+
+# ── NVD status charts ────────────────────────────────────────────────────────
+# Every CVE carries the NVD ``vulnStatus`` it was published with; these two
+# charts count them by year and by week. Only the six NVD workflow statuses are
+# drawn — "Reserved" (no status) and "Rejected" are never in the picture.
+STATUS_START_YEAR = 2022            # the yearly bars start here
+STATUS_WEEKLY_START = "2024-01-01"  # the weekly chart starts on the first Monday on/after
+# Bottom-to-top stack order of the yearly bars and of the weekly areas.
+STATUS_BAR_ORDER = ["Analyzed", "Modified", "Undergoing Analysis", "Awaiting Analysis", "Received", "Deferred"]
+STATUS_STACK_ORDER = ["Deferred", "Analyzed", "Modified", "Undergoing Analysis", "Awaiting Analysis", "Received"]
+STATUS_COLORS = {
+    "Analyzed": "#1E90FF",            # Dodger Blue
+    "Modified": "#70A1FF",            # Sky Blue
+    "Undergoing Analysis": "#ECCC68", # Warm Yellow
+    "Awaiting Analysis": "#FFA502",   # Orange
+    "Received": "#FF4757",            # Vibrant Red
+    "Deferred": "#747D8C",            # Slate Gray
+}
+# The statuses that mean "NVD has not looked at this yet".
+STATUS_QUEUE = ("Undergoing Analysis", "Awaiting Analysis", "Received")
 
 # ── Sankey lane colors ───────────────────────────────────────────────────────
 # A lane's color belongs to its *place* in the ranking, not to the CNA's name.
@@ -485,11 +1281,29 @@ def count_monthly_cves(file_path, cut_off_date=None):
     daily_cna_counts_2026 = collections.defaultdict(collections.Counter)
     # daily_counts[year_str][month_day_str] = count
     daily_counts = collections.defaultdict(collections.Counter)
+    # daily_counts_kernel[year_str][month_day_str] = count, kernel CNA only
+    daily_counts_kernel = collections.defaultdict(collections.Counter)
     # candidate_stats["YYYY-MM"] = {"active", "rejected", "ref_types": Counter}
     # The "hidden" reserved/candidate CVEs, excluded from the main counts.
     candidate_stats = collections.defaultdict(
         lambda: {"active": 0, "rejected": 0, "ref_types": collections.Counter()}
     )
+    # status_yearly[year_str][vulnStatus] and status_weekly[monday_iso][vulnStatus]
+    # = count, for the NVD status charts. Counted over every record, candidates
+    # and all, the way the standalone cve_status_stats.py did, so those two
+    # pictures keep their numbers when drawn from here.
+    status_yearly = collections.defaultdict(collections.Counter)
+    status_weekly = collections.defaultdict(collections.Counter)
+    # chrome_cves: one row per Chrome-CNA CVE of the anchor year —
+    # {"id", "day", "advisories": [GCSA ids], "versions": [Chrome versions]}.
+    chrome_cves = []
+    # fanout_records[cve_id] = the archive record's facts the fan-out slide and
+    # its shortlist CSV need, for FANOUT_CVE and every FANOUT_SHORTLIST entry.
+    fanout_records = {}
+    fanout_wanted = set(FANOUT_SHORTLIST) | {FANOUT_CVE}
+    # epss_rows: (CVE id, publication day, exploited-in-the-wild flag) for every
+    # kept CVE of the last EPSS_ROWS_YEARS_BACK+1 years, for the EPSS slides.
+    epss_rows = []
 
     if cut_off_date:
         now = datetime.strptime(cut_off_date, "%Y-%m-%d")
@@ -546,6 +1360,45 @@ def count_monthly_cves(file_path, cut_off_date=None):
                 is_rejected = bool(vuln_status) and vuln_status.lower() == "rejected"
                 is_candidate = bool(reporter) and reporter.lower() == "candidate"
 
+                if item.get("id") in fanout_wanted:
+                    ench = item.get("enchantments")
+                    deps = ench.get("dependencies") if isinstance(ench, dict) else None
+                    refs = deps.get("references") if isinstance(deps, dict) else None
+                    refs = refs if isinstance(refs, list) else []
+                    fanout_records[item["id"]] = {
+                        "id": item["id"],
+                        "published": (published_date or "")[:10],
+                        "reporter": reporter,
+                        "short": (ench.get("short_description") if isinstance(ench, dict) else None) or "",
+                        "software": sorted({
+                            str(a.get("name") or a.get("cpeName") or "")
+                            for a in (item.get("affectedSoftware") or []) if isinstance(a, dict)
+                        }),
+                        "kev": any(isinstance(r, dict) and r.get("type") == "vulncheck_kev" for r in refs),
+                        "references": [
+                            {"type": r.get("type"), "idList": [str(i) for i in (r.get("idList") or [])]}
+                            for r in refs if isinstance(r, dict)
+                        ],
+                    }
+
+                if (
+                    published_date and len(published_date) >= 10
+                    and published_date[:10] <= anchor_date_str
+                    and published_date[:4].isdigit()
+                    and int(published_date[:4]) >= STATUS_START_YEAR
+                ):
+                    try:
+                        pub_day = date(
+                            int(published_date[:4]), int(published_date[5:7]), int(published_date[8:10])
+                        )
+                    except ValueError:
+                        pub_day = None
+                    if pub_day is not None:
+                        status_key = vuln_status or "Reserved"
+                        status_yearly[published_date[:4]][status_key] += 1
+                        week_start = pub_day - timedelta(days=pub_day.weekday())
+                        status_weekly[week_start.isoformat()][status_key] += 1
+
                 # Candidate (reserved / not-yet-published) CVEs are excluded from
                 # the main counts, but tracked separately as the "hidden" volume:
                 # active vs rejected, plus OSV/GitHub reference presence, by month
@@ -577,6 +1430,19 @@ def count_monthly_cves(file_path, cut_off_date=None):
                 if is_rejected:
                     continue
 
+                if (
+                    published_date and len(published_date) >= 10 and item.get("id")
+                    and published_date[:4].isdigit()
+                    and int(published_date[:4]) >= int(anchor_year) - EPSS_ROWS_YEARS_BACK
+                    and published_date[:10] <= anchor_date_str
+                ):
+                    ench = item.get("enchantments")
+                    expl = ench.get("exploitation") if isinstance(ench, dict) else None
+                    epss_rows.append((
+                        str(item["id"]).upper(), published_date[:10],
+                        isinstance(expl, dict) and expl.get("wildExploited") is True,
+                    ))
+
                 if published_date and len(published_date) >= 10:
                     year = published_date[:4]
                     month = published_date[5:7]
@@ -589,8 +1455,32 @@ def count_monthly_cves(file_path, cut_off_date=None):
                     if year in ["2022", "2023", "2024", "2025", "2026"]:
                         cna_name = item.get("cna") or reporter or "Unknown"
 
+                        if cna_name == CHROME_CNA and year == anchor_year:
+                            advisories, versions = [], set()
+                            ench = item.get("enchantments")
+                            deps = ench.get("dependencies") if isinstance(ench, dict) else None
+                            refs = deps.get("references") if isinstance(deps, dict) else None
+                            for ref in refs if isinstance(refs, list) else ():
+                                if not isinstance(ref, dict):
+                                    continue
+                                if ref.get("type") == "chrome":
+                                    advisories.extend(str(i) for i in ref.get("idList") or [])
+                                elif ref.get("type") == "nessus":
+                                    for plugin in ref.get("idList") or []:
+                                        mv = _CHROME_NESSUS_VER.match(str(plugin))
+                                        if mv:
+                                            versions.add(".".join(mv.groups()))
+                            chrome_cves.append({
+                                "id": item.get("id"),
+                                "day": record_date_str,
+                                "advisories": advisories,
+                                "versions": sorted(versions),
+                            })
+
                         # Store in full monthly stats
                         stats[month][year][cna_name] += 1
+                        if cna_name == KERNEL_CNA:
+                            daily_counts_kernel[year][f"{month}-{day:02d}"] += 1
 
                         # Store in partial stats if within the same day-range as current date
                         if day <= current_day:
@@ -632,8 +1522,14 @@ def count_monthly_cves(file_path, cut_off_date=None):
         "daily_counts_2025": daily_counts_2025,
         "daily_counts_2026": daily_counts_2026,
         "daily_counts": daily_counts,
+        "daily_counts_kernel": daily_counts_kernel,
         "daily_cna_counts_2026": daily_cna_counts_2026,
         "candidate_stats": candidate_stats,
+        "status_yearly": status_yearly,
+        "status_weekly": status_weekly,
+        "chrome_cves": chrome_cves,
+        "fanout_records": fanout_records,
+        "epss_rows": epss_rows,
     }
 
 
@@ -1809,34 +2705,11 @@ def sankey_rank_color_map(stats, partial_stats, ytd_2026, anchor_month_str, anch
     )
 
 
-def plot_custom_sankey_flow(
-    stats,
-    partial_stats,
-    top_names,
-    anchor_date,
-    anchor_month_complete=False,
-    output_filename="cve_monthly_stats_comparison_sankey_monthly.png",
-):
-    """
-    Plots a custom Sankey flow visualization of CVE contributions for top YTD
-    CNAs, starting from December of the previous year, flowing through each
-    month of the current year, and ending at the anchor month.
+def _prep_sankey_flow(stats, partial_stats, top_names, anchor_date, anchor_month_complete=False):
+    """Everything ``plot_custom_sankey_flow`` draws, before any layout.
 
-    Every column hangs from one shared baseline and is drawn to one scale, so a
-    height means the same number of CVEs wherever it sits: a lane can be read
-    against another lane, against the ruler on the right, and against a whole
-    column of some other month. That last comparison is the reason for the
-    layout. The columns used to be centered on one another with a fixed gap
-    between lanes, and both of those broke it — a centered column has no shared
-    origin to measure from, and 15 gaps of padding made a full column stand
-    taller than the CVEs in it, by more the further down you counted. So the
-    gaps are gone (the separation is now taken from *inside* each band, which
-    costs no layout) and the counts are used unfloored. The dashed guide carries
-    the first month of the year across the picture for exactly that comparison.
-
-    The last column is the anchor month. It is normally partial, and its header
-    carries the day range that says so; when ``anchor_month_complete`` it is a
-    whole month and gets a plain month header, like every column before it.
+    Shared with the slide renderer (``monthly_slides``) so both pictures are cut
+    from the very same numbers; nothing in here knows about inches or y units.
     """
     anchor_month_str = anchor_date[5:7]  # e.g., "06" for June
     current_year = int(anchor_date[:4])  # display year, derived from the data anchor
@@ -1903,6 +2776,117 @@ def plot_custom_sankey_flow(
         totals.append(sum(volumes.values()))
 
     max_total = max(totals) if totals else 1
+
+    # One color per rank, in the stack's own order — this chart defines the
+    # ranking every other Sankey inherits.
+    colors = sankey_lane_colors(all_items, sankey_rank_colors(sorted_top_names))
+
+    # ── The reference guide ──────────────────────────────────────────────────
+    # One month's entire output, carried across every column at the depth it
+    # reaches. The first month of the current year is the natural yardstick: the
+    # dashed line leaves that column's own underside, so wherever it crosses a
+    # later month it says "this many CNAs, and you have already matched it".
+    ref_idx = 1 if len(stages) > 1 else None
+    ref_total = totals[ref_idx] if ref_idx is not None else 0
+    ref_label = stage_labels[ref_idx] if ref_idx is not None else ""
+    # Only meaningful once a later month has grown clear of the yardstick.
+    show_ref = (
+        ref_idx is not None
+        and len(stages) >= 4
+        and ref_total > 0
+        and totals[-1] >= 1.25 * ref_total
+    )
+
+    # ── The callout ──────────────────────────────────────────────────────────
+    # How many of the newest month's top CNAs it takes to cover an entire
+    # earlier month, read off the same numbers the chart is drawn from, so it
+    # can never drift from what is on screen.
+    callout = None
+    if show_ref:
+        cum = 0
+        n_cnas = 0
+        for name in sorted_top_names:
+            cum += raw_data[-1][name]
+            n_cnas += 1
+            if cum >= _SANKEY_ALMOST * ref_total:
+                break
+        ref_publishers = sum(1 for v in stages[ref_idx]["data"].values() if v > 0)
+        pct = round(cum / ref_total * 100)
+        verb = (
+            "out-publish" if pct >= 102 else
+            "match" if pct >= 98 else
+            "nearly match"
+        )
+        callout = {
+            "cum": cum, "n_cnas": n_cnas, "ref_publishers": ref_publishers,
+            "pct": pct, "verb": verb,
+        }
+
+    return {
+        "anchor_month_str": anchor_month_str,
+        "current_year": current_year,
+        "prev_year": prev_year,
+        "months_abbrev": months_abbrev,
+        "stages": stages,
+        "stage_labels": stage_labels,
+        "sorted_top_names": sorted_top_names,
+        "all_items": all_items,
+        "raw_data": raw_data,
+        "totals": totals,
+        "max_total": max_total,
+        "colors": colors,
+        "ref_idx": ref_idx,
+        "ref_total": ref_total,
+        "ref_label": ref_label,
+        "show_ref": show_ref,
+        "callout": callout,
+    }
+
+
+def plot_custom_sankey_flow(
+    stats,
+    partial_stats,
+    top_names,
+    anchor_date,
+    anchor_month_complete=False,
+    output_filename="cve_monthly_stats_comparison_sankey_monthly.png",
+):
+    """
+    Plots a custom Sankey flow visualization of CVE contributions for top YTD
+    CNAs, starting from December of the previous year, flowing through each
+    month of the current year, and ending at the anchor month.
+
+    Every column hangs from one shared baseline and is drawn to one scale, so a
+    height means the same number of CVEs wherever it sits: a lane can be read
+    against another lane, against the ruler on the right, and against a whole
+    column of some other month. That last comparison is the reason for the
+    layout. The columns used to be centered on one another with a fixed gap
+    between lanes, and both of those broke it — a centered column has no shared
+    origin to measure from, and 15 gaps of padding made a full column stand
+    taller than the CVEs in it, by more the further down you counted. So the
+    gaps are gone (the separation is now taken from *inside* each band, which
+    costs no layout) and the counts are used unfloored. The dashed guide carries
+    the first month of the year across the picture for exactly that comparison.
+
+    The last column is the anchor month. It is normally partial, and its header
+    carries the day range that says so; when ``anchor_month_complete`` it is a
+    whole month and gets a plain month header, like every column before it.
+    """
+    p = _prep_sankey_flow(
+        stats, partial_stats, top_names, anchor_date, anchor_month_complete
+    )
+    anchor_month_str = p["anchor_month_str"]
+    current_year = p["current_year"]
+    prev_year = p["prev_year"]
+    months_abbrev = p["months_abbrev"]
+    stages = p["stages"]
+    sorted_top_names = p["sorted_top_names"]
+    all_items = p["all_items"]
+    stage_labels = p["stage_labels"]
+    raw_data = p["raw_data"]
+    totals = p["totals"]
+    max_total = p["max_total"]
+    colors = p["colors"]
     # y-units per CVE — the scale of the whole picture, one number.
     unit = (_SANKEY_Y_TOP - _SANKEY_Y_FLOOR) / max(max_total, 1)
 
@@ -1931,10 +2915,6 @@ def plot_custom_sankey_flow(
             return y0, y1
         d = min(_SANKEY_BAND_INSET, max(0.0, (h - _SANKEY_MIN_BAND) / 2.0))
         return y0 + d, y1 - d
-
-    # One color per rank, in the stack's own order — this chart defines the
-    # ranking every other Sankey inherits.
-    colors = sankey_lane_colors(all_items, sankey_rank_colors(sorted_top_names))
 
     # Plot
     plt.style.use("dark_background")
@@ -2042,17 +3022,9 @@ def plot_custom_sankey_flow(
     # reaches. The first month of the current year is the natural yardstick: the
     # dashed line leaves that column's own underside, so wherever it crosses a
     # later column it says "this many CNAs, and you have already matched it".
-    ref_idx = 1 if len(stages) > 1 else None
-    ref_total = totals[ref_idx] if ref_idx is not None else 0
-    ref_label = stage_labels[ref_idx] if ref_idx is not None else ""
+    ref_idx, ref_total, ref_label = p["ref_idx"], p["ref_total"], p["ref_label"]
+    show_ref = p["show_ref"]
     ref_y = _SANKEY_Y_TOP - ref_total * unit
-    # Only meaningful once a later month has grown clear of the yardstick.
-    show_ref = (
-        ref_idx is not None
-        and len(stages) >= 4
-        and ref_total > 0
-        and totals[-1] >= 1.25 * ref_total
-    )
     if show_ref:
         ax.plot(
             [grid_x0, span + 0.58 * x_in], [ref_y] * 2,
@@ -2175,20 +3147,11 @@ def plot_custom_sankey_flow(
     # cover an entire earlier month is read off the same numbers the chart is
     # drawn from, so it can never drift from what is on screen.
     if show_ref:
-        cum = 0
-        n_cnas = 0
-        for name in sorted_top_names:
-            cum += raw_data[-1][name]
-            n_cnas += 1
-            if cum >= _SANKEY_ALMOST * ref_total:
-                break
-        ref_publishers = sum(1 for v in stages[ref_idx]["data"].values() if v > 0)
-        pct = round(cum / ref_total * 100)
-        verb = (
-            "out-publish" if pct >= 102 else
-            "match" if pct >= 98 else
-            "nearly match"
-        )
+        cum = p["callout"]["cum"]
+        n_cnas = p["callout"]["n_cnas"]
+        ref_publishers = p["callout"]["ref_publishers"]
+        pct = p["callout"]["pct"]
+        verb = p["callout"]["verb"]
         # The callout lives in the empty wedge under the growth curve. Early in
         # the year there is no wedge yet, and text dropped there would land on
         # the bands — so it is drawn only where the columns it would run beneath
@@ -2265,6 +3228,115 @@ def plot_custom_sankey_flow(
     saved_files_log.append(f"Saved custom monthly flow Sankey chart to {os.path.abspath(output_filename)}")
 
 
+def _prep_incomplete_sankey(
+    data_2025_partial,
+    data_2026_partial,
+    prev_data_partial,
+    top_names,
+    range_label,
+    prev_range_label,
+    prev_year_str,
+    anchor_date,
+    center_is_complete=False,
+    rank_colors=None,
+):
+    """Everything ``plot_incomplete_month_sankey`` draws, before any layout.
+
+    Shared with the slide renderer (``monthly_slides``). ``raw_data`` carries
+    the floored lane volumes the web chart sizes its bands by; ``exact_data``
+    the unfloored counts, for a renderer that hangs its columns to scale.
+    """
+    current_year = int(anchor_date[:4])  # display year, derived from the data anchor
+    prev_year = current_year - 1
+
+    # Three stages: previous month (MoM) -> current year -> previous year (YoY).
+    stages = [
+        {"label": f"{prev_year_str} ({prev_range_label})", "data": prev_data_partial},
+        {"label": f"{current_year} ({range_label})", "data": data_2026_partial},
+        {"label": f"{prev_year} ({range_label})", "data": data_2025_partial},
+    ]
+
+    # Sort top CNAs by their current-month (pivot) volume, and drop the ones that
+    # published nothing in it. ``top_names`` also carries the leaders of the
+    # previous month and of last year, so a CNA can be named here purely for a
+    # column that is not the subject of the chart; with no pivot volume its lane
+    # is drawn at the minimum band height across all three stops and reads as a
+    # flow that does not exist. What it did publish in the other two columns is
+    # not lost — it joins "Others" there.
+    sorted_top_names = sorted(
+        (c for c in top_names if data_2026_partial.get(c, 0) > 0),
+        key=lambda c: data_2026_partial.get(c, 0),
+        reverse=True,
+    )
+    all_items = sorted_top_names + ["Others"]
+
+    stage_labels = [s["label"] for s in stages]
+
+    # As in plot_custom_sankey_flow: the max(5, ...) floor sizes the bands so a
+    # near-empty lane stays visible, but the header must report the real data.
+    # Every lane now has pivot-month volume, but the flanking columns can still
+    # sit at 0 (a CNA that started publishing this month, say), and each of those
+    # would otherwise add 5 to that column's header.
+    raw_data = []
+    exact_data = []
+    totals = []
+    display_totals = []
+    for stage in stages:
+        stage_data = stage["data"]
+        volumes = {}
+        exact = {}
+        for cna in sorted_top_names:
+            volumes[cna] = max(5, stage_data.get(cna, 0))
+            exact[cna] = stage_data.get(cna, 0)
+        others_val = sum(v for k, v in stage_data.items() if k not in sorted_top_names)
+        volumes["Others"] = max(5, others_val)
+        exact["Others"] = others_val
+
+        raw_data.append(volumes)
+        exact_data.append(exact)
+        totals.append(sum(volumes.values()))
+        display_totals.append(sum(stage_data.values()))
+
+    max_total_vol = max(totals) if totals else 1.0
+
+    # Inherited from the monthly-flow ranking, so a top-15 CNA is the same color
+    # in both charts; the extra lanes this chart names stay gray.
+    colors = sankey_lane_colors(all_items, rank_colors)
+
+    title = f"CVE Contributions of Top CNAs ({range_label}) — MoM & YoY"
+    if center_is_complete:
+        subtitle = (
+            f"Left: previous month, {prev_range_label} (MoM).  Center: {range_label}, "
+            f"complete.  Right: {prev_year} same month (YoY).  "
+            f"Sized by volume, sorted by {range_label} volume."
+        )
+    else:
+        subtitle = (
+            f"Left: previous month {prev_range_label} (MoM).  Center: current incomplete month.  "
+            f"Right: {prev_year} same range (YoY).  Sized by volume, sorted by current-month volume."
+        )
+
+    return {
+        "current_year": current_year,
+        "prev_year": prev_year,
+        "stages": stages,
+        "stage_labels": stage_labels,
+        "sorted_top_names": sorted_top_names,
+        "all_items": all_items,
+        "raw_data": raw_data,
+        "exact_data": exact_data,
+        "totals": totals,
+        "display_totals": display_totals,
+        "max_total_vol": max_total_vol,
+        "colors": colors,
+        "title": title,
+        "subtitle": subtitle,
+        "range_label": range_label,
+        "prev_range_label": prev_range_label,
+        "center_is_complete": center_is_complete,
+    }
+
+
 def plot_incomplete_month_sankey(
     data_2025_partial,
     data_2026_partial,
@@ -2299,53 +3371,22 @@ def plot_incomplete_month_sankey(
     year's top 15 wears the same color here as in the monthly-flow chart, and a
     lane named only for this chart gets the "Others" gray.
     """
-    current_year = int(anchor_date[:4])  # display year, derived from the data anchor
-    prev_year = current_year - 1
-
-    # Three stages: previous month (MoM) -> current year -> previous year (YoY).
-    stages = [
-        {"label": f"{prev_year_str} ({prev_range_label})", "data": prev_data_partial},
-        {"label": f"{current_year} ({range_label})", "data": data_2026_partial},
-        {"label": f"{prev_year} ({range_label})", "data": data_2025_partial},
-    ]
-
-    # Sort top CNAs by their current-month (pivot) volume, and drop the ones that
-    # published nothing in it. ``top_names`` also carries the leaders of the
-    # previous month and of last year, so a CNA can be named here purely for a
-    # column that is not the subject of the chart; with no pivot volume its lane
-    # is drawn at the minimum band height across all three stops and reads as a
-    # flow that does not exist. What it did publish in the other two columns is
-    # not lost — it joins "Others" there.
-    sorted_top_names = sorted(
-        (c for c in top_names if data_2026_partial.get(c, 0) > 0),
-        key=lambda c: data_2026_partial.get(c, 0),
-        reverse=True,
+    p = _prep_incomplete_sankey(
+        data_2025_partial, data_2026_partial, prev_data_partial, top_names,
+        range_label, prev_range_label, prev_year_str, anchor_date,
+        center_is_complete=center_is_complete, rank_colors=rank_colors,
     )
-    all_items = sorted_top_names + ["Others"]
-
-    stage_labels = [s["label"] for s in stages]
-
-    # As in plot_custom_sankey_flow: the max(5, ...) floor sizes the bands so a
-    # near-empty lane stays visible, but the header must report the real data.
-    # Every lane now has pivot-month volume, but the flanking columns can still
-    # sit at 0 (a CNA that started publishing this month, say), and each of those
-    # would otherwise add 5 to that column's header.
-    raw_data = []
-    totals = []
-    display_totals = []
-    for stage in stages:
-        stage_data = stage["data"]
-        volumes = {}
-        for cna in sorted_top_names:
-            volumes[cna] = max(5, stage_data.get(cna, 0))
-        others_val = sum(v for k, v in stage_data.items() if k not in sorted_top_names)
-        volumes["Others"] = max(5, others_val)
-
-        raw_data.append(volumes)
-        totals.append(sum(volumes.values()))
-        display_totals.append(sum(stage_data.values()))
-
-    max_total_vol = max(totals) if totals else 1.0
+    current_year = p["current_year"]
+    prev_year = p["prev_year"]
+    stages = p["stages"]
+    sorted_top_names = p["sorted_top_names"]
+    all_items = p["all_items"]
+    stage_labels = p["stage_labels"]
+    raw_data = p["raw_data"]
+    totals = p["totals"]
+    display_totals = p["display_totals"]
+    max_total_vol = p["max_total_vol"]
+    colors = p["colors"]
 
     # Compute stacked positions centered at y = 500, scaled by absolute volumes
     gap = 12
@@ -2369,10 +3410,6 @@ def plot_incomplete_month_sankey(
             pos[item] = (y_start, y_end)
             curr_y = y_start - gap
         stage_positions.append(pos)
-
-    # Inherited from the monthly-flow ranking, so a top-15 CNA is the same color
-    # in both charts; the extra lanes this chart names stay gray.
-    colors = sankey_lane_colors(all_items, rank_colors)
 
     # Plot. Width scales with the number of stops so columns sit far enough apart
     # for the (left-column) CNA name labels to clear the neighbouring column.
@@ -2469,24 +3506,14 @@ def plot_incomplete_month_sankey(
     title_x = (len(stages) - 1) / 2.0
     ax.text(
         title_x, 1090,
-        f"CVE Contributions of Top CNAs ({range_label}) — MoM & YoY",
+        p["title"],
         ha="center",
         va="bottom",
         color="#FFFFFF",
         fontsize=26,
         fontweight="bold"
     )
-    if center_is_complete:
-        subtitle = (
-            f"Left: previous month, {prev_range_label} (MoM).  Center: {range_label}, "
-            f"complete.  Right: {prev_year} same month (YoY).  "
-            f"Sized by volume, sorted by {range_label} volume."
-        )
-    else:
-        subtitle = (
-            f"Left: previous month {prev_range_label} (MoM).  Center: current incomplete month.  "
-            f"Right: {prev_year} same range (YoY).  Sized by volume, sorted by current-month volume."
-        )
+    subtitle = p["subtitle"]
     ax.text(
         title_x, 1065,
         subtitle,
@@ -2515,10 +3542,9 @@ def plot_incomplete_month_sankey(
     saved_files_log.append(f"Saved incomplete-month Sankey chart to {os.path.abspath(output_filename)}")
 
 
-def plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str, output_filename="cve_monthly_stats_comparison_ytd_growth.png"):
-    """
-    Plots YTD growth over the same date in 2025 for all days in 2026 up to anchor_date_str.
-    """
+def _prep_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str):
+    """Everything ``plot_ytd_growth`` draws, before any layout. Shared with the
+    slide renderer (``monthly_slides``)."""
     current_year = int(anchor_date_str[:4])  # display year, derived from the data anchor
     prev_year = current_year - 1
     start_date = datetime(2026, 1, 1)
@@ -2563,7 +3589,7 @@ def plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str, outpu
         growth_pct = (growth_abs / (cumulative_2025 + 100)) * 100
         ytd_growth_pct.append(growth_pct)
         date_series.append(dt)
-        
+
         daily_values_2025.append(count_25)
         daily_values_2026.append(count_26)
 
@@ -2580,6 +3606,34 @@ def plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str, outpu
     days_count = len(dates_2026)
     final_speed_25 = cumulative_2025 / days_count if days_count > 0 else 0.0
     final_speed_26 = cumulative_2026 / days_count if days_count > 0 else 0.0
+
+    return {
+        "current_year": current_year,
+        "prev_year": prev_year,
+        "date_series": date_series,
+        "ma_2025": ma_2025,
+        "ma_2026": ma_2026,
+        "ytd_values_2025": ytd_values_2025,
+        "ytd_values_2026": ytd_values_2026,
+        "cumulative_2025": cumulative_2025,
+        "cumulative_2026": cumulative_2026,
+        "final_speed_25": final_speed_25,
+        "final_speed_26": final_speed_26,
+    }
+
+
+def plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str, output_filename="cve_monthly_stats_comparison_ytd_growth.png"):
+    """
+    Plots YTD growth over the same date in 2025 for all days in 2026 up to anchor_date_str.
+    """
+    p = _prep_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str)
+    current_year = p["current_year"]
+    prev_year = p["prev_year"]
+    date_series = p["date_series"]
+    ma_2025 = p["ma_2025"]
+    ma_2026 = p["ma_2026"]
+    final_speed_25 = p["final_speed_25"]
+    final_speed_26 = p["final_speed_26"]
 
     # The fastest curve sets the axis, and the axis sets the figure height — at a
     # scale that never changes until the picture is square. See _speed_layout.
@@ -2661,11 +3715,9 @@ def plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str, outpu
     saved_files_log.append(f"YTD growth comparison chart saved to {os.path.abspath(output_filename)}")
 
 
-def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_monthly_stats_comparison_yearly_cumulative.png"):
-    """
-    Plots cumulative CVEs for each year from 2022 to 2025 (full year) and 2026 (YTD up to anchor_date_str).
-    Includes the average daily speed in the legend and highlights the moment 2026 surpassed any previous years' totals.
-    """
+def _prep_yearly_cumulative(daily_counts, anchor_date_str):
+    """Everything ``plot_yearly_cumulative`` draws, before any layout. Shared
+    with the slide renderer (``monthly_slides``)."""
     # Construct reference dates for X-axis using a leap year (2024) to cover Feb 29
     start_ref = datetime(2024, 1, 1)
     ref_dates = []
@@ -2752,6 +3804,49 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
                 "cumulative_2026_val": cumulative_series["2026"][surpassed_idx]
             })
 
+    # Horizontal guiding lines: any previous year whose full-year total 2026 has
+    # already reached OR is within 95% of. Surpassed years additionally get a
+    # star + "Surpassed ... on <date>" annotation below; approaching years
+    # (95%-100%) show the guiding line only. The totals themselves live in the
+    # legend, where every year has one — the guides only mark the few that are
+    # in play, so labelling them on the right told a partial story twice.
+    final_2026 = cumulative_series["2026"][-1] if cumulative_series["2026"] else 0
+    guide_years = [
+        y for y in ["2022", "2023", "2024", "2025"]
+        if totals[y] > 0 and final_2026 >= 0.95 * totals[y]
+    ]
+    # End the guides at the "Jan" (next-year) tick rather than spanning the whole
+    # axis / the label margin.
+    guide_xmax = datetime(ref_dates[-1].year + 1, 1, 1)
+
+    return {
+        "ref_dates": ref_dates,
+        "anchor_date_2026": anchor_date_2026,
+        "years": years,
+        "cumulative_series": cumulative_series,
+        "dates_series": dates_series,
+        "totals": totals,
+        "avg_speeds": avg_speeds,
+        "surpassed_info": surpassed_info,
+        "final_2026": final_2026,
+        "guide_years": guide_years,
+        "guide_xmax": guide_xmax,
+    }
+
+
+def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_monthly_stats_comparison_yearly_cumulative.png"):
+    """
+    Plots cumulative CVEs for each year from 2022 to 2025 (full year) and 2026 (YTD up to anchor_date_str).
+    Includes the average daily speed in the legend and highlights the moment 2026 surpassed any previous years' totals.
+    """
+    p = _prep_yearly_cumulative(daily_counts, anchor_date_str)
+    ref_dates = p["ref_dates"]
+    cumulative_series = p["cumulative_series"]
+    dates_series = p["dates_series"]
+    totals = p["totals"]
+    avg_speeds = p["avg_speeds"]
+    surpassed_info = p["surpassed_info"]
+
     # The tallest curve sets the axis, and the axis sets the figure height — at a
     # scale that never changes until the picture is square. See _cumulative_layout.
     y_top, fig_h = _cumulative_layout(max(totals.values()) if totals else 0)
@@ -2797,14 +3892,8 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
     # (95%-100%) show the guiding line only. The totals themselves live in the
     # legend, where every year has one — the guides only mark the few that are
     # in play, so labelling them on the right told a partial story twice.
-    final_2026 = cumulative_series["2026"][-1] if cumulative_series["2026"] else 0
-    guide_years = [
-        y for y in ["2022", "2023", "2024", "2025"]
-        if totals[y] > 0 and final_2026 >= 0.95 * totals[y]
-    ]
-    # End the guides at the "Jan" (next-year) tick rather than spanning the whole
-    # axis / the label margin.
-    guide_xmax = datetime(ref_dates[-1].year + 1, 1, 1)
+    guide_years = p["guide_years"]
+    guide_xmax = p["guide_xmax"]
     for prev_y in guide_years:
         prev_total = totals[prev_y]
         ax.hlines(
@@ -2911,11 +4000,9 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
     saved_files_log.append(f"Yearly cumulative comparison chart saved to {os.path.abspath(output_filename)}")
 
 
-def plot_monthly_projections(stats, completed_month_strs, slope, intercept, partial_stats=None, current_month_str=None, current_month_yoy_growth=None, anchor_date=None, output_filename="cve_monthly_stats_comparison_projection.png"):
-    """
-    Generates a cumulative monthly publication comparison chart for 2025 vs 2026,
-    including trend projections for remaining 2026 months and MoM growth annotations.
-    """
+def _prep_projections(stats, completed_month_strs, slope, intercept, partial_stats=None, current_month_str=None, current_month_yoy_growth=None, anchor_date=None):
+    """Everything ``plot_monthly_projections`` draws, before any layout. Shared
+    with the slide renderer (``monthly_slides``)."""
     # Display years derived from the data anchor (falls back to the clock if unset).
     current_year = int(anchor_date[:4]) if anchor_date else datetime.now().year
     prev_year = current_year - 1
@@ -3092,6 +4179,57 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
 
     # Hardcode December value to land exactly on 100,000 baseline target
     y_2026_proj_cum[11] = 100000
+
+
+    return {
+        "current_year": current_year,
+        "prev_year": prev_year,
+        "months_list": months_list,
+        "months_names": months_names,
+        "n_comp": n_comp,
+        "last_comp_idx": last_comp_idx,
+        "cur_month_idx": cur_month_idx,
+        "start_proj_idx": start_proj_idx,
+        "y_2025": y_2025,
+        "y_2025_cum": y_2025_cum,
+        "y_2026_actual_cum": y_2026_actual_cum,
+        "y_2026_full_cum": y_2026_full_cum,
+        "y_2026_runrate_cum": y_2026_runrate_cum,
+        "y_2026_runrate_proj_cum": y_2026_runrate_proj_cum,
+        "y_2026_proj_cum": y_2026_proj_cum,
+        "yoy_2026": yoy_2026,
+        "yoy_2026_runrate": yoy_2026_runrate,
+        "yoy_2026_green": yoy_2026_green,
+    }
+
+
+def plot_monthly_projections(stats, completed_month_strs, slope, intercept, partial_stats=None, current_month_str=None, current_month_yoy_growth=None, anchor_date=None, output_filename="cve_monthly_stats_comparison_projection.png"):
+    """
+    Generates a cumulative monthly publication comparison chart for 2025 vs 2026,
+    including trend projections for remaining 2026 months and MoM growth annotations.
+    """
+    p = _prep_projections(
+        stats, completed_month_strs, slope, intercept,
+        partial_stats=partial_stats, current_month_str=current_month_str,
+        current_month_yoy_growth=current_month_yoy_growth, anchor_date=anchor_date,
+    )
+    current_year = p["current_year"]
+    prev_year = p["prev_year"]
+    months_list = p["months_list"]
+    months_names = p["months_names"]
+    n_comp = p["n_comp"]
+    last_comp_idx = p["last_comp_idx"]
+    cur_month_idx = p["cur_month_idx"]
+    start_proj_idx = p["start_proj_idx"]
+    y_2025_cum = p["y_2025_cum"]
+    y_2026_actual_cum = p["y_2026_actual_cum"]
+    y_2026_full_cum = p["y_2026_full_cum"]
+    y_2026_runrate_cum = p["y_2026_runrate_cum"]
+    y_2026_runrate_proj_cum = p["y_2026_runrate_proj_cum"]
+    y_2026_proj_cum = p["y_2026_proj_cum"]
+    yoy_2026 = p["yoy_2026"]
+    yoy_2026_runrate = p["yoy_2026_runrate"]
+    yoy_2026_green = p["yoy_2026_green"]
 
     # Plot
     plt.style.use("dark_background")
@@ -3518,20 +4656,294 @@ def plot_cumulative_contribution_2026(daily_cna_counts_2026, anchor_date_str, ou
     saved_files_log.append(f"Yearly cumulative contribution chart saved to {os.path.abspath(output_filename)}")
 
 
+# ── NVD status charts ────────────────────────────────────────────────────────
+
+def _prep_status_yearly(status_yearly, anchor_date):
+    """Everything ``plot_status_yearly_bar`` draws, before any layout; ``None``
+    when there is nothing to draw. Shared with the slide renderer."""
+    years = sorted(int(y) for y in status_yearly if y.isdigit() and int(y) >= STATUS_START_YEAR)
+    if not years:
+        return None
+    values = {
+        s: [status_yearly[str(y)].get(s, 0) for y in years] for s in STATUS_BAR_ORDER
+    }
+    totals = [sum(values[s][i] for s in STATUS_BAR_ORDER) for i in range(len(years))]
+    anchor_year = int(anchor_date[:4])
+    # The last bar is a running total unless the anchor closed its year.
+    year_complete = anchor_date[5:10] == "12-31"
+    end_label = f"{years[-1]} YTD" if years[-1] == anchor_year and not year_complete else str(years[-1])
+    return {
+        "years": years,
+        "values": values,
+        "totals": totals,
+        "start_year": years[0],
+        "end_label": end_label,
+        "anchor_year": anchor_year,
+        "statuses": list(STATUS_BAR_ORDER),
+        "colors": [STATUS_COLORS[s] for s in STATUS_BAR_ORDER],
+    }
+
+
+def _prep_status_weekly(status_weekly, anchor_date):
+    """Everything ``plot_status_stacked_charts`` draws, before any layout;
+    ``None`` when there is nothing to draw. Shared with the slide renderer.
+
+    Weeks run Monday to Sunday. The picture starts on the first Monday on or
+    after ``STATUS_WEEKLY_START`` and ends on the Sunday of the last week that
+    is *entirely* on or before the anchor — a week still running is never drawn.
+    """
+    anchor = date.fromisoformat(anchor_date[:10])
+    first = date.fromisoformat(STATUS_WEEKLY_START)
+    first += timedelta(days=(7 - first.weekday()) % 7)      # first Monday on/after
+    last_sunday = anchor - timedelta(days=(anchor.weekday() + 1) % 7)
+    last_start = last_sunday - timedelta(days=6)
+    weeks = []
+    w = first
+    while w <= last_start:
+        weeks.append(w)
+        w += timedelta(days=7)
+    if not weeks:
+        return None
+
+    counts = [status_weekly.get(w.isoformat(), {}) for w in weeks]
+    y_absolute = [[c.get(s, 0) for c in counts] for s in STATUS_STACK_ORDER]
+    week_totals = [sum(col) for col in zip(*y_absolute)]
+    y_normalized = [
+        [(v / t * 100.0) if t > 0 else 0.0 for v, t in zip(series, week_totals)]
+        for series in y_absolute
+    ]
+    return {
+        "weeks": weeks,
+        "dates": [datetime(w.year, w.month, w.day) for w in weeks],
+        "statuses": list(STATUS_STACK_ORDER),
+        "colors": [STATUS_COLORS[s] for s in STATUS_STACK_ORDER],
+        "y_absolute": y_absolute,
+        "y_normalized": y_normalized,
+        "week_totals": week_totals,
+        "start_str": weeks[0].isoformat(),
+        "end_str": (weeks[-1] + timedelta(days=6)).isoformat(),
+    }
+
+
+def _write_status_csvs(status_yearly, status_weekly):
+    """Local-only CSV companions of the two status charts (all statuses, every
+    week/year counted, the way the standalone script wrote them)."""
+    all_statuses = sorted({s for c in status_yearly.values() for s in c} | {s for c in status_weekly.values() for s in c})
+    with open("cve_monthly_stats_comparison_status_yearly_counts.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["year"] + all_statuses + ["total"])
+        writer.writeheader()
+        for year in sorted(status_yearly):
+            counts = status_yearly[year]
+            row = {"year": year, "total": sum(counts.values())}
+            row.update({s: counts.get(s, 0) for s in all_statuses})
+            writer.writerow(row)
+    with open("cve_monthly_stats_comparison_status_weekly_counts.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["week_start"] + all_statuses + ["total"])
+        writer.writeheader()
+        for week in sorted(status_weekly):
+            counts = status_weekly[week]
+            row = {"week_start": week, "total": sum(counts.values())}
+            row.update({s: counts.get(s, 0) for s in all_statuses})
+            writer.writerow(row)
+    saved_files_log.append(f"Saved status CSVs to {os.path.abspath('cve_monthly_stats_comparison_status_weekly_counts.csv')} and cve_monthly_stats_comparison_status_yearly_counts.csv")
+
+
+def _write_fanout_csv(fanout_records, output_filename="cve_monthly_stats_comparison_fanout_downstream.csv"):
+    """The shortlist's downstream counts, so the pick can be sanity-checked:
+    one row per candidate with distinct records, issuers, and the top issuers."""
+    rows = []
+    for cve_id in FANOUT_SHORTLIST:
+        rec = fanout_records.get(cve_id)
+        if rec is None:
+            rows.append({"cve": cve_id, "note": "not in archive"})
+            continue
+        groups = fanout_breakdown(rec["references"])
+        counts = sorted(((g, len(ids)) for g, ids in groups.items()), key=lambda gc: (-gc[1], gc[0]))
+        audit_rows, audit_totals = fanout_packages(fetch_audit_cve(cve_id))
+        rows.append({
+            "audit_package_updates": audit_totals["updates"] if audit_rows else "",
+            "audit_products": audit_totals["products"] if audit_rows else "",
+            "audit_releases": audit_totals["releases"] if audit_rows else "",
+            "audit_advisories": audit_totals["advisories"] if audit_rows else "",
+            "audit_top_products": "; ".join(f"{r['product']}={r['updates']}" for r in audit_rows[:6]),
+            "cve": cve_id,
+            "published": rec["published"],
+            "reporter": rec["reporter"],
+            "software": "; ".join(rec["software"][:3]),
+            "kev_vulncheck": rec["kev"],
+            "downstream_records": sum(c for _, c in counts),
+            "issuers": len(counts),
+            "raw_reference_ids": sum(len(r["idList"]) for r in rec["references"]),
+            "top_issuers": "; ".join(f"{g}={c}" for g, c in counts[:8]),
+            "picked": cve_id == FANOUT_CVE,
+            "note": rec["short"][:120],
+        })
+    fields = ["cve", "published", "reporter", "software", "kev_vulncheck",
+              "audit_package_updates", "audit_products", "audit_releases", "audit_advisories", "audit_top_products",
+              "downstream_records", "issuers", "raw_reference_ids", "top_issuers", "picked", "note"]
+    with open(output_filename, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fields})
+    saved_files_log.append(f"Saved fan-out shortlist CSV to {os.path.abspath(output_filename)}")
+
+
+def plot_status_yearly_bar(status_yearly, anchor_date, output_filename="cve_monthly_stats_comparison_status_yearly.png"):
+    """Yearly stacked bar chart of NVD statuses, ``STATUS_START_YEAR`` through
+    the anchor year. Ported from cve_status_stats.py; the years run to the
+    anchor (the last full day) like every other chart here."""
+    p = _prep_status_yearly(status_yearly, anchor_date)
+    if p is None:
+        return
+    sorted_years, statuses, colors = p["years"], p["statuses"], p["colors"]
+
+    plt.style.use("dark_background")
+    fig, ax = plt.subplots(figsize=(15, 9.5), facecolor="#1E1E1E")
+    ax.set_facecolor("#1E1E1E")
+
+    x = np.arange(len(sorted_years))
+    bar_width = 0.76
+
+    bottoms = np.zeros(len(sorted_years))
+    for status, color in zip(statuses, colors):
+        vals = np.array(p["values"][status])
+        ax.bar(
+            x, vals, bar_width, bottom=bottoms, label=status, color=color,
+            edgecolor="#1E1E1E", linewidth=1.2, alpha=0.92,
+        )
+        bottoms += vals
+
+    # Annotate total counts above each bar
+    for i, total in enumerate(bottoms):
+        ax.annotate(
+            f"{int(total):,}", xy=(x[i], total), xytext=(0, 8), textcoords="offset points",
+            ha="center", va="bottom", fontsize=15.5, fontweight="bold", color="#FFFFFF",
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(y) for y in sorted_years], fontsize=16, fontweight="bold", color="#E0E0E0")
+    ax.tick_params(colors="#CCCCCC", labelsize=14, pad=8)
+    ax.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda val, pos: f"{int(val):,}"))
+    for label in ax.get_yticklabels():
+        label.set_fontweight("bold")
+
+    ax.set_ylabel("Number of CVEs", fontsize=17, fontweight="bold", color="#FFFFFF", labelpad=12)
+    ax.set_title(
+        f"CVE Publication Volume by NVD Status ({p['start_year']} – {p['end_label']})",
+        fontsize=22, fontweight="bold", color="#FFFFFF", pad=20,
+    )
+    ax.grid(True, axis="y", color="#444444", linestyle="--", alpha=0.6, linewidth=0.9)
+    ax.set_axisbelow(True)
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+    for spine in ["left", "bottom"]:
+        ax.spines[spine].set_color("#555555")
+
+    # Legend across the bottom, starting right of the logo's corner.
+    handles, labels = ax.get_legend_handles_labels()
+    fig.legend(
+        handles, labels, loc="lower center", bbox_to_anchor=(0.08, 0.045, 0.90, 0.05),
+        mode="expand", ncol=6, facecolor="#262626", edgecolor="#444444", fontsize=16,
+        handletextpad=0.6, borderpad=0.5, framealpha=0.95,
+    )
+    ax.set_ylim(0, max(bottoms) * 1.08)
+
+    plt.figtext(
+        0.5, 0.008, f"{_stamp()} | Data Source: Vulners CVE Archive",
+        ha="center", fontsize=12, color="#747D8C", style="italic", fontweight="bold",
+    )
+    plt.tight_layout(rect=[0.01, 0.11, 0.99, 0.98])
+    fig.subplots_adjust(bottom=0.16)
+    _add_logo(fig)
+    plt.savefig(output_filename, dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.close()
+    saved_files_log.append(f"Yearly status bar chart saved to {os.path.abspath(output_filename)}")
+
+
+def plot_status_stacked_charts(status_weekly, anchor_date, output_filename="cve_monthly_stats_comparison_status_weekly.png"):
+    """Absolute and normalized weekly stacked-area charts of NVD statuses in one
+    figure, sharing a legend. Ported from cve_status_stats.py; the weeks run
+    from the first full week of ``STATUS_WEEKLY_START`` to the last full week
+    before the anchor (see ``_prep_status_weekly``)."""
+    p = _prep_status_weekly(status_weekly, anchor_date)
+    if p is None:
+        return
+    dates, statuses, colors = p["dates"], p["statuses"], p["colors"]
+
+    plt.style.use("dark_background")
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 18), facecolor="#1E1E1E")
+    ax1.set_facecolor("#1E1E1E")
+    ax2.set_facecolor("#1E1E1E")
+
+    def _style(ax):
+        ax.grid(True, color="#444444", linestyle="--", alpha=0.5)
+        ax.set_xlim(dates[0], dates[-1])
+        ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=(1, 4, 7, 10)))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+        for label in ax.get_xticklabels():
+            label.set_rotation(40)
+            label.set_horizontalalignment("right")
+            label.set_fontweight("bold")
+        for label in ax.get_yticklabels():
+            label.set_fontweight("bold")
+        for spine in ["top", "right"]:
+            ax.spines[spine].set_visible(False)
+        for spine in ["left", "bottom"]:
+            ax.spines[spine].set_color("#777777")
+        ax.tick_params(colors="#CCCCCC", labelsize=16.5)
+
+    # 1. Absolute Stacked Area Chart (Top Subplot)
+    ax1.stackplot(dates, p["y_absolute"], labels=statuses, colors=colors, alpha=0.85, edgecolor="#1E1E1E", linewidth=0.5)
+    ax1.set_title("Absolute Status Counts", fontsize=20, fontweight="bold", color="#FFFFFF", pad=15)
+    ax1.set_ylabel("Number of CVEs", fontsize=21, fontweight="bold", color="#FFFFFF")
+    ax1.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, loc: f"{int(x):,}"))
+    _style(ax1)
+
+    # 2. Normalized Stacked Area Chart (Bottom Subplot)
+    ax2.stackplot(dates, p["y_normalized"], labels=statuses, colors=colors, alpha=0.85, edgecolor="#1E1E1E", linewidth=0.5)
+    ax2.set_title("Normalized Status Distribution", fontsize=20, fontweight="bold", color="#FFFFFF", pad=15)
+    ax2.set_ylabel("Percentage (%)", fontsize=21, fontweight="bold", color="#FFFFFF")
+    ax2.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, loc: f"{int(x)}%"))
+    ax2.set_ylim(0, 100)
+    _style(ax2)
+
+    fig.suptitle(
+        f"CVE Weekly Status Analysis: Absolute vs. Normalized Stacked Trends\n({p['start_str']} to {p['end_str']})",
+        fontsize=26, fontweight="bold", color="#FFFFFF", y=0.98,
+    )
+
+    # Shared legend at the bottom, nudged right of the logo's corner.
+    handles, labels = ax1.get_legend_handles_labels()
+    fig.legend(
+        reversed(handles), reversed(labels), loc="lower center", ncol=6,
+        facecolor="#262626", edgecolor="#444444", fontsize=17.5, bbox_to_anchor=(0.53, 0.025),
+    )
+    plt.figtext(
+        0.5, 0.005, f"{_stamp()} | Data Source: Vulners CVE Archive",
+        ha="center", fontsize=13, color="#747D8C", style="italic", fontweight="bold",
+    )
+
+    plt.tight_layout(rect=[0.01, 0.06, 0.99, 0.98])
+    fig.subplots_adjust(top=0.89)
+    _add_logo(fig)
+    plt.savefig(output_filename, bbox_inches="tight", pad_inches=0.1, dpi=200, facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.close()
+    saved_files_log.append(f"Combined stacked status chart saved to {os.path.abspath(output_filename)}")
+
+
 # Top sources (by overall reach) shown as rows in the candidate heatmap; the
 # long tail is aggregated into an "other sources" row so nothing is dropped.
 _CAND_TOP_SOURCES = 12
 
 
-def plot_candidate_track(candidate_stats, output_filename="cve_monthly_stats_comparison_candidate_track.png"):
-    """Heatmap of the hidden reserved/candidate CVE backlog. Rows are the top
-    sources feeding it (ranked by how many reserved CVEs each touches overall),
-    columns are months, and each cell is the reserved CVEs that source touches
-    that month. A new source shows up as a row that stays dark until it lights up.
-    Scales to any number of months (each month is one more column)."""
+def _prep_candidate_track(candidate_stats):
+    """Everything ``plot_candidate_track`` draws, before any layout; ``None``
+    when there is nothing to draw. Shared with the slide renderer
+    (``monthly_slides``)."""
     months = sorted(candidate_stats.keys())
     if not months:
-        return
+        return None
 
     totals = {m: candidate_stats[m]["active"] + candidate_stats[m]["rejected"] for m in months}
     grand_total = sum(totals.values())
@@ -3556,6 +4968,34 @@ def plot_candidate_track(candidate_stats, output_filename="cve_monthly_stats_com
     # Anchor the colour scale to individual top sources (not the aggregated
     # "other" row) so one big residual doesn't wash everything else out.
     vmax = max(1.0, mat[:len(top_sources)].max() if top_sources else mat.max())
+
+    return {
+        "months": months,
+        "totals": totals,
+        "grand_total": grand_total,
+        "top_sources": top_sources,
+        "rows": rows,
+        "mat": mat,
+        "vmax": vmax,
+        "year": months[0][:4],
+    }
+
+
+def plot_candidate_track(candidate_stats, output_filename="cve_monthly_stats_comparison_candidate_track.png"):
+    """Heatmap of the hidden reserved/candidate CVE backlog. Rows are the top
+    sources feeding it (ranked by how many reserved CVEs each touches overall),
+    columns are months, and each cell is the reserved CVEs that source touches
+    that month. A new source shows up as a row that stays dark until it lights up.
+    Scales to any number of months (each month is one more column)."""
+    p = _prep_candidate_track(candidate_stats)
+    if p is None:
+        return
+    months = p["months"]
+    totals = p["totals"]
+    grand_total = p["grand_total"]
+    rows = p["rows"]
+    mat = p["mat"]
+    vmax = p["vmax"]
 
     plt.style.use("dark_background")
     fig, ax = plt.subplots(
@@ -3584,7 +5024,7 @@ def plot_candidate_track(candidate_stats, output_filename="cve_monthly_stats_com
                     color="#111111" if mat[i, j] > vmax * 0.5 else "#EAEAEA",
                 )
 
-    year = months[0][:4]
+    year = p["year"]
     ax.set_title(
         f"Hidden Volume: Who Feeds the Reserved (Candidate) Backlog  ·  {grand_total:,} CVEs in {year}\n"
         "cell = reserved CVEs each source touches that month",
@@ -3700,6 +5140,9 @@ def _run_monthly(results, report_buf):
     anchor_month_str = anchor_date[5:7]  # e.g. "02" when anchor is Feb 28
 
     full_month_data = []  # collects (month_str, month_name, data_2025, data_2026)
+    # The arguments every chart below is drawn from, kept so the slide renderer
+    # can redraw the same pictures from the same inputs (local runs only).
+    slide_inputs = {}
 
     # The anchor month is the running (partial) month only while it still has
     # days left. When the anchor is its last day — a run on the 1st, or the
@@ -3825,6 +5268,20 @@ def _run_monthly(results, report_buf):
                 )[:TOP_N] if v > 0
             }
             sankey_named_cnas = set(top_names) | prev_shown_top
+            slide_inputs["incomplete_month"] = dict(
+                data_2025_partial=data_2025_partial,
+                data_2026_partial=data_2026_partial,
+                prev_data_partial=prev_data_2026_partial,
+                top_names=sankey_named_cnas,
+                range_label=range_label,
+                prev_range_label=prev_range_label,
+                prev_year_str=prev_year_str,
+                anchor_date=anchor_date,
+                rank_colors=sankey_rank_color_map(
+                    stats, partial_stats, curr_ytd_2026,
+                    anchor_month_str, anchor_month_complete,
+                ),
+            )
             plot_incomplete_month_sankey(
                 data_2025_partial,
                 data_2026_partial,
@@ -3835,10 +5292,7 @@ def _run_monthly(results, report_buf):
                 prev_year_str,
                 anchor_date,
                 output_filename="cve_monthly_stats_comparison_incomplete_month.png",
-                rank_colors=sankey_rank_color_map(
-                    stats, partial_stats, curr_ytd_2026,
-                    anchor_month_str, anchor_month_complete,
-                ),
+                rank_colors=slide_inputs["incomplete_month"]["rank_colors"],
             )
 
     # A finished anchor month still gets the same three-column comparison chart —
@@ -3884,6 +5338,21 @@ def _run_monthly(results, report_buf):
                 prev_data_full.items(), key=lambda kv: kv[1], reverse=True
             )[:TOP_N] if v > 0
         }
+        slide_inputs["incomplete_month"] = dict(
+            data_2025_partial=data_2025_full,
+            data_2026_partial=data_2026_full,
+            prev_data_partial=prev_data_full,
+            top_names=set(top_names) | prev_shown_top,
+            range_label=month_name,
+            prev_range_label=prev_month_name,
+            prev_year_str=prev_year_str,
+            anchor_date=anchor_date,
+            center_is_complete=True,
+            rank_colors=sankey_rank_color_map(
+                stats, partial_stats, ytd_2026,
+                anchor_month_str, anchor_month_complete,
+            ),
+        )
         plot_incomplete_month_sankey(
             data_2025_full,
             data_2026_full,
@@ -3895,10 +5364,7 @@ def _run_monthly(results, report_buf):
             anchor_date,
             output_filename="cve_monthly_stats_comparison_incomplete_month.png",
             center_is_complete=True,
-            rank_colors=sankey_rank_color_map(
-                stats, partial_stats, ytd_2026,
-                anchor_month_str, anchor_month_complete,
-            ),
+            rank_colors=slide_inputs["incomplete_month"]["rank_colors"],
         )
 
     # Resolve the final cumulative YTD dictionary to use
@@ -3932,7 +5398,30 @@ def _run_monthly(results, report_buf):
             anchor_date,
         )
 
+    # Every Chrome release of the year with its CVE count, for the fan-in slide (local only).
+    slide_inputs["fanin_chrome"] = dict(chrome_cves=results.get("chrome_cves", []), anchor_date=anchor_date)
+    # EPSS recency penalty and recall (local only).
+    slide_inputs["epss"] = dict(epss_rows=results.get("epss_rows", []), anchor_date=anchor_date)
+    # Kernel bug-fix discovery against CVE publishing (local only).
+    slide_inputs["kernel_fixes"] = dict(daily_counts_kernel=results.get("daily_counts_kernel", {}), anchor_date=anchor_date)
+    # Exploitation signals against publication volume (local only).
+    slide_inputs["exploitation_vs_volume"] = dict(
+        stats=stats, anchor_date=anchor_date, anchor_month_complete=anchor_month_complete,
+    )
+    # One CVE's downstream advisories, for the fan-out slide (local only).
+    fanout_records = results.get("fanout_records", {})
+    slide_inputs["fanout_downstream"] = dict(record=fanout_records.get(FANOUT_CVE))
+    if _WRITE_CSV:
+        _write_fanout_csv(fanout_records)
+
     # Generate custom monthly flow Sankey chart
+    slide_inputs["sankey_flow"] = dict(
+        stats=stats,
+        partial_stats=partial_stats,
+        top_names=ytd_top_cnas,
+        anchor_date=anchor_date,
+        anchor_month_complete=anchor_month_complete,
+    )
     plot_custom_sankey_flow(
         stats,
         partial_stats,
@@ -3942,9 +5431,15 @@ def _run_monthly(results, report_buf):
     )
 
     # Generate YTD growth chart
+    slide_inputs["ytd_growth"] = dict(
+        daily_counts_2025=daily_counts_2025,
+        daily_counts_2026=daily_counts_2026,
+        anchor_date_str=anchor_date,
+    )
     plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date)
 
     # Generate Yearly Cumulative YoY comparison chart (2022-2025 full year, 2026 YTD)
+    slide_inputs["yearly_cumulative"] = dict(daily_counts=daily_counts, anchor_date_str=anchor_date)
     plot_yearly_cumulative(daily_counts, anchor_date)
 
     # Generate Monthly Projections comparison chart
@@ -3995,6 +5490,16 @@ def _run_monthly(results, report_buf):
     elif n_reg == 1:
         intercept = y_coords[0]
 
+    slide_inputs["projections"] = dict(
+        stats=stats,
+        completed_month_strs=completed_month_strs,
+        slope=slope,
+        intercept=intercept,
+        partial_stats=partial_stats,
+        current_month_str=current_month_str,
+        current_month_yoy_growth=current_month_yoy_growth,
+        anchor_date=anchor_date,
+    )
     plot_monthly_projections(
         stats,
         completed_month_strs,
@@ -4006,5 +5511,22 @@ def _run_monthly(results, report_buf):
         anchor_date=anchor_date,
     )
 
+    # NVD status of what was published: by year, then by week.
+    status_yearly = results.get("status_yearly", {})
+    status_weekly = results.get("status_weekly", {})
+    slide_inputs["status_yearly"] = dict(status_yearly=status_yearly, anchor_date=anchor_date)
+    slide_inputs["status_weekly"] = dict(status_weekly=status_weekly, anchor_date=anchor_date)
+    plot_status_yearly_bar(status_yearly, anchor_date)
+    plot_status_stacked_charts(status_weekly, anchor_date)
+    if _WRITE_CSV:
+        _write_status_csvs(status_yearly, status_weekly)
+
     # Hidden volume: reserved/candidate CVEs (last chart on the dashboard).
+    slide_inputs["candidate_track"] = dict(candidate_stats=results.get("candidate_stats", {}))
     plot_candidate_track(results.get("candidate_stats", {}))
+
+    # The same six pictures again, rethought as 16:9 presentation slides. Local
+    # runs only — the published page never sees these files.
+    if _SLIDES:
+        from . import monthly_slides
+        monthly_slides.render_all(slide_inputs)
