@@ -347,17 +347,26 @@ def slide_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date_str, outp
 _BAND_INSET_IN = 0.02
 _MIN_BAND_IN = 0.01
 _HEADER_IN = 0.58        # above the baseline: month name and total
+_HEADER_TEXT_IN = 0.47   # where the month name's cap height ends, within that
 _FLOOR_PAD_IN = 0.14     # below the deepest column
 
 
-def _sankey_axes(fig, max_total, n_columns, gutter_in, values_in):
+def _subtitle_bottom(fig):
+    """Figure fraction of the subtitle's lower edge (the title's when there is
+    none), measured after ``_fit_text`` has shrunk or wrapped it."""
+    txt = fig.texts[1] if len(fig.texts) > 1 and fig.texts[1].get_position()[1] == SUB_Y else fig.texts[0]
+    y0 = txt.get_window_extent(fig.canvas.get_renderer()).y0
+    return y0 / (fig.get_figheight() * fig.dpi)
+
+
+def _sankey_axes(fig, max_total, n_columns, gutter_in, values_in, top=CONTENT_TOP, bottom=0.085):
     """An axes spanning the slide's width, scaled so the deepest column fills
-    the content band. Returns ``(ax, geom)`` with the conversions the drawing
-    needs: ``cpi`` (CVEs per inch), ``x_in`` (data units per inch), ``span``."""
-    bottom = 0.085
-    ax = fig.add_axes([0, bottom, 1, CONTENT_TOP - bottom])
+    the band between ``top`` and ``bottom`` (figure fractions). Returns
+    ``(ax, geom)`` with the conversions the drawing needs: ``cpi`` (CVEs per
+    inch), ``x_in`` (data units per inch), ``span``."""
+    ax = fig.add_axes([0, bottom, 1, top - bottom])
     ax.set_facecolor(BG)
-    ax_h = (CONTENT_TOP - bottom) * SLIDE_H
+    ax_h = (top - bottom) * SLIDE_H
     col_h = ax_h - _HEADER_IN - _FLOOR_PAD_IN
     cpi = max(max_total, 1) / col_h
     span = n_columns - 1
@@ -531,7 +540,14 @@ def slide_sankey_flow(stats, partial_stats, top_names, anchor_date, anchor_month
         subtitle,
     )
 
-    ax, geom = _sankey_axes(fig, max_total, len(stages), gutter_in=1.5, values_in=1.35)
+    # Ten columns want every inch of height: the headers start a quarter inch
+    # under the subtitle (wrapped or not) and the deepest column stops just
+    # short of the footer.
+    ax, geom = _sankey_axes(
+        fig, max_total, len(stages), gutter_in=1.5, values_in=1.35,
+        top=_subtitle_bottom(fig) - (0.25 - (_HEADER_IN - _HEADER_TEXT_IN)) / SLIDE_H,
+        bottom=FOOT_Y + (F_FOOT / 72 + 0.06) / SLIDE_H - _FLOOR_PAD_IN / SLIDE_H,
+    )
     cpi, x_in, span = geom["cpi"], geom["x_in"], geom["span"]
     positions = _stack_positions(raw, all_items)
 
@@ -629,7 +645,7 @@ def slide_projections(stats, completed_month_strs, slope, intercept, partial_sta
     y_act = p["y_2026_actual_cum"]
     y_rr, y_rr_proj = p["y_2026_runrate_cum"], p["y_2026_runrate_proj_cum"]
     y_bsl = p["y_2026_proj_cum"]
-    yoy_act, yoy_rr = p["yoy_2026"], p["yoy_2026_runrate"]
+    yoy_act, yoy_rr, yoy_bsl = p["yoy_2026"], p["yoy_2026_runrate"], p["yoy_2026_green"]
     all_actual = n_comp >= 12
 
     fig = _slide(
@@ -665,6 +681,14 @@ def slide_projections(stats, completed_month_strs, slope, intercept, partial_sta
             fontsize=size, color=color, fontweight=weight, zorder=6,
         )
 
+    # Growth boxes go on every month the web chart labels: solid for actuals,
+    # dotted for the run-rate forecast, dashed for the 100k baseline. The two
+    # projected series ride the same rising segment, so the upper one's labels
+    # sit above-left and the lower one's below-right, in the empty wedges.
+    def rr_pill_text(i):
+        # The running month's rate is a measured partial, not a forecast: no '*'.
+        return f"{yoy_rr[i]:+.1f}%" if i == cur_idx else f"{yoy_rr[i]:+.1f}%*"
+
     for i in range(12):
         if i <= last:
             v = y_act[i]
@@ -677,23 +701,20 @@ def slide_projections(stats, completed_month_strs, slope, intercept, partial_sta
             # kept under the curve so the miss stays visible.
             if i >= m._BASELINE_PROJ_IDX and y_bsl[i] is not None and i < 11:
                 value(i, y_bsl[i], f"{y_bsl[i]:,}*", 0, -9, "center", "top", color=INK2)
-        elif i == 11:
-            if i == cur_idx:
-                pill(i, y_rr[i], f"{yoy_rr[i]:+.1f}%", m.C_RED, -9, 12, "right", "bottom", "dotted")
+                pill(i, y_bsl[i], f"{yoy_bsl[i]:+.1f}%*", m.C_GREEN, 0, -27, "center", "top", "dashed")
         else:
-            v_rr, v_bsl = y_rr[i], y_bsl[i]
-            # Upper series above-left, lower series below-right: the two empty
-            # wedges around a rising point.
-            if v_rr >= v_bsl:
-                value(i, v_rr, f"{v_rr:,}*", -9, 9, "right", "bottom")
-                value(i, v_bsl, f"{v_bsl:,}*", 9, -9, "left", "top", color=INK2)
-                if i == cur_idx:
-                    pill(i, v_rr, f"{yoy_rr[i]:+.1f}%", m.C_RED, -9, 27, "right", "bottom", "dotted")
-            else:
-                value(i, v_bsl, f"{v_bsl:,}*", -9, 9, "right", "bottom", color=INK2)
-                value(i, v_rr, f"{v_rr:,}*", 9, -9, "left", "top")
-                if i == cur_idx:
-                    pill(i, v_rr, f"{yoy_rr[i]:+.1f}%", m.C_RED, 9, -27, "left", "top", "dotted")
+            # Upper series' labels above-left, lower series' below-right. December's
+            # totals are read off the margin labels, so only its boxes stay, hugging
+            # the points: further out they land on the lines arriving from November.
+            rr = (y_rr[i], rr_pill_text(i), m.C_RED, "dotted", INK)
+            bsl = (y_bsl[i], f"{yoy_bsl[i]:+.1f}%*", m.C_GREEN, "dashed", INK2)
+            hi, lo = (rr, bsl) if rr[0] >= bsl[0] else (bsl, rr)
+            if i < 11:
+                value(i, hi[0], f"{hi[0]:,}*", -9, 9, "right", "bottom", color=hi[4])
+                value(i, lo[0], f"{lo[0]:,}*", 9, -9, "left", "top", color=lo[4])
+            up, down = (27, -27) if i < 11 else (12, -14)
+            pill(i, hi[0], hi[1], hi[2], -9, up, "right", "bottom", hi[3])
+            pill(i, lo[0], lo[1], lo[2], 9, down, "left", "top", lo[3])
 
     peak = max([*p["y_2026_full_cum"], *y_rr] + [v for v in y_bsl if v is not None] + y25)
     ax.set_ylim(0, peak * 1.12)
