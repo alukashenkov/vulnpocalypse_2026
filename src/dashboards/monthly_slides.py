@@ -244,7 +244,7 @@ def slide_yearly_cumulative(daily_counts, anchor_date_str, output_filename=SLIDE
         ax.plot(dates[y], series[y], color=m.YEAR_COLORS[y], linewidth=2.2, alpha=0.9)
     ax.plot(dates[cur], series[cur], color=m.YEAR_COLORS[cur], linewidth=3.6, zorder=4)
 
-    y_top = max(totals.values()) * 1.06 if totals else 1
+    y_top = p["axis_peak"] * 1.06 if totals else 1
     ax.set_ylim(0, y_top)
     ax.set_xlim(ref_dates[0], ref_dates[-1] + timedelta(days=6))
 
@@ -253,6 +253,20 @@ def slide_yearly_cumulative(daily_counts, anchor_date_str, output_filename=SLIDE
             totals[y], ref_dates[0], p["guide_xmax"],
             color=m.YEAR_COLORS[y], linestyle="--", linewidth=1.2, alpha=0.5, zorder=1,
         )
+
+    # The FIRST mid-year forecast as a dashed finish line, labelled above its
+    # right end.
+    forecast_total = p["forecast_total"]
+    ax.hlines(
+        forecast_total, ref_dates[0], p["guide_xmax"],
+        color=INK, linestyle=(0, (6, 4)), linewidth=1.6, alpha=0.85, zorder=1,
+    )
+    t = ax.annotate(
+        f"{forecast_total:,}  {p['forecast_label']}",
+        xy=(p["guide_xmax"], forecast_total), xytext=(0, 5), textcoords="offset points",
+        ha="right", va="bottom", fontsize=F_SMALL, fontweight="bold", color=INK, zorder=6,
+    )
+    _stroke(t, 2.5)
     for info in p["surpassed_info"]:
         ax.plot(
             info["cross_x"], info["cross_y"], marker="*", markersize=14,

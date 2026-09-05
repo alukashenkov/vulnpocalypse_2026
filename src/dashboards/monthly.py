@@ -68,6 +68,13 @@ REFERENCE_PREDICTIONS = {
 # written down twice, so extending the table moves the boundary with it.
 _BASELINE_PROJ_IDX = min(int(m) for m in REFERENCE_PREDICTIONS) - 1
 
+# FIRST's Vulnerability Forecasting SIG mid-year forecast for the anchor year's
+# full-year CVE count, published June 15th. Drawn on the yearly cumulative chart
+# (web and slide) as a dashed "finish line": the axis is raised to keep it in
+# view until the current year's curve crosses it.
+FIRST_FORECAST_TOTAL = 66_000
+FIRST_FORECAST_LABEL = "FIRST Mid-Year Vulnerability Forecast, June 15th"
+
 
 def clamp_growth(g_m):
     """Bound a projected YoY growth factor.
@@ -3819,6 +3826,10 @@ def _prep_yearly_cumulative(daily_counts, anchor_date_str):
     # axis / the label margin.
     guide_xmax = datetime(ref_dates[-1].year + 1, 1, 1)
 
+    # The forecast finish line must stay in view, so the axis peaks at whichever
+    # is taller: the tallest curve or the forecast.
+    axis_peak = max(max(totals.values()) if totals else 0, FIRST_FORECAST_TOTAL)
+
     return {
         "ref_dates": ref_dates,
         "anchor_date_2026": anchor_date_2026,
@@ -3831,6 +3842,9 @@ def _prep_yearly_cumulative(daily_counts, anchor_date_str):
         "final_2026": final_2026,
         "guide_years": guide_years,
         "guide_xmax": guide_xmax,
+        "forecast_total": FIRST_FORECAST_TOTAL,
+        "forecast_label": FIRST_FORECAST_LABEL,
+        "axis_peak": axis_peak,
     }
 
 
@@ -3849,7 +3863,7 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
 
     # The tallest curve sets the axis, and the axis sets the figure height — at a
     # scale that never changes until the picture is square. See _cumulative_layout.
-    y_top, fig_h = _cumulative_layout(max(totals.values()) if totals else 0)
+    y_top, fig_h = _cumulative_layout(p["axis_peak"])
 
     plt.style.use("dark_background")
     fig, ax = plt.subplots(figsize=(_CUM_FIG_W, fig_h), facecolor="#1E1E1E")
@@ -3906,6 +3920,33 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
             alpha=0.6,
             zorder=1
         )
+
+    # The FIRST mid-year forecast as a dashed finish line, labelled above its
+    # right end where the top-right of the chart is clear until the current
+    # year's curve gets there.
+    forecast_total = p["forecast_total"]
+    ax.hlines(
+        y=forecast_total,
+        xmin=ref_dates[0],
+        xmax=guide_xmax,
+        color="#FFFFFF",
+        linestyle=(0, (6, 4)),
+        linewidth=2.0,
+        alpha=0.85,
+        zorder=1
+    )
+    ax.annotate(
+        f"{forecast_total:,}  {p['forecast_label']}",
+        xy=(guide_xmax, forecast_total),
+        xytext=(0, 6),
+        textcoords="offset points",
+        ha="right",
+        va="bottom",
+        fontsize=12,
+        fontweight="bold",
+        color="#FFFFFF",
+        zorder=2
+    )
 
     ax.grid(True, color="#444444", linestyle="--", alpha=0.5)
     ax.set_ylabel("Cumulative CVE Count", fontsize=16, fontweight="bold", color="#FFFFFF")
