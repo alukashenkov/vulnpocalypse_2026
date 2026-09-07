@@ -2987,7 +2987,12 @@ def plot_custom_sankey_flow(
                 [grid_x0, grid_x1], [y] * 2,
                 color="#FFFFFF", alpha=0.10, linewidth=1.0, zorder=0.5,
             )
-        tick = f"{depth // 1000}k" if step >= 1000 and depth else f"{depth:,}"
+        if step >= 1000 and depth:
+            # 2,500 must read "2.5k", not "2k": integer division once turned a
+            # 2,500-step ruler into 0, 2k, 5k, 7k, 10k.
+            tick = f"{depth / 1000:g}k"
+        else:
+            tick = f"{depth:,}"
         ax.text(
             ruler_x, y, tick,
             ha="left", va="center", color="#6E7A88", fontsize=13,
