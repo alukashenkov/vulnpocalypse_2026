@@ -505,20 +505,28 @@ def _draw_headers(ax, labels, totals, geom):
         ax.text(s, 0.07 * cpi, f"({total:,})", ha="center", va="bottom", color=INK2, fontsize=10.5)
 
 
-def _draw_names(ax, positions, all_items, geom, column=0):
+def _draw_names(ax, positions, all_items, geom, column=0, colors=None):
     """CNA names beside one column, nudged apart, each with a leader back to
-    its lane."""
+    its lane and, when ``colors`` is given, a swatch of the lane colour, so a
+    lane too thin to show its colour can still be matched by name."""
     cpi, x_in = geom["cpi"], geom["x_in"]
     pos = positions[column]
     centers = [sum(pos[item]) / 2.0 for item in all_items]
     floor = min(centers[-1], pos[all_items[-1]][0]) - 0.3 * cpi
     ys = m._spread_label_ys(centers, 0.165 * cpi, floor, 0.0)
+    lead_x = column - (0.21 if colors else 0.30) * x_in
     for item, center, y in zip(all_items, centers, ys):
         if abs(y - center) > 0.02 * cpi:
             ax.plot(
-                [column - 0.30 * x_in, column - 0.16 * x_in, column - 0.07 * x_in],
+                [lead_x, column - 0.16 * x_in, column - 0.07 * x_in],
                 [y, y, center],
                 color=INK, alpha=0.3, linewidth=0.8, solid_joinstyle="round", zorder=3.5,
+            )
+        if colors:
+            ax.plot(
+                [column - 0.25 * x_in], [y], marker="s", markersize=7, linestyle="none",
+                markerfacecolor=colors.get(item, m.SANKEY_OTHERS_COLOR), markeredgecolor="none",
+                clip_on=False, zorder=4,
             )
         ax.text(
             column - 0.33 * x_in, y, item, ha="right", va="center",
@@ -592,7 +600,7 @@ def slide_sankey_flow(stats, partial_stats, top_names, anchor_date, anchor_month
         label_all=(len(stages) - 1,), label_min_in=0.14, others_counts=others_counts,
     )
     _draw_headers(ax, labels, totals, geom)
-    _draw_names(ax, positions, all_items, geom, column=0)
+    _draw_names(ax, positions, all_items, geom, column=0, colors=colors)
     _save(fig, output_filename, "monthly flow Sankey")
 
 
@@ -639,7 +647,7 @@ def slide_incomplete_month(data_2025_partial, data_2026_partial, prev_data_parti
         label_all=tuple(range(len(stages))), others_counts=others_counts,
     )
     _draw_headers(ax, labels, totals, geom)
-    _draw_names(ax, positions, all_items, geom, column=0)
+    _draw_names(ax, positions, all_items, geom, column=0, colors=colors)
     _save(fig, output_filename, "month comparison Sankey")
 
 
@@ -1574,17 +1582,37 @@ def _exploitation_series(stats, anchor_date, anchor_month_complete):
     if not kev_all:
         print("CISA KEV catalog unavailable; exploitation slides skipped.")
         return None
+    # The running anchor month, when there is one: its count so far, kept out
+    # of the complete-month series (titles, ratios, corridor) and drawn only as
+    # a dashed tail on the volume slide.
+    partial = None
+    if not anchor_month_complete:
+        pm = date(anchor.year, anchor.month, 1)
+        pk = pm.strftime("%Y-%m")
+        partial = {
+            "month": pm, "key": pk, "through": anchor,
+            "pub": sum(stats.get(pk[5:7], {}).get(pk[:4], {}).values()),
+            "kev": kev_all.get(pk, 0),
+            "x": datetime(pm.year, pm.month, 15),
+            "lbl": f"{pm.strftime('%b')} 1\u2013{anchor.day} {anchor.year}",
+        }
     return {
         "months": months, "keys": keys, "pubs": pubs, "kev": [kev_all.get(k, 0) for k in keys],
-        "kev_released": kev_released, "last": last,
+        "kev_released": kev_released, "last": last, "partial": partial,
         "x": [datetime(mo.year, mo.month, 15) for mo in months],
         "first_lbl": months[0].strftime("%b %Y"), "last_lbl": months[-1].strftime("%b %Y"),
     }
 
 
-def _exploitation_xaxis(ax, d):
-    ax.set_xlim(datetime(d["months"][0].year, d["months"][0].month, 1),
-                datetime(d["last"].year, d["last"].month, 1) + timedelta(days=31))
+def _exploitation_xaxis(ax, d, with_partial=False):
+    if with_partial and d["partial"]:
+        pm = d["partial"]["month"]
+        # Through the running month's last day, so no tick for the month after it.
+        x_end = datetime(pm.year, pm.month, 1) + timedelta(days=32)
+        x_end = x_end.replace(day=1) - timedelta(days=1)
+    else:
+        x_end = datetime(d["last"].year, d["last"].month, 1) + timedelta(days=31)
+    ax.set_xlim(datetime(d["months"][0].year, d["months"][0].month, 1), x_end)
     ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=(1, 4, 7, 10)))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
     ax.tick_params(axis="x", labelsize=F_TICK - 1)
@@ -1604,11 +1632,13 @@ def slide_exploitation_vs_volume(stats, anchor_date, anchor_month_complete=False
     ratio_p = pubs[-1] / pubs[0] if pubs[0] else float("nan")
     ratio_k = kev[-1] / kev[0] if kev[0] else float("nan")
 
+    part = d["partial"]
     fig = _slide(
         f"CVE publications ×{ratio_p:.1f}, CISA KEV additions ×{ratio_k:.1f} — and never outside {k_lo}–{k_hi} a month",
         f"{d['first_lbl']} → {d['last_lbl']}  ·  publications {pubs[0]:,} → {pubs[-1]:,} a month (left axis)  ·  "
         f"KEV additions {kev[0]} → {kev[-1]} a month, average {sum(kev) / len(kev):.0f} (right axis, scaled to meet "
-        f"publications in {d['first_lbl']})",
+        f"publications in {d['first_lbl']})"
+        + (f"  ·  dashed: {part['lbl']}, an incomplete month, not in the figures above" if part else ""),
     )
     ax = fig.add_axes([0.085, AXES_BOTTOM, 0.665, CONTENT_TOP - AXES_BOTTOM])
     _style_axes(ax)
@@ -1635,7 +1665,25 @@ def slide_exploitation_vs_volume(stats, anchor_date, anchor_month_complete=False
     ax.plot(x, pubs, color=m.C_RED, linewidth=3.2, marker="o", markersize=3.5, zorder=4)
     ax2.plot(x, kev, color=m.C_YELLOW, linewidth=2.2, marker="o", markersize=3.5, zorder=4)
 
-    _exploitation_xaxis(ax, d)
+    if part:
+        # The running month: a dashed tail from the last complete month to the
+        # count so far, hollow markers, and a note saying how many days it holds.
+        dash = (0, (4, 3))
+        ax.plot([x[-1], part["x"]], [pubs[-1], part["pub"]], color=m.C_RED, linewidth=3.2,
+                linestyle=dash, marker="o", markersize=5, markevery=[1], markerfacecolor=BG,
+                markeredgewidth=1.6, zorder=4)
+        ax2.plot([x[-1], part["x"]], [kev[-1], part["kev"]], color=m.C_YELLOW, linewidth=2.2,
+                 linestyle=dash, marker="o", markersize=5, markevery=[1], markerfacecolor=BG,
+                 markeredgewidth=1.6, zorder=4)
+        # The note sits under the corridor, beside the hollow KEV marker: the
+        # only strip the steep dashed tails never cross.
+        t = ax2.annotate(f"{part['lbl']} (incomplete)\n{part['pub']:,} CVEs · {part['kev']} KEV",
+                         xy=(part["x"], k_lo), xytext=(4, -6), textcoords="offset points",
+                         ha="right", va="top", fontsize=F_SMALL, color=INK2, style="italic",
+                         linespacing=1.3, zorder=5)
+        _stroke(t, 2.5)
+
+    _exploitation_xaxis(ax, d, with_partial=True)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{int(v):,}"))
     ax.set_ylabel("CVE publications per month", fontsize=F_TICK, color=INK2)
     ax2.set_ylabel("CISA KEV additions per month", fontsize=F_TICK, color=m.C_YELLOW, labelpad=10)

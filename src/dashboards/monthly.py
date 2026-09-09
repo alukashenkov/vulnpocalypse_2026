@@ -73,7 +73,7 @@ _BASELINE_PROJ_IDX = min(int(m) for m in REFERENCE_PREDICTIONS) - 1
 # (web and slide) as a dashed "finish line": the axis is raised to keep it in
 # view until the current year's curve crosses it.
 FIRST_FORECAST_TOTAL = 66_000
-FIRST_FORECAST_LABEL = "FIRST Mid-Year Vulnerability Forecast, June 15th"
+FIRST_FORECAST_LABEL = "FIRST Mid-Year Vulnerability Forecast Update, June 15th"
 
 
 def clamp_growth(g_m):
@@ -228,14 +228,15 @@ COMPLETE_MONTH_CAPTION = (
 )
 
 # ── Shared chart palette ─────────────────────────────────────────────────────
-# Every chart draws its series colors from the Sankey "premium" palette so the
-# whole dashboard reads as one system. #FF4757 (the Sankey's first red) is the
-# anchor; the rest are pulled from the same palette. Colorblind separation on the
-# dark (#1E1E1E) surface is validated with the dataviz palette validator.
+# The series colours of every non-Sankey chart. #FF4757 is the anchor and is
+# also rank 1 of the Sankey lane palette (``SANKEY_RANK_COLORS``, further down);
+# the Sankey's other lanes have their own, larger set since fifteen lanes must
+# stay apart everywhere on the picture. Colorblind separation on the dark
+# (#1E1E1E) surface is validated with the dataviz palette validator.
 C_RED = "#FF4757"     # current year / primary emphasis  (Sankey rank 1)
-C_BLUE = "#2E86DE"    # previous year / reference         (Sankey rank 8)
-C_GREEN = "#2ED573"   # positive / baseline projection    (Sankey rank 15)
-C_YELLOW = "#F1C40F"  # (Sankey rank 6)
+C_BLUE = "#2E86DE"    # previous year / reference
+C_GREEN = "#2ED573"   # positive / baseline projection
+C_YELLOW = "#F1C40F"
 C_GRAY = "#747D8C"    # oldest year / neutral data        (Sankey Others)
 
 # Fixed color per calendar year for the multi-year comparison charts.
@@ -1022,30 +1023,38 @@ STATUS_CNA_ORDER = list(STATUS_BAR_ORDER)
 # color that means "not a ranked lane at all". Ranks are permanent; the CNAs
 # holding them are not.
 #
-# The lanes are stacked in rank order, so rank N and rank N+1 always touch, and
-# this order is the one that maximizes the separation of every touching pair —
-# found by searching the orderings of these hues, with #FF4757 pinned to rank 1 so
-# the dashboard's primary red stays on the biggest CNA and the "Others" gray held
-# as the tail lane it always is. Against the dark #1E1E1E surface, worst adjacent
-# ΔE 18.0 under protanopia/deuteranopia (target 8) and 24.8 under normal vision
-# (floor 15), every lane ≥ 3:1 contrast — dataviz validate_palette.py, --mode dark.
-# Re-run it if you touch the order; the old name-keyed palette scored 4.6/9.9.
+# Fifteen lanes that must be told apart *anywhere* on the picture, not only where
+# they touch: a reader matches a thin lane on the far right against the legend
+# on the left, and lanes further down the stack are thin enough that rank 7 and
+# rank 9 sit a hair apart. The old palette maximised only touching pairs and
+# carried three near-identical reds (ranks 1, 7, 9: ΔE 3–6), two yellows (2.6),
+# three purples and three greens, so it failed exactly that reading.
+#
+# This set is eight hue families 45° apart in OKLCH, each in a deep and a pale
+# tier, so any two lanes differ by hue name or by an obvious lightness step,
+# with #FF4757 pinned to rank 1 (the dashboard's accent stays on the biggest
+# CNA) and the "Others" gray as the tail lane. Found by search under the dataviz
+# validator's rules on the dark #1E1E1E surface, then ordered so touching ranks
+# are furthest apart: worst touching pair ΔE 25.4 normal / 21.3 protan-deutan;
+# worst pair *anywhere* (gray included) 9.2 normal / 5.6 CVD, against 2.6 / 0.4
+# before. Every lane ≥ 3:1 contrast, chroma ≥ 0.10. Re-run the validator
+# (all pairs, --mode dark --surface #1E1E1E) if you touch a colour or the order.
 SANKEY_RANK_COLORS = [
-    "#FF4757",   # 1  Coral Red        (also C_RED, the dashboard's accent)
-    "#FFBE1A",   # 2  Amber
-    "#00D2D3",   # 3  Cyan
-    "#FF9F43",   # 4  Bright Orange
-    "#E84393",   # 5  Deep Pink
-    "#F1C40F",   # 6  Yellow
-    "#EE5253",   # 7  Red
-    "#2E86DE",   # 8  Dodger Blue
-    "#FF6B6B",   # 9  Light Coral
-    "#6C5CE7",   # 10 Indigo
-    "#10AC84",   # 11 Teal Green
-    "#A55EEA",   # 12 Lavender Purple
-    "#1DD1A1",   # 13 Mint
-    "#9B59B6",   # 14 Amethyst Purple
-    "#2ED573",   # 15 Light Green
+    "#FF4757",   # 1  Coral Red      (also C_RED, the dashboard's accent)
+    "#A5FAAD",   # 2  Pale Mint
+    "#14A8A3",   # 3  Teal
+    "#EDED1D",   # 4  Yellow
+    "#FAADDC",   # 5  Pale Pink
+    "#BC1DD3",   # 6  Magenta
+    "#FB9B8E",   # 7  Salmon
+    "#933EF9",   # 8  Violet
+    "#82D5FF",   # 9  Sky Blue
+    "#35A35F",   # 10 Green
+    "#B4ADFC",   # 11 Lavender
+    "#BD7228",   # 12 Brown
+    "#7CFDF6",   # 13 Aqua
+    "#2891EC",   # 14 Blue
+    "#FFBC64",   # 15 Peach
 ]
 SANKEY_OTHERS_COLOR = C_GRAY   # the pooled tail lane, and everyone below rank 15
 
@@ -3157,14 +3166,21 @@ def plot_custom_sankey_flow(
         min(name_centers[-1], _SANKEY_Y_TOP - totals[0] * unit) - 30,
         _SANKEY_Y_TOP,
     )
+    # Each name carries a swatch of its lane colour, so a lane too thin to show
+    # its colour at the column can still be matched by the square beside its name.
     for item, center, label_y in zip(all_items, name_centers, name_ys):
         if abs(label_y - center) > 3:
             ax.plot(
-                [-0.82 * x_in, -0.25 * x_in, -0.086 * x_in],
+                [-0.66 * x_in, -0.25 * x_in, -0.086 * x_in],
                 [label_y, label_y, center],
                 color="#FFFFFF", alpha=0.3, linewidth=0.9,
                 solid_joinstyle="round", zorder=3.5,
             )
+        ax.plot(
+            [-0.73 * x_in], [label_y], marker="s", markersize=11, linestyle="none",
+            markerfacecolor=colors.get(item, SANKEY_OTHERS_COLOR), markeredgecolor="none",
+            clip_on=False, zorder=4,
+        )
         ax.text(
             -0.86 * x_in,
             label_y,
