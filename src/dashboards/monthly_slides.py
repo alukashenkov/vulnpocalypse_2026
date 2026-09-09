@@ -455,10 +455,13 @@ def _draw_ruler(ax, max_total, geom, x_from, x_to, x_ticks):
 
 
 def _draw_columns(ax, positions, all_items, volumes_per_stage, colors, geom,
-                  label_all=(), label_min_in=0.2, others_counts=None):
+                  label_all=(), label_min_in=0.2, others_counts=None, swatch_columns=()):
     """Node blocks and their values. Columns listed in ``label_all`` print every
     lane's value, nudged apart with a leader; elsewhere a value appears only
-    where its own lane has the room, which keeps small lanes honest."""
+    where its own lane has the room, which keeps small lanes honest. Columns in
+    ``swatch_columns`` put the lane colour in a square ahead of each value, the
+    way ``_draw_names`` does for the names, so a stack of numbers too tightly
+    packed to trace back along its leaders can still be read off by colour."""
     cpi, x_in = geom["cpi"], geom["x_in"]
     half_w = 0.055 * x_in
     for s, pos in enumerate(positions):
@@ -491,8 +494,16 @@ def _draw_columns(ax, positions, all_items, volumes_per_stage, colors, geom,
                     [label_x - 0.03 * x_in, s + half_w + 0.01 * x_in], [label_y, center],
                     color=INK, alpha=0.35, linewidth=0.8, zorder=3.5,
                 )
+            text_x = label_x
+            if s in swatch_columns:
+                ax.plot(
+                    [label_x + 0.04 * x_in], [label_y], marker="s", markersize=6.5,
+                    linestyle="none", markerfacecolor=colors.get(item, m.SANKEY_OTHERS_COLOR),
+                    markeredgecolor="none", clip_on=False, zorder=4,
+                )
+                text_x = label_x + 0.115 * x_in
             t = ax.text(
-                label_x, label_y, text, ha="left", va="center", color=INK,
+                text_x, label_y, text, ha="left", va="center", color=INK,
                 fontsize=F_SMALL if spread is not None else 9, fontweight="bold", zorder=4,
             )
             _stroke(t, 1.8)
@@ -567,15 +578,17 @@ def slide_sankey_flow(stats, partial_stats, top_names, anchor_date, anchor_month
     # Ten columns want every inch of height: the headers start a quarter inch
     # under the subtitle (wrapped or not) and the deepest column stops just
     # short of the footer.
+    # The last column prints every lane's value with a colour swatch ahead of
+    # it, so the value margin has to hold swatch + number + the ruler's ticks.
     ax, geom = _sankey_axes(
-        fig, max_total, len(stages), gutter_in=1.5, values_in=1.35,
+        fig, max_total, len(stages), gutter_in=1.5, values_in=1.62,
         top=_subtitle_bottom(fig) - (0.25 - (_HEADER_IN - _HEADER_TEXT_IN)) / SLIDE_H,
         bottom=FOOT_Y + (F_FOOT / 72 + 0.06) / SLIDE_H - _FLOOR_PAD_IN / SLIDE_H,
     )
     cpi, x_in, span = geom["cpi"], geom["x_in"], geom["span"]
     positions = _stack_positions(raw, all_items)
 
-    _draw_ruler(ax, max_total, geom, -0.08 * x_in, span + 0.62 * x_in, span + 0.70 * x_in)
+    _draw_ruler(ax, max_total, geom, -0.08 * x_in, span + 1.10 * x_in, span + 1.16 * x_in)
     _draw_bands(ax, positions, all_items, colors, cpi, alpha=0.38)
 
     if p["show_ref"]:
@@ -598,6 +611,7 @@ def slide_sankey_flow(stats, partial_stats, top_names, anchor_date, anchor_month
     _draw_columns(
         ax, positions, all_items, raw, colors, geom,
         label_all=(len(stages) - 1,), label_min_in=0.14, others_counts=others_counts,
+        swatch_columns=(len(stages) - 1,),
     )
     _draw_headers(ax, labels, totals, geom)
     _draw_names(ax, positions, all_items, geom, column=0, colors=colors)
