@@ -15,6 +15,7 @@ import html
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import zlib
@@ -543,12 +544,21 @@ def chart_anchor(result, chart):
     return f"{_slugify(result.slug)}-{_slugify(short)}"
 
 
+# The site's icon: the same square Vulners logo the charts carry in their
+# corner, copied next to the pages as ``favicon.png`` by ``build_site``. Every
+# current browser takes a PNG icon; the touch-icon link covers iOS bookmarks.
+_FAVICON_SRC = os.path.join(os.path.dirname(__file__), "assets", "vulners_logo.png")
+_FAVICON_NAME = "favicon.png"
+
+
 def _html_page(title, body):
     return (
         "<!doctype html>\n<html lang=\"en\">\n<head>\n"
         "<meta charset=\"utf-8\">\n"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
         f"<title>{html.escape(title)}</title>\n"
+        f"<link rel=\"icon\" type=\"image/png\" href=\"{_FAVICON_NAME}\">\n"
+        f"<link rel=\"apple-touch-icon\" href=\"{_FAVICON_NAME}\">\n"
         f"<style>{_PAGE_CSS}</style>\n</head>\n<body>\n<div class=\"wrap\">\n"
         f"{body}\n</div>\n</body>\n</html>\n"
     )
@@ -644,6 +654,10 @@ def build_site(results, out_dir):
     )
 
     os.makedirs(out_dir, exist_ok=True)
+    try:
+        shutil.copyfile(_FAVICON_SRC, os.path.join(out_dir, _FAVICON_NAME))
+    except OSError as e:   # the pages still build; the tab just shows no icon
+        print(f"Could not copy the site icon {_FAVICON_SRC}: {e}")
     with open(os.path.join(out_dir, "index.html"), "w", encoding="utf-8") as f:
         f.write(_html_page("Vulnpocalypse 2026 Statistics Dashboard", index_body))
     with open(os.path.join(out_dir, "tables.html"), "w", encoding="utf-8") as f:
