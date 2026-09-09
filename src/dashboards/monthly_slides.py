@@ -1,7 +1,8 @@
 '''Presentation-slide versions of the monthly dashboard's charts.
 
 Every chart on the monthly page is drawn here a second time as a 16:9 slide
-(the weekly NVD-status chart as two, one per panel):
+(the weekly NVD-status chart as two, one per panel, plus the per-CNA status
+bar chart that keeps the weekly share panel company):
 the same numbers (each renderer reads the same ``_prep_*`` result the web chart
 is drawn from), rethought for a projector — one fixed frame, a title and a
 one-line takeaway across the top, direct labels in the right margin instead of
@@ -66,6 +67,7 @@ SLIDE_FILES = {
     "status_yearly": "cve_monthly_stats_comparison_status_yearly_slide.png",
     "status_weekly_absolute": "cve_monthly_stats_comparison_status_weekly_absolute_slide.png",
     "status_weekly_normalized": "cve_monthly_stats_comparison_status_weekly_normalized_slide.png",
+    "status_by_cna": "cve_monthly_stats_comparison_status_by_cna_slide.png",
     "fanin_chrome": "cve_monthly_stats_comparison_fanin_chrome_slide.png",
     "fanin_chrome_estate": "cve_monthly_stats_comparison_fanin_chrome_estate_slide.png",
     "fanout_downstream": "cve_monthly_stats_comparison_fanout_downstream_slide.png",
@@ -984,6 +986,93 @@ def slide_status_weekly_normalized(status_weekly, anchor_date, output_filename=S
         _slide_status_weekly(p, output_filename, normalized=True, status_weekly=status_weekly)
 
 
+# ── 9b. NVD status by CNA: whose CVEs are deferred, analysed, queued ────────
+
+def slide_status_by_cna(status_cna, anchor_date, output_filename=SLIDE_FILES["status_by_cna"]):
+    """One stacked horizontal bar per top CNA, in CVEs, under a pooled "Others"
+    bar on top: everything each one published since ``STATUS_CNA_START`` by
+    NVD status, each segment labelled with its share of the CNA's bar. The
+    companion of the weekly status slides, cut by publisher instead of by
+    week; same statuses, same colors."""
+    p = m._prep_status_by_cna(status_cna, anchor_date)
+    if p is None:
+        return
+    rows, statuses, colors = p["rows"], p["statuses"], p["colors"]
+    n = len(rows)
+    named = [r for r in rows if not r["pooled"]]
+
+    a_all = p["all_shares"]["Analyzed"] + p["all_shares"]["Modified"]
+    q_all = sum(p["all_shares"][s] for s in m.STATUS_QUEUE)
+    d_all = p["all_shares"]["Deferred"]
+    named_share = p["named_total"] / p["all_total"] * 100.0 if p["all_total"] else 0.0
+    most_deferred = max(named, key=lambda r: r["shares"]["Deferred"]) if named else None
+    most_queued = max(named, key=lambda r: sum(r["shares"][s] for s in m.STATUS_QUEUE)) if named else None
+    start = date.fromisoformat(p["start_str"]).strftime("%-d %b %Y")
+    end = date.fromisoformat(p["end_str"]).strftime("%-d %b %Y")
+
+    subtitle = (
+        f"{p['all_total']:,} CVEs published {start} – {end}: {a_all:.0f}% analysed by NVD, "
+        f"{q_all:.0f}% still in its queue, {d_all:.0f}% deferred unanalysed  ·  "
+        f"the {len(named)} named CNAs are {named_share:.0f}% of the volume"
+    )
+    if most_deferred is not None and most_queued is not None:
+        subtitle += (
+            f"  ·  most deferred: {most_deferred['name']} ({most_deferred['shares']['Deferred']:.0f}%), "
+            f"deepest in the queue: {most_queued['name']} "
+            f"({sum(most_queued['shares'][s] for s in m.STATUS_QUEUE):.0f}%)"
+        )
+    fig = _slide(f"Whose CVEs NVD analyses, defers, or leaves in the queue: top {len(named)} CNAs", subtitle)
+
+    legend_y = 0.075
+    axes_bottom = 0.175
+    ax = fig.add_axes([0.205, axes_bottom, 0.66, CONTENT_TOP - axes_bottom - 0.01])
+    _style_axes(ax)
+    ax.grid(False, axis="y")
+
+    y = np.arange(n)[::-1]            # first row (the pooled one) on top
+    bar_h = 0.74
+    x_max = p["x_max"]
+    lefts = np.zeros(n)
+    dark_text = {"Modified", "Undergoing Analysis", "Awaiting Analysis"}
+    for status, color in zip(statuses, colors):
+        vals = np.array([r["counts"][status] for r in rows], dtype=float)
+        ax.barh(y, vals, bar_h, left=lefts, label=status, color=color, edgecolor=BG, linewidth=1.0, alpha=0.95)
+        # The segment's share of its own bar, where the segment can hold it.
+        for i, r in enumerate(rows):
+            if vals[i] >= 0.045 * x_max:
+                ax.text(
+                    lefts[i] + vals[i] / 2.0, y[i], f"{r['shares'][status]:.0f}%", ha="center", va="center",
+                    fontsize=F_SMALL, fontweight="bold",
+                    color=BG if status in dark_text else INK,
+                )
+        lefts += vals
+
+    for i, r in enumerate(rows):
+        ax.text(
+            r["total"] + 0.012 * x_max, y[i], f"{r['total']:,}", ha="left", va="center",
+            fontsize=F_SMALL, fontweight="bold", color=INK2 if r["pooled"] else "#E0E0E0",
+        )
+
+    ax.set_yticks(y)
+    ax.set_yticklabels([r["name"] for r in rows], fontsize=F_TICK, fontweight="bold", color="#E0E0E0")
+    if rows[0]["pooled"]:
+        ax.get_yticklabels()[0].set_color(INK2)
+    ax.tick_params(axis="y", pad=8)
+    ax.set_xlim(0, x_max * 1.12)
+    ax.set_ylim(-0.6, n - 0.4)
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{int(v):,}"))
+    ax.set_xlabel(f"CVEs published since {start}  ·  labels: share of the CNA's bar", fontsize=F_TICK, color=INK2)
+    ax.spines["left"].set_visible(False)
+
+    handles, labels = ax.get_legend_handles_labels()
+    fig.legend(
+        handles, labels, loc="center", bbox_to_anchor=(0.535, legend_y), ncol=6,
+        facecolor="#262626", edgecolor="#444444", fontsize=F_SMALL + 0.5,
+        handletextpad=0.5, columnspacing=1.4, borderpad=0.6,
+    )
+    _save(fig, output_filename, "status by CNA")
+
+
 # ── 10. Chrome fan-in: every release, one restart ───────────────────────────
 
 def _chrome_releases(chrome_cves, anchor_date):
@@ -1876,6 +1965,7 @@ _RENDERERS = [
     # The web chart stacks both weekly views in one tall picture; a slide gets one each.
     ("status_weekly", slide_status_weekly_absolute),
     ("status_weekly", slide_status_weekly_normalized),
+    ("status_by_cna", slide_status_by_cna),
     ("candidate_track", slide_candidate_track),
     ("fanin_chrome", slide_fanin_chrome),
     ("fanin_chrome", slide_fanin_chrome_estate),      # reads the CSV the line above writes

@@ -98,6 +98,7 @@ CHART_FILES = [
     "cve_monthly_stats_comparison_projection.png",
     "cve_monthly_stats_comparison_status_yearly.png",
     "cve_monthly_stats_comparison_status_weekly.png",
+    "cve_monthly_stats_comparison_status_by_cna.png",
     "cve_monthly_stats_comparison_candidate_track.png",
 ]
 
@@ -112,6 +113,7 @@ CHART_LINKS = {
     "cve_monthly_stats_comparison_projection.png": ("projection", "Year-end projections"),
     "cve_monthly_stats_comparison_status_yearly.png": ("nvd-status-yearly", "NVD status by year"),
     "cve_monthly_stats_comparison_status_weekly.png": ("nvd-status-weekly", "NVD status by week"),
+    "cve_monthly_stats_comparison_status_by_cna.png": ("nvd-status-cna", "NVD status by CNA"),
     "cve_monthly_stats_comparison_candidate_track.png": ("reserved", "Reserved but unpublished"),
 }
 
@@ -186,6 +188,17 @@ CHART_CAPTIONS = {
         "much of each week's output got analysed, how much was deferred, and how "
         "much is still sitting in the queue. When the warm band at the top grows, "
         "the backlog is growing faster than the analysts."
+    ),
+    "cve_monthly_stats_comparison_status_by_cna.png": (
+        "Same statuses, third cut: whose CVEs they are. Every CVE published since "
+        "the first of January, grouped by the CNA that issued it, one bar per "
+        "publisher, as long as its volume. The fifteen biggest publishers get a "
+        "row of their own; everyone else shares the top one. The numbers inside "
+        "a bar are that publisher's own mix in percent. "
+        "Blue is what NVD analysed, gray is what it deferred without a look, "
+        "and the warm colors are the queue. Read down the gray: some publishers "
+        "are waved through almost wholesale, others barely at all. Read down the "
+        "warm colors to see whose backlog it actually is."
     ),
     "cve_monthly_stats_comparison_candidate_track.png": (
         "And here is the part nobody counts. These are CVE IDs already reserved "
@@ -996,6 +1009,11 @@ STATUS_COLORS = {
 }
 # The statuses that mean "NVD has not looked at this yet".
 STATUS_QUEUE = ("Undergoing Analysis", "Awaiting Analysis", "Received")
+# The per-CNA status chart: every CVE published from this day to the anchor,
+# grouped by CNA, the top TOP_N named and the rest pooled into one "Others" row.
+STATUS_CNA_START = "2026-01-01"
+# Left-to-right order of the per-CNA bars: analysed, then the queue, then deferred.
+STATUS_CNA_ORDER = list(STATUS_BAR_ORDER)
 
 # ── Sankey lane colors ───────────────────────────────────────────────────────
 # A lane's color belongs to its *place* in the ranking, not to the CNA's name.
@@ -1301,6 +1319,9 @@ def count_monthly_cves(file_path, cut_off_date=None):
     # pictures keep their numbers when drawn from here.
     status_yearly = collections.defaultdict(collections.Counter)
     status_weekly = collections.defaultdict(collections.Counter)
+    # status_cna[cna_name][vulnStatus] = count, for the per-CNA status chart:
+    # the same records as above, published STATUS_CNA_START through the anchor.
+    status_cna = collections.defaultdict(collections.Counter)
     # chrome_cves: one row per Chrome-CNA CVE of the anchor year —
     # {"id", "day", "advisories": [GCSA ids], "versions": [Chrome versions]}.
     chrome_cves = []
@@ -1363,6 +1384,7 @@ def count_monthly_cves(file_path, cut_off_date=None):
                 published_date = item.get("published")
                 vuln_status = item.get("vulnStatus")
                 reporter = item.get("reporter")
+                cna_name = item.get("cna") or reporter or "Unknown"
 
                 is_rejected = bool(vuln_status) and vuln_status.lower() == "rejected"
                 is_candidate = bool(reporter) and reporter.lower() == "candidate"
@@ -1405,6 +1427,8 @@ def count_monthly_cves(file_path, cut_off_date=None):
                         status_yearly[published_date[:4]][status_key] += 1
                         week_start = pub_day - timedelta(days=pub_day.weekday())
                         status_weekly[week_start.isoformat()][status_key] += 1
+                        if published_date[:10] >= STATUS_CNA_START:
+                            status_cna[cna_name][status_key] += 1
 
                 # Candidate (reserved / not-yet-published) CVEs are excluded from
                 # the main counts, but tracked separately as the "hidden" volume:
@@ -1460,8 +1484,6 @@ def count_monthly_cves(file_path, cut_off_date=None):
                         continue
 
                     if year in ["2022", "2023", "2024", "2025", "2026"]:
-                        cna_name = item.get("cna") or reporter or "Unknown"
-
                         if cna_name == CHROME_CNA and year == anchor_year:
                             advisories, versions = [], set()
                             ench = item.get("enchantments")
@@ -1534,6 +1556,7 @@ def count_monthly_cves(file_path, cut_off_date=None):
         "candidate_stats": candidate_stats,
         "status_yearly": status_yearly,
         "status_weekly": status_weekly,
+        "status_cna": status_cna,
         "chrome_cves": chrome_cves,
         "fanout_records": fanout_records,
         "epss_rows": epss_rows,
@@ -4977,6 +5000,155 @@ def plot_status_stacked_charts(status_weekly, anchor_date, output_filename="cve_
     plt.close()
     saved_files_log.append(f"Combined stacked status chart saved to {os.path.abspath(output_filename)}")
 
+def _prep_status_by_cna(status_cna, anchor_date):
+    """Everything ``plot_status_by_cna`` draws, before any layout; ``None``
+    when there is nothing to draw. Shared with the slide renderer.
+
+    One pooled "Others" row first, then one row per CNA for the ``TOP_N``
+    biggest publishers of the window (by CVEs carrying one of the six drawn
+    statuses), biggest first. Each row carries its counts and its shares in
+    percent; ``all_counts`` is the whole window's mix for the headline.
+    """
+    statuses = list(STATUS_CNA_ORDER)
+    per_cna = []
+    for cna, counts in status_cna.items():
+        kept = {s: counts.get(s, 0) for s in statuses}
+        total = sum(kept.values())
+        if total > 0:
+            per_cna.append((cna, total, kept))
+    if not per_cna:
+        return None
+    per_cna.sort(key=lambda r: (-r[1], r[0]))
+    named, tail = per_cna[:TOP_N], per_cna[TOP_N:]
+
+    def row(name, total, counts, pooled=0):
+        return {
+            "name": name,
+            "total": total,
+            "counts": counts,
+            "shares": {s: counts[s] / total * 100.0 for s in statuses},
+            "pooled": pooled,
+        }
+
+    rows = [row(cna, total, counts) for cna, total, counts in named]
+    if tail:
+        pooled = {s: sum(c[s] for _, _, c in tail) for s in statuses}
+        rows.insert(0, row(f"Others ({len(tail):,} CNAs)", sum(pooled.values()), pooled, pooled=len(tail)))
+    all_counts = {s: sum(r["counts"][s] for r in rows) for s in statuses}
+    all_total = sum(all_counts.values())
+    return {
+        "rows": rows,
+        "statuses": statuses,
+        "colors": [STATUS_COLORS[s] for s in statuses],
+        "all_counts": all_counts,
+        "all_total": all_total,
+        "all_shares": {s: all_counts[s] / all_total * 100.0 for s in statuses},
+        "named_total": sum(r["total"] for r in rows if not r["pooled"]),
+        "x_max": max(r["total"] for r in rows),
+        "start_str": STATUS_CNA_START,
+        "end_str": anchor_date[:10],
+    }
+
+
+def _write_status_by_cna_csv(status_cna, output_filename="cve_monthly_stats_comparison_status_by_cna_counts.csv"):
+    """Local-only CSV companion of the per-CNA status chart: every CNA of the
+    window, every status it carries, biggest publisher first."""
+    all_statuses = sorted({s for c in status_cna.values() for s in c})
+    rows = sorted(status_cna.items(), key=lambda kv: (-sum(kv[1].values()), kv[0]))
+    with open(output_filename, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["cna"] + all_statuses + ["total"])
+        writer.writeheader()
+        for cna, counts in rows:
+            r = {"cna": cna, "total": sum(counts.values())}
+            r.update({s: counts.get(s, 0) for s in all_statuses})
+            writer.writerow(r)
+    saved_files_log.append(f"Saved per-CNA status CSV to {os.path.abspath(output_filename)}")
+
+
+def plot_status_by_cna(status_cna, anchor_date, output_filename="cve_monthly_stats_comparison_status_by_cna.png"):
+    """Horizontal stacked bars in absolute counts: every CVE published
+    ``STATUS_CNA_START`` through the anchor by NVD status, one bar per
+    top-``TOP_N`` CNA under a pooled "Others" bar on top. Each segment carries
+    its share of the CNA's bar in percent. The companion of the weekly status
+    chart — same statuses, same colors, cut by publisher instead of by week."""
+    p = _prep_status_by_cna(status_cna, anchor_date)
+    if p is None:
+        return
+    rows, statuses, colors = p["rows"], p["statuses"], p["colors"]
+    n = len(rows)
+
+    plt.style.use("dark_background")
+    fig, ax = plt.subplots(figsize=(16, 11), facecolor="#1E1E1E")
+    ax.set_facecolor("#1E1E1E")
+
+    y = np.arange(n)[::-1]            # first row (the pooled one) on top
+    bar_height = 0.72
+    x_max = p["x_max"]
+    lefts = np.zeros(n)
+    dark_text = {"Modified", "Undergoing Analysis", "Awaiting Analysis"}
+    for status, color in zip(statuses, colors):
+        vals = np.array([r["counts"][status] for r in rows], dtype=float)
+        ax.barh(
+            y, vals, bar_height, left=lefts, label=status, color=color,
+            edgecolor="#1E1E1E", linewidth=1.2, alpha=0.92,
+        )
+        # The segment's share of its own bar, wherever the segment is wide
+        # enough to hold the number.
+        for i, r in enumerate(rows):
+            if vals[i] >= 0.045 * x_max:
+                ax.text(
+                    lefts[i] + vals[i] / 2.0, y[i], f"{r['shares'][status]:.0f}%", ha="center", va="center",
+                    fontsize=12.5, fontweight="bold",
+                    color="#1E1E1E" if status in dark_text else "#FFFFFF",
+                )
+        lefts += vals
+
+    for i, r in enumerate(rows):
+        ax.text(
+            r["total"] + 0.012 * x_max, y[i], f"{r['total']:,}", ha="left", va="center",
+            fontsize=13.5, fontweight="bold", color="#E0E0E0",
+        )
+
+    ax.set_yticks(y)
+    ax.set_yticklabels([r["name"] for r in rows], fontsize=14.5, fontweight="bold", color="#E0E0E0")
+    if rows[0]["pooled"]:
+        ax.get_yticklabels()[0].set_color("#A4B0BE")     # the pooled row, quieter
+    ax.set_xlim(0, x_max * 1.12)
+    ax.set_ylim(-0.6, n - 0.4)
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda val, pos: f"{int(val):,}"))
+    ax.tick_params(axis="x", colors="#CCCCCC", labelsize=13.5, pad=6)
+    ax.tick_params(axis="y", length=0, pad=10)
+    for label in ax.get_xticklabels():
+        label.set_fontweight("bold")
+    ax.set_xlabel("Number of CVEs (labels: share of the CNA's bar)", fontsize=16, fontweight="bold", color="#FFFFFF", labelpad=10)
+    ax.grid(True, axis="x", color="#444444", linestyle="--", alpha=0.6, linewidth=0.9)
+    ax.set_axisbelow(True)
+    for spine in ["top", "right", "left"]:
+        ax.spines[spine].set_visible(False)
+    ax.spines["bottom"].set_color("#555555")
+
+    ax.set_title(
+        f"CVEs by CNA and NVD Status: Top {TOP_N} Publishers + Others ({p['start_str']} – {p['end_str']})",
+        fontsize=22, fontweight="bold", color="#FFFFFF", pad=20,
+    )
+
+    handles, labels = ax.get_legend_handles_labels()
+    fig.legend(
+        handles, labels, loc="lower center", bbox_to_anchor=(0.08, 0.045, 0.90, 0.05),
+        mode="expand", ncol=6, facecolor="#262626", edgecolor="#444444", fontsize=15,
+        handletextpad=0.6, borderpad=0.5, framealpha=0.95,
+    )
+    plt.figtext(
+        0.5, 0.008, f"{_stamp()} | Data Source: Vulners CVE Archive",
+        ha="center", fontsize=12, color="#747D8C", style="italic", fontweight="bold",
+    )
+    plt.tight_layout(rect=[0.01, 0.11, 0.99, 0.98])
+    fig.subplots_adjust(bottom=0.15)
+    _add_logo(fig)
+    plt.savefig(output_filename, dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.close()
+    saved_files_log.append(f"Per-CNA status chart saved to {os.path.abspath(output_filename)}")
+
 
 # Top sources (by overall reach) shown as rows in the candidate heatmap; the
 # long tail is aggregated into an "other sources" row so nothing is dropped.
@@ -5562,10 +5734,14 @@ def _run_monthly(results, report_buf):
     status_weekly = results.get("status_weekly", {})
     slide_inputs["status_yearly"] = dict(status_yearly=status_yearly, anchor_date=anchor_date)
     slide_inputs["status_weekly"] = dict(status_weekly=status_weekly, anchor_date=anchor_date)
+    status_cna = results.get("status_cna", {})
+    slide_inputs["status_by_cna"] = dict(status_cna=status_cna, anchor_date=anchor_date)
     plot_status_yearly_bar(status_yearly, anchor_date)
     plot_status_stacked_charts(status_weekly, anchor_date)
+    plot_status_by_cna(status_cna, anchor_date)
     if _WRITE_CSV:
         _write_status_csvs(status_yearly, status_weekly)
+        _write_status_by_cna_csv(status_cna)
 
     # Hidden volume: reserved/candidate CVEs (last chart on the dashboard).
     slide_inputs["candidate_track"] = dict(candidate_stats=results.get("candidate_stats", {}))
