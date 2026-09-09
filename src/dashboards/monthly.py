@@ -1127,7 +1127,7 @@ _SPEED_HEADROOM = 1.05         # blank space kept above the fastest curve
 # overhang of the last header, which is the widest of them ("Aug 1-15" while the
 # month is still running).
 _SANKEY_GUTTER_IN = 2.55     # inches reserved left of the first column
-_SANKEY_VALUES_IN = 1.45     # inches reserved right of the last column
+_SANKEY_VALUES_IN = 1.78     # inches reserved right of the last column
 
 # Monthly-flow Sankey: the vertical frame. The columns all hang from
 # ``_SANKEY_Y_TOP`` and the busiest one reaches ``_SANKEY_Y_FLOOR``, which fixes
@@ -3001,7 +3001,7 @@ def plot_custom_sankey_flow(
     # Depth below the baseline, in CVEs. It is what turns "that band looks about
     # as tall as that column" into a number, and it only reads because every
     # column starts at the same line.
-    grid_x0, grid_x1 = -0.10 * x_in, span + 0.72 * x_in
+    grid_x0, grid_x1 = -0.10 * x_in, span + 0.95 * x_in
     ax.plot(
         [grid_x0, grid_x1], [_SANKEY_Y_TOP] * 2,
         color="#FFFFFF", alpha=0.22, linewidth=1.4, zorder=0.5,
@@ -3011,7 +3011,7 @@ def plot_custom_sankey_flow(
          if max_total / s <= 6),
         20000,
     )
-    ruler_x = span + 0.80 * x_in
+    ruler_x = span + 1.03 * x_in
     for depth in range(0, int(max_total) + 1, step):
         y = _SANKEY_Y_TOP - depth * unit
         if depth:
@@ -3126,7 +3126,13 @@ def plot_custom_sankey_flow(
                         1 for k, v in stage_data.items()
                         if k not in sorted_top_names and v > 0
                     )
-                    label_text = f"{val}\n[{cna_count}]"
+                    # Nudged apart, the labels get one line's worth of room
+                    # each, so the last column's "Others" says its CNA count on
+                    # the same line instead of overrunning the value above it.
+                    label_text = (
+                        f"{val} [{cna_count}]" if spread is not None
+                        else f"{val}\n[{cna_count}]"
+                    )
                 else:
                     label_text = f"{val}"
                 label_y = spread[i] if spread is not None else y_center
@@ -3136,8 +3142,20 @@ def plot_custom_sankey_flow(
                         [label_x - 0.02 * x_in, x_pos + 0.095 * x_in], [label_y, y_center],
                         color="#FFFFFF", alpha=0.35, linewidth=0.9, zorder=3.5,
                     )
+                # Nudged apart, a value no longer sits against its own lane and
+                # the leaders into this stack cross each other, so each value
+                # carries a swatch of its lane colour the way the names do.
+                text_x = label_x
+                if spread is not None:
+                    ax.plot(
+                        [label_x + 0.075 * x_in], [label_y], marker="s", markersize=10,
+                        linestyle="none",
+                        markerfacecolor=colors.get(item, SANKEY_OTHERS_COLOR),
+                        markeredgecolor="none", clip_on=False, zorder=4,
+                    )
+                    text_x = label_x + 0.19 * x_in
                 txt = ax.text(
-                    label_x,
+                    text_x,
                     label_y,
                     label_text,
                     ha="left",
@@ -3498,7 +3516,21 @@ def plot_incomplete_month_sankey(
 
             ax.fill(x_poly, y_poly, color=colors.get(item, "#747D8C"), alpha=0.35, edgecolor="none")
 
-    # Draw stage blocks and labels
+    # Draw stage blocks and labels.
+    #
+    # Only the right column's values carry a colour swatch: the left column's
+    # numbers already have the names' own squares a swatch's width away, and the
+    # centre column is the one every lane is sorted by, read as a stack.
+    value_swatch_stage = len(stages) - 1
+    # And a swatch only says something for a lane that holds a rank colour. A CNA
+    # outside the top 15 wears the "Others" gray, so a gray square beside its
+    # name or its value would claim a colour it has not got; those lanes keep the
+    # text, at the same x, and drop the square. "Others" itself is the exception —
+    # gray is its colour.
+    has_swatch = {
+        item: item == "Others" or colors.get(item) != SANKEY_OTHERS_COLOR
+        for item in all_items
+    }
     for s, stage in enumerate(stages):
         x_pos = s
         pos = stage_positions[s]
@@ -3521,8 +3553,21 @@ def plot_incomplete_month_sankey(
                     label_text = f"{val}\n[{cna_count}]"
                 else:
                     label_text = f"{val}"
+                # The right column has no names beside it and its thinnest
+                # lanes leave no visible colour at the node, so each of its
+                # values gets a swatch of its lane colour.
+                text_x = x_pos + 0.06
+                if s == value_swatch_stage:
+                    if has_swatch[item]:
+                        ax.plot(
+                            [x_pos + 0.075], [y_center], marker="s", markersize=10,
+                            linestyle="none",
+                            markerfacecolor=colors.get(item, SANKEY_OTHERS_COLOR),
+                            markeredgecolor="none", clip_on=False, zorder=4,
+                        )
+                    text_x = x_pos + 0.105
                 txt = ax.text(
-                    x_pos + 0.06,
+                    text_x,
                     y_center,
                     label_text,
                     ha="left",
@@ -3538,9 +3583,19 @@ def plot_incomplete_month_sankey(
                 ])
 
             # Label the CNA name once, in the left margin at the first column.
+            # Each name carries a swatch of its lane colour on its right, the
+            # way the monthly-flow chart's names do: a lane thin enough to be a
+            # hairline at the node shows no colour of its own otherwise.
             if s == 0:
+                if has_swatch[item]:
+                    ax.plot(
+                        [x_pos - 0.075], [y_center], marker="s", markersize=10,
+                        linestyle="none",
+                        markerfacecolor=colors.get(item, SANKEY_OTHERS_COLOR),
+                        markeredgecolor="none", clip_on=False, zorder=4,
+                    )
                 ax.text(
-                    x_pos - 0.06,
+                    x_pos - 0.105,
                     y_center,
                     item,
                     ha="right",
