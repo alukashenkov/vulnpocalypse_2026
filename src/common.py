@@ -29,6 +29,12 @@ from urllib3.util.retry import Retry
 ARCHIVE_BASENAME = "vulners_archive_cve.json"
 COLLECTION_URL = "https://vulners.com/api/v4/archive/collection/"
 UPDATE_URL = "https://vulners.com/api/v4/archive/collection-update/"
+STATE_URL = "https://vulners.com/api/v4/archive/collection-state/"
+
+# How much of the published archive's stream is pulled to read its first
+# document. Documents run to a few tens of KB; a megabyte is slack, and the
+# connection is dropped the moment the head parses.
+PUBLISHED_HEAD_MAX_BYTES = 4 * 1024 * 1024
 
 # Server-enforced: collection-update rejects an `after` earlier than this with a
 # 400. An archive further behind than this cannot be patched at all — clamping
@@ -233,6 +239,101 @@ def _stream_gzip_to(session, url, params, headers, dest, timeout):
                     f.write(decompressor.decompress(chunk))
             f.write(decompressor.flush())
     return os.path.getsize(dest)
+
+
+def _published_archive_head(session, headers):
+    """The first document of the published CDN archive, or ``None``.
+
+    Published archives are sorted newest-modified-first, so their first document
+    is the newest record the snapshot holds. Nothing else says this: the
+    ``collection-state`` cursor drifts forward on its own while the published
+    file stands still, and ``upload_time`` dates the build, not its contents.
+
+    The archive is multi-GB, so the stream is decompressed chunk by chunk and
+    dropped the moment one document decodes — a megabyte or so off the front,
+    written nowhere. Like every archive endpoint the call is free.
+    """
+    decoder = json.JSONDecoder()
+    with session.get(
+        COLLECTION_URL, params={"type": "cve"}, headers=headers,
+        stream=True, timeout=(10, 60),
+    ) as r:
+        r.raise_for_status()
+        decompressor = zlib.decompressobj(wbits=zlib.MAX_WBITS | 16)
+        buf = ""
+        for chunk in r.iter_content(chunk_size=256 * 1024):
+            if not chunk:
+                continue
+            buf += decompressor.decompress(chunk).decode("utf-8", errors="ignore")
+            start = buf.find("{")
+            if start >= 0:
+                try:
+                    # raw_decode stops at the end of the first object rather than
+                    # hunting for a "}," delimiter, which lands inside a nested
+                    # object on almost every real document.
+                    head, _ = decoder.raw_decode(buf[start:])
+                    return head
+                except ValueError:
+                    pass  # document still incomplete — read more
+            if len(buf) > PUBLISHED_HEAD_MAX_BYTES:
+                return None
+    return None
+
+
+def _report_published_archive(session, headers, watermark, now):
+    """Print what the CDN is publishing right now, against this local copy.
+
+    The watermark line above says how current *this* archive is; it cannot say
+    how current the published one is, which is what decides whether a full
+    re-download would even gain anything over the deltas about to be applied.
+    A snapshot is already hours stale when served, and archives are rebuilt
+    several times a day, so the two numbers move independently.
+
+    Purely a report, and never fatal: both calls are free, and a failure costs
+    the line and nothing else.
+    """
+    try:
+        r = session.get(STATE_URL, params={"type": "cve"}, headers=headers, timeout=30)
+        r.raise_for_status()
+        state = r.json().get("result") or {}
+    except Exception as e:  # noqa: BLE001 - a missing report must not stop the run
+        state = {}
+        print(f"Note: collection-state unavailable ({e}).")
+
+    try:
+        head = _published_archive_head(session, headers)
+    except Exception as e:  # noqa: BLE001 - ditto
+        head = None
+        print(f"Note: could not read the published archive's newest record ({e}).")
+
+    newest = None
+    if head:
+        newest = _to_dt((head.get("timestamps") or {}).get("updated") or head.get("modified"))
+
+    bits = []
+    if newest:
+        lag = (now - newest).total_seconds() / 3600
+        behind_local = (watermark - newest).total_seconds() / 3600 if watermark else None
+        bits.append(
+            f"newest record {head.get('id') or '?'} modified {newest.isoformat()} "
+            f"({lag:.1f}h behind now"
+            + (
+                f", {abs(behind_local):.1f}h {'behind' if behind_local >= 0 else 'ahead of'} this copy)"
+                if behind_local is not None else ")"
+            )
+        )
+    elif head:
+        bits.append(f"newest record {head.get('id') or '?'} carries no modification date")
+    else:
+        bits.append("newest record unreadable")
+    # The cursor is deliberately not reported: it describes the server's position,
+    # not the published file, and reading it as the archive's age has bitten
+    # before. upload_time is the CDN object's Last-Modified exactly.
+    if state.get("upload_time"):
+        bits.append(f"built {state['upload_time']}")
+    if state.get("total_docs"):
+        bits.append(f"{int(state['total_docs']):,} docs")
+    print("Published CDN archive: " + "; ".join(bits))
 
 
 def _ijson_array_prefix(path):
@@ -450,6 +551,7 @@ def download_archive_once():
             f"({(now - watermark).total_seconds() / 3600:.1f}h behind); "
             f"fetching updates after {after} ..."
         )
+        _report_published_archive(session, headers, watermark, now)
 
         update_file = path + ".update.tmp"
         start = time.time()
