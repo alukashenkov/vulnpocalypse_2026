@@ -253,11 +253,27 @@ YEAR_COLORS = {
 # record's ``cna`` field and falls back to ``reporter`` — Chrome's records carry
 # no ``cna`` and ``reporter == "Chrome"``, which is the Sankey's "Chrome" lane.
 # For the anchor year every Chrome CVE's release facts are kept for the fan-in
-# slide: the Chrome security advisory it references (``type: chrome`` in
-# enchantments.dependencies.references, a ``GCSA-…`` id — one advisory is one
-# release) and the Chrome version named by its Nessus plugin id.
+# slide: the Chrome release post it links to, the Chrome security advisory it
+# references (``type: chrome`` in enchantments.dependencies.references, a
+# ``GCSA-…`` id) and the Chrome version named by its Nessus plugin id.
+#
+# The release post — the ``chromereleases.googleblog.com`` URL in the record's
+# own ``references`` — is the release itself, and is the only one of the three
+# that a CVE carries on the day it is published: the advisory id and the Nessus
+# plugin id are enrichments that land a day or more later, so a release
+# pinned by those alone is missing from the slide until the archive catches up.
+# One post can carry several advisories (a desktop and a mobile bulletin for
+# the same build), and each advisory belongs to exactly one post.
+#
+# ``_CHROME_FIX_VER`` reads the fixed version out of the description ("prior to
+# 153.0.8010.36"), which is the only version a fresh record names. It can
+# differ from the Nessus plugin's version by the last component — Chrome
+# numbers a release's platforms separately — so it is a display fallback, never
+# a grouping key.
 CHROME_CNA = "Chrome"
 _CHROME_NESSUS_VER = re.compile(r"^(?:MACOSX_)?GOOGLE_CHROME_(\d+)_(\d+)_(\d+)_(\d+)\.NASL$")
+_CHROME_POST_URL = re.compile(r"chromereleases\.googleblog\.com/(\d{4}/\d{2}/[^\s\"']+)")
+_CHROME_FIX_VER = re.compile(r"prior to (\d+\.\d+\.\d+\.\d+)")
 
 # ── Fan-out: one CVE, many downstream advisories ─────────────────────────────
 # The fan-out slide takes one CVE and counts the distinct downstream records
@@ -1331,8 +1347,9 @@ def count_monthly_cves(file_path, cut_off_date=None):
     # status_cna[cna_name][vulnStatus] = count, for the per-CNA status chart:
     # the same records as above, published STATUS_CNA_START through the anchor.
     status_cna = collections.defaultdict(collections.Counter)
-    # chrome_cves: one row per Chrome-CNA CVE of the anchor year —
-    # {"id", "day", "advisories": [GCSA ids], "versions": [Chrome versions]}.
+    # chrome_cves: one row per Chrome-CNA CVE of the anchor year — {"id", "day",
+    # "posts": [release-post paths], "advisories": [GCSA ids], "versions":
+    # [Chrome versions], "fix_version": the version its description names}.
     chrome_cves = []
     # fanout_records[cve_id] = the archive record's facts the fan-out slide and
     # its shortlist CSV need, for FANOUT_CVE and every FANOUT_SHORTLIST entry.
@@ -1508,11 +1525,19 @@ def count_monthly_cves(file_path, cut_off_date=None):
                                         mv = _CHROME_NESSUS_VER.match(str(plugin))
                                         if mv:
                                             versions.add(".".join(mv.groups()))
+                            posts = []
+                            for url in item.get("references") or ():
+                                mp = _CHROME_POST_URL.search(str(url))
+                                if mp and mp.group(1) not in posts:
+                                    posts.append(mp.group(1))
+                            mf = _CHROME_FIX_VER.search(str(item.get("description") or ""))
                             chrome_cves.append({
                                 "id": item.get("id"),
                                 "day": record_date_str,
+                                "posts": posts,
                                 "advisories": advisories,
                                 "versions": sorted(versions),
+                                "fix_version": mf.group(1) if mf else None,
                             })
 
                         # Store in full monthly stats

@@ -1100,49 +1100,73 @@ def slide_status_by_cna(status_cna, anchor_date, output_filename=SLIDE_FILES["st
 def _chrome_releases(chrome_cves, anchor_date):
     """Group the year's Chrome CVEs into releases.
 
-    A release is pinned by the Chrome security advisory (``GCSA-…``) its CVEs
-    reference, and dated by the day those CVEs were published. Advisories that
-    name the same Chrome version are one release (a desktop and a mobile post
-    for the same build). A CVE without an advisory link joins the release of
-    its own Chrome version (from its Nessus plugin id) published within
-    ``CHROME_ATTACH_DAYS`` of it — most of Chrome's volume arrives this way, in
-    bulk on release day. Whatever matches neither is counted as unattributed.
+    A release is the Chrome release post (``chromereleases.googleblog.com/…``)
+    its CVEs link to. That link is the one release fact a record carries on the
+    day it is published, which is why it is the key: the ``GCSA-…`` advisory id
+    and the Nessus plugin id are enrichments that land a day or more later, and
+    a release pinned by those alone is missing from the slide — while every
+    other chart already counts its CVEs — until the archive catches up. One
+    post can carry two advisories (a desktop and a mobile bulletin for the same
+    build); a record with no post is pinned by its advisory instead, and one
+    with neither joins the release of its own Chrome version published within
+    ``CHROME_ATTACH_DAYS`` of it. Whatever matches none of the three is counted
+    as unattributed.
 
     Returns ``(releases, unattributed)``; each release is a dict with ``key``,
     ``version`` (or ``None``), ``major``, ``date``, ``linked`` and ``attached``
     counts, sorted by date.
     """
     rows = [r for r in chrome_cves if r["day"] <= anchor_date[:10]]
-    by_adv = {}
-    for r in rows:
+
+    def _new(key):
+        return {"key": key, "advisories": set(), "date": None,
+                "nessus": collections.Counter(), "fixed": collections.Counter(),
+                "linked_ids": set(), "attached_ids": set()}
+
+    releases, by_adv = {}, {}
+
+    def _link(rel, r):
+        rel["advisories"].update(r["advisories"])
+        rel["date"] = r["day"] if rel["date"] is None else min(rel["date"], r["day"])
+        rel["nessus"].update(r["versions"])
+        if r.get("fix_version"):
+            rel["fixed"][r["fix_version"]] += 1
+        rel["linked_ids"].add(r["id"])
         for gid in r["advisories"]:
-            by_adv.setdefault(gid, []).append(r)
+            by_adv[gid] = rel
 
-    releases = {}
-    for gid, rs in by_adv.items():
-        vers = collections.Counter(v for r in rs for v in r["versions"])
-        version = sorted(vers, key=lambda v: (-vers[v], v))[0] if vers else None
-        key = version or gid
-        rel = releases.setdefault(key, {
-            "key": key, "version": version, "advisories": set(), "date": None,
-            "linked_ids": set(), "attached_ids": set(),
-        })
-        rel["advisories"].add(gid)
-        first = min(r["day"] for r in rs)
-        rel["date"] = first if rel["date"] is None else min(rel["date"], first)
-        rel["linked_ids"].update(r["id"] for r in rs)
+    for r in rows:
+        posts = r.get("posts") or ()
+        if posts:
+            _link(releases.setdefault(posts[0], _new(posts[0])), r)
 
+    # No post: the advisory pins the release — the same one if another record
+    # already tied that advisory to a post, otherwise a release of its own,
+    # keyed by the Chrome version so two advisories for one build stay together.
+    for r in rows:
+        if r.get("posts") or not r["advisories"]:
+            continue
+        rel = next((by_adv[gid] for gid in r["advisories"] if gid in by_adv), None)
+        if rel is None:
+            key = r["versions"][0] if r["versions"] else r["advisories"][0]
+            rel = releases.setdefault(key, _new(key))
+        _link(rel, r)
+
+    # Neither: attach by Chrome version to a release published around the same
+    # day. Both versions a record can name are tried — the Nessus plugin's and
+    # the one its description gives — because Chrome numbers a release's
+    # platforms separately and the two differ by the last component.
     by_version = {}
     for rel in releases.values():
-        if rel["version"]:
-            by_version.setdefault(rel["version"], []).append(rel)
+        for v in list(rel["nessus"]) + list(rel["fixed"]):
+            by_version.setdefault(v, []).append(rel)
     unattributed = 0
     for r in rows:
-        if r["advisories"]:
+        if r.get("posts") or r["advisories"]:
             continue
         day = date.fromisoformat(r["day"])
         best = None
-        for v in r["versions"]:
+        for v in list(r["versions"]) + ([r["fix_version"]] if r.get("fix_version") else []):
             for rel in by_version.get(v, ()):
                 gap = abs((date.fromisoformat(rel["date"]) - day).days)
                 if gap <= CHROME_ATTACH_DAYS and (best is None or gap < best[0]):
@@ -1154,10 +1178,14 @@ def _chrome_releases(chrome_cves, anchor_date):
 
     out = []
     for rel in releases.values():
+        # The Nessus plugin's version names the build the slide labels; before
+        # that enrichment lands, the version the CVEs' descriptions give.
+        vers = rel["nessus"] or rel["fixed"]
+        version = sorted(vers, key=lambda v: (-vers[v], v))[0] if vers else None
         out.append({
             "key": rel["key"],
-            "version": rel["version"],
-            "major": int(rel["version"].split(".")[0]) if rel["version"] else None,
+            "version": version,
+            "major": int(version.split(".")[0]) if version else None,
             "date": date.fromisoformat(rel["date"]),
             "advisories": sorted(rel["advisories"]),
             "linked": len(rel["linked_ids"]),
