@@ -1802,6 +1802,19 @@ def slide_kernel_fixes(daily_counts_kernel, anchor_date, output_filename=SLIDE_F
     if len(rel) < 3:
         return
     last = rel[-1]
+    # The cycle after the newest release is still open, so its CVEs belong to no
+    # bar: without this the CVEs published since release day are on every other
+    # chart and missing from this one. Drawn outlined and labelled with the days
+    # it has run, since a part-cycle count is not comparable to a full one.
+    anchor_day = date.fromisoformat(anchor_date[:10])
+    open_start = last["end"] + timedelta(days=1)
+    open_days = (anchor_day - open_start).days + 1
+    open_cycle = None
+    if open_days > 0:
+        open_cycle = {
+            "start": open_start, "end": anchor_day, "days": open_days,
+            "cves": sum(per_day.get(open_start + timedelta(days=k), 0) for k in range(open_days)),
+        }
     plateau = [r["fixes"] for r in rel[:-3]]
     plateau_avg = sum(plateau) / len(plateau)
     # The CVE plateau only over cycles the kernel CNA was active for.
@@ -1823,7 +1836,7 @@ def slide_kernel_fixes(daily_counts_kernel, anchor_date, output_filename=SLIDE_F
         + "  ·  bottom: CVEs the kernel CNA published in each release's cycle",
     )
     x0 = datetime.fromisoformat(window_start)
-    x1 = datetime.combine(last["end"], datetime.min.time()) + timedelta(days=45)
+    x1 = datetime.combine(open_cycle["end"] if open_cycle else last["end"], datetime.min.time()) + timedelta(days=45)
     ax_top = fig.add_axes([0.085, 0.50, 0.685, CONTENT_TOP - 0.50])
     ax_bot = fig.add_axes([0.085, AXES_BOTTOM, 0.685, 0.50 - 0.045 - AXES_BOTTOM])
     for ax in (ax_top, ax_bot):
@@ -1839,11 +1852,11 @@ def slide_kernel_fixes(daily_counts_kernel, anchor_date, output_filename=SLIDE_F
     xs = [datetime.combine(r["end"], datetime.min.time()) for r in rel]
     colors = [m.C_RED if r is last else m.C_BLUE for r in rel]
 
-    def panel(ax, key, avg, ylabel, label_main, label_sub, plateau_note):
+    def panel(ax, key, avg, ylabel, label_main, label_sub, plateau_note, open_bar=None):
         ys = [r[key] for r in rel]
         ax.bar(xs, ys, width=26, color=colors, alpha=0.95, edgecolor=BG, linewidth=0.6, zorder=3)
         ax.axhline(avg, color=INK3, linestyle=(0, (6, 4)), linewidth=1.1, alpha=0.8, zorder=2)
-        y_max = max(ys) * 1.28
+        y_max = max(ys + ([open_bar[key]] if open_bar else [])) * 1.28
         ax.set_ylim(0, y_max)
         ax.text(x0 + timedelta(days=12), y_max * 0.93, plateau_note, ha="left", va="top",
                 fontsize=F_SMALL, color=INK3, style="italic")
@@ -1854,8 +1867,24 @@ def slide_kernel_fixes(daily_counts_kernel, anchor_date, output_filename=SLIDE_F
             t = ax.annotate(r["v"], xy=(xx, 0), xytext=(0, 3), textcoords="offset points", ha="center", va="bottom",
                             fontsize=7.5, color=INK, fontweight="bold", zorder=5, rotation=90)
             _stroke(t, 1.8)
+        labels = [{"y": last[key], "color": m.C_RED, "main": label_main, "sub": label_sub}]
+        if open_bar:
+            # Narrower than a release bar and outlined, so a part-cycle count is
+            # not read as one more full cycle. Its value is on the end label only.
+            xo = datetime.combine(open_bar["end"], datetime.min.time())
+            ax.bar([xo], [open_bar[key]], width=17, facecolor="none", edgecolor=m.C_RED,
+                   linewidth=1.3, linestyle=(0, (3, 2)), alpha=0.9, zorder=3)
+            t = ax.annotate("open", xy=(xo, 0), xytext=(0, 3), textcoords="offset points", ha="center",
+                            va="bottom", fontsize=7.5, color=INK2, fontweight="bold", zorder=5, rotation=90)
+            _stroke(t, 1.8)
+            labels.append({
+                "y": open_bar[key], "color": m.C_RED,
+                "main": f"cycle open: {open_bar[key]:,} CVEs",
+                "sub": f"{open_bar['start'].strftime('%b %-d')} – {open_bar['end'].strftime('%b %-d')}, "
+                       f"{open_bar['days']} days so far",
+            })
         ax.set_ylabel(ylabel, fontsize=F_TICK - 1, color=INK2)
-        _end_labels(ax, [{"y": last[key], "color": m.C_RED, "main": label_main, "sub": label_sub}], min_gap=0.2)
+        _end_labels(ax, labels, min_gap=0.2)
 
     # Both 7.2 figures, each with its basis: the bar is the chart's polyline, the
     # article's prose counts more broadly. Quoting one over the other is fine once
@@ -1871,6 +1900,7 @@ def slide_kernel_fixes(daily_counts_kernel, anchor_date, output_filename=SLIDE_F
         ax_bot, "cves", cve_base_avg, "kernel CNA CVEs per release cycle",
         f"{last['v']} cycle: {last['cves']:,} CVEs", f"{last['start'].strftime('%b %-d')} – {last['end'].strftime('%b %-d')}, {last['days']} days",
         f"- - -  plateau {cve_base_avg:,.0f} a cycle ({min(cve_base):,}–{max(cve_base):,}), {cna_rel[0]['v']}–{cna_rel[-1]['v']}",
+        open_bar=open_cycle,
     )
     # The bottom panel's honest reading: the CVE side has moved in one release so
     # far; fixes lead, CVE assignment follows. Said as a prediction, not a multiple.
@@ -1878,7 +1908,9 @@ def slide_kernel_fixes(daily_counts_kernel, anchor_date, output_filename=SLIDE_F
     ax_bot.text(
         0.012, 0.74,
         f"Fixes lead, CVE assignment follows: {lead_names} stayed at the plateau, {last['v']} broke out.\n"
-        f"If the lag holds, the next two cycles publish far more kernel CVEs. Check in December.",
+        f"If the lag holds, the next two cycles publish far more kernel CVEs. Check in December."
+        + (f"\nOutlined at the right: the cycle open since {open_cycle['start'].strftime('%b %-d')} — "
+           f"{open_cycle['cves']:,} CVEs in {open_cycle['days']} days, not yet a full cycle." if open_cycle else ""),
         transform=ax_bot.transAxes, ha="left", va="top", fontsize=F_SMALL, color=INK2, style="italic", linespacing=1.4,
     )
     # Cycles before the kernel CNA existed have nothing to count.
