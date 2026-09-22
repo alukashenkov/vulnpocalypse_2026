@@ -64,6 +64,7 @@ SLIDE_FILES = {
     "incomplete_month": "cve_monthly_stats_comparison_incomplete_month_slide.png",
     "projections": "cve_monthly_stats_comparison_projection_slide.png",
     "candidate_track": "cve_monthly_stats_comparison_candidate_track_slide.png",
+    "active_cnas": "cve_monthly_stats_comparison_active_cnas_slide.png",
     "status_yearly": "cve_monthly_stats_comparison_status_yearly_slide.png",
     "status_weekly_absolute": "cve_monthly_stats_comparison_status_weekly_absolute_slide.png",
     "status_weekly_normalized": "cve_monthly_stats_comparison_status_weekly_normalized_slide.png",
@@ -834,6 +835,99 @@ def slide_candidate_track(candidate_stats, output_filename=SLIDE_FILES["candidat
     ax.grid(which="minor", color=BG, linewidth=2.5)
     ax.tick_params(which="minor", length=0)
     _save(fig, output_filename, "candidate track")
+
+
+def slide_active_cnas(stats, anchor_date, anchor_month_complete=False,
+                      output_filename=SLIDE_FILES["active_cnas"]):
+    """The headcount behind the volume: CNAs active per month (bars, split into
+    those already seen this year and those arriving) against the running count
+    of distinct CNAs since January 1st (line). Same prep as the web chart."""
+    p = m._prep_active_cnas(stats, anchor_date, anchor_month_complete)
+    if p is None:
+        return
+    rows = p["rows"]
+    first, last = rows[0], rows[-1]
+
+    roster = p["roster_total"]
+    fig = _slide(
+        f"Active CNAs month by month, {p['year']}",
+        "A CNA counts as active in a month if it published at least one CVE that month  ·  "
+        "bar = active that month, green = publishing for the first time this year  ·  "
+        "line = distinct CNAs since Jan 1"
+        + (f"  ·  dashed = every CNA cve.org lists ({p['roster_retrieved']})" if roster else ""),
+    )
+    ax = fig.add_axes([0.085, AXES_BOTTOM, 0.715, CONTENT_TOP - AXES_BOTTOM])
+    _style_axes(ax)
+    ax.grid(False, axis="x")
+
+    x = np.arange(len(rows))
+    returning = np.array([r["returning"] for r in rows], dtype=float)
+    new = np.array([r["new"] for r in rows], dtype=float)
+    cumulative = np.array([r["cumulative"] for r in rows], dtype=float)
+
+    b_ret = ax.bar(x, returning, 0.6, color=m.C_BLUE, edgecolor=BG, linewidth=0.8, alpha=0.95, zorder=3)
+    b_new = ax.bar(x, new, 0.6, bottom=returning, color=m.C_GREEN, edgecolor=BG, linewidth=0.8,
+                   alpha=0.95, zorder=3)
+    for i, r in enumerate(rows):
+        if not r["partial"]:
+            continue
+        for bar, color in ((b_ret[i], m.C_BLUE), (b_new[i], m.C_GREEN)):
+            bar.set_alpha(0.35)
+            bar.set_edgecolor(color)
+            bar.set_linewidth(1.2)
+            bar.set_linestyle((0, (3, 2)))
+
+    ax.plot(x, cumulative, color=m.C_RED, linewidth=2.8, marker="o", markersize=7,
+            markerfacecolor=m.C_RED, markeredgecolor=BG, markeredgewidth=1.2, zorder=5)
+
+    y_top = max(cumulative.max() * 1.14, (roster or 0) * 1.05)
+    if roster:
+        ax.axhline(roster, color=INK2, linestyle=(0, (7, 5)), linewidth=1.6, zorder=4)
+    for i, r in enumerate(rows):
+        t = ax.annotate(f"{r['active']:,}", xy=(x[i], r["active"]), xytext=(0, 5),
+                        textcoords="offset points", ha="center", va="bottom",
+                        fontsize=F_LABEL, fontweight="bold", color=INK, zorder=6)
+        _stroke(t, 2.5)
+        if r["new"] >= 12:
+            ax.annotate(f"+{r['new']}", xy=(x[i], r["returning"] + r["new"] / 2.0),
+                        xytext=(0, 0), textcoords="offset points", ha="center", va="center",
+                        fontsize=F_SMALL, fontweight="bold",
+                        color=m.C_GREEN if r["partial"] else BG, zorder=6)
+        clear = (r["cumulative"] - r["active"]) < 0.06 * y_top
+        t = ax.annotate(f"{r['cumulative']:,}", xy=(x[i], r["cumulative"]),
+                        xytext=(0, 24 if clear else 9), textcoords="offset points",
+                        ha="center", va="bottom", fontsize=F_LABEL, fontweight="bold",
+                        color=m.C_RED, zorder=6)
+        _stroke(t, 2.5)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(
+        [f"{r['label']}\n1–{int(p['anchor_date'][8:10])}" if r["partial"] else r["label"] for r in rows],
+        fontsize=F_TICK, fontweight="bold", color=INK,
+    )
+    ax.set_ylim(0, y_top)
+    ax.set_xlim(-0.7, len(rows) - 0.3)
+    ax.set_ylabel("CNAs", fontsize=F_TICK, color=INK2)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, pos: f"{int(v):,}"))
+
+    labels = [
+        {"y": last["cumulative"], "color": m.C_RED,
+         "main": f"{p['total_cnas']:,} distinct CNAs",
+         "sub": f"since Jan 1  ·  January alone: {first['cumulative']:,}"},
+        {"y": last["active"], "color": m.C_BLUE,
+         "main": f"{last['active']:,} active",
+         "sub": f"in {last['label']}" + (f" 1–{int(p['anchor_date'][8:10])}" if last["partial"] else ""),
+        },
+    ]
+    if roster:
+        labels.insert(0, {
+            "y": roster, "color": INK2,
+            "main": f"{roster:,} listed CNAs",
+            "sub": f"{p['roster_share']:.0f}% of them published in {p['year']}",
+        })
+    _end_labels(ax, labels, min_gap=0.1)
+
+    _save(fig, output_filename, "active CNAs")
 
 
 # ── 7. NVD status by year ───────────────────────────────────────────────────
@@ -2149,6 +2243,7 @@ _RENDERERS = [
     ("ytd_growth", slide_ytd_growth),
     ("sankey_flow", slide_sankey_flow),
     ("incomplete_month", slide_incomplete_month),
+    ("active_cnas", slide_active_cnas),
     ("projections", slide_projections),
     ("status_yearly", slide_status_yearly),
     # The web chart stacks both weekly views in one tall picture; a slide gets one each.

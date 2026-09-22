@@ -101,6 +101,7 @@ CHART_FILES = [
     "cve_monthly_stats_comparison_ytd_growth.png",
     "cve_monthly_stats_comparison_sankey_monthly.png",
     "cve_monthly_stats_comparison_incomplete_month.png",
+    "cve_monthly_stats_comparison_active_cnas.png",
     "cve_monthly_stats_comparison_projection.png",
     "cve_monthly_stats_comparison_status_yearly.png",
     "cve_monthly_stats_comparison_status_weekly.png",
@@ -115,6 +116,7 @@ CHART_LINKS = {
     "cve_monthly_stats_comparison_yearly_cumulative.png": ("cumulative", "Cumulative CVEs by year"),
     "cve_monthly_stats_comparison_ytd_growth.png": ("pace", "Year-over-year pace"),
     "cve_monthly_stats_comparison_sankey_monthly.png": ("cna-flow", "Monthly flow by CNA"),
+    "cve_monthly_stats_comparison_active_cnas.png": ("active-cnas", "Active CNAs by month"),
     "cve_monthly_stats_comparison_incomplete_month.png": ("month-comparison", "Month-to-month comparison"),
     "cve_monthly_stats_comparison_projection.png": ("projection", "Year-end projections"),
     "cve_monthly_stats_comparison_status_yearly.png": ("nvd-status-yearly", "NVD status by year"),
@@ -160,6 +162,23 @@ CHART_CAPTIONS = {
         "it crosses, everything above it is that month's worth of CVEs. This is "
         'what "more of everything, from everyone" looks like when you actually '
         "draw it."
+    ),
+    "cve_monthly_stats_comparison_active_cnas.png": (
+        "Before anyone starts guessing at year-end, a headcount. Every chart so "
+        "far counts CVEs; this one counts the publishers behind them. A CNA is "
+        "active in a month if it put out at least one CVE that month, and the "
+        "bar says how many did. The green slice is the ones turning up for the "
+        "first time this year, and the red line is the running tally of "
+        "distinct publishers since January 1st, which climbs by exactly that "
+        "slice every month. The dashed line above everything is the whole "
+        "roster \u2014 every CNA the CVE Program currently lists, pulled fresh from "
+        "cve.org's own partner list \u2014 so the gap between it and the red line is "
+        "the publishers that have been silent all year. Two things to read. The "
+        "bars barely move while the CVE counts keep climbing, so the extra "
+        "volume is the same crowd "
+        "publishing more, not a crowd that doubled. And the red line never "
+        "flattens \u2014 there is always one more publisher that was quiet until "
+        "now, which is the part the projections below have to live with."
     ),
     "cve_monthly_stats_comparison_incomplete_month.png": (
         "Down from the whole year to a single window. Three snapshots of the exact "
@@ -639,6 +658,106 @@ def kev_additions_by_month(data_dir=None):
         if len(added) >= 7:
             counts[added[:7]] += 1
     return dict(counts), (data.get("dateReleased") or "")[:10] or None
+
+
+# ── The CNA roster: how many CNAs exist at all ───────────────────────────────
+# The denominator of the active-CNA chart. cve.org's "List of Partners" page is
+# a client-side app with no API of its own — the table it renders is this file
+# in the CVE Program's own website repo, which is where the program commits
+# every onboarding (a handful of entries a month, several commits a month), so
+# reading it is reading the published list itself rather than scraping a page.
+# Fetched once a day into DATA_DIR the way the KEV catalog is, with the local
+# copy as the fallback: a failed fetch costs the chart its roster line and
+# nothing else.
+CNA_LIST_URL = (
+    "https://raw.githubusercontent.com/CVEProject/cve-website/dev/src/assets/data/CNAsList.json"
+)
+CNA_LIST_BASENAME = "cve_org_cna_list.json"
+# Roles that assign CVE IDs. The list also carries roles that do not — Root,
+# Top-Level Root, Secretariat, ADP — held by organisations that are counted here
+# only when they also hold one of these (MITRE and CISA-ICS are CNA-LRs, and the
+# CNA of last resort publishes like any other CNA; CISA's ADP entry enriches
+# other CNAs' records and assigns nothing, so it is not counted).
+CNA_ASSIGNING_ROLES = ("CNA", "CNA-LR")
+_cna_roster_cache = {}
+
+
+def download_cna_list(data_dir=None):
+    """Path to today's copy of the cve.org partner list in ``data_dir``
+    (DATA_DIR by default); re-downloaded once a day, else the local copy is
+    kept. ``None`` when neither a download nor a local copy is available."""
+    import urllib.request
+
+    data_dir = os.path.abspath(data_dir or os.getenv("DATA_DIR") or os.getcwd())
+    target_path = os.path.join(data_dir, CNA_LIST_BASENAME)
+    if os.path.exists(target_path):
+        if datetime.fromtimestamp(os.path.getmtime(target_path)).date() == datetime.now().date():
+            return target_path
+    print(f"Downloading the cve.org CNA list from: {CNA_LIST_URL}")
+    try:
+        req = urllib.request.Request(
+            CNA_LIST_URL, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as response:
+            payload = response.read()
+        json.loads(payload)  # a truncated body must not overwrite a good copy
+        os.makedirs(data_dir, exist_ok=True)
+        with open(target_path, "wb") as out_file:
+            out_file.write(payload)
+        return target_path
+    except Exception as e:  # noqa: BLE001 - any failure falls back to the local copy
+        print(f"Failed to download the cve.org CNA list: {e}")
+        return target_path if os.path.exists(target_path) else None
+
+
+def cna_roster(data_dir=None):
+    """How many CNAs the CVE Program currently lists, or ``None`` when the list
+    is unavailable.
+
+    Returns ``{"total", "partners", "roles", "shortnames", "retrieved"}``:
+    ``total`` is the partners holding an assigning role (``CNA_ASSIGNING_ROLES``)
+    — the chart's denominator — ``partners`` is every record on the list
+    including the roots and the Secretariat, ``roles`` is the whole role
+    breakdown, ``shortnames`` are the assigning partners' short names, and
+    ``retrieved`` is the day the local copy was downloaded (the list carries no
+    date of its own).
+    """
+    path = download_cna_list(data_dir)
+    if not path:
+        return None
+    key = (path, os.path.getmtime(path))
+    if key in _cna_roster_cache:
+        return _cna_roster_cache[key]
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"Could not read the CNA list {path}: {e}")
+        return None
+    if not isinstance(data, list) or not data:
+        print(f"Unexpected CNA list shape in {path}")
+        return None
+
+    roles = collections.Counter()
+    assigning = set()
+    for record in data:
+        if not isinstance(record, dict):
+            continue
+        cna = record.get("CNA") or {}
+        held = {r.get("role") for r in (cna.get("roles") or []) if isinstance(r, dict)}
+        roles.update(r for r in held if r)
+        if held & set(CNA_ASSIGNING_ROLES) and record.get("shortName"):
+            assigning.add(record["shortName"])
+
+    roster = {
+        "total": len(assigning),
+        "partners": len(data),
+        "roles": dict(roles),
+        "shortnames": assigning,
+        "retrieved": datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d"),
+    }
+    _cna_roster_cache[key] = roster
+    return roster
 
 
 # ── Kernel bug-fix discovery vs CVE publishing ───────────────────────────────
@@ -5334,6 +5453,218 @@ def plot_status_by_cna(status_cna, anchor_date, output_filename="cve_monthly_sta
     saved_files_log.append(f"Per-CNA status chart saved to {os.path.abspath(output_filename)}")
 
 
+def _prep_active_cnas(stats, anchor_date, anchor_month_complete=False):
+    """Everything ``plot_active_cnas`` draws, before any layout; ``None`` when
+    there is nothing to draw. Shared with the slide renderer.
+
+    One row per month of the anchor year up to the anchor month: how many
+    distinct CNAs published at least one CVE that month, how many of those were
+    publishing for the first time this year, and the running count of distinct
+    CNAs seen since January 1st. Counted over the same records the monthly
+    charts count — candidates and rejected CVEs are already out of ``stats`` —
+    so "active" means "published a CVE that counts on this page". The anchor
+    month is a part month unless it has closed, and is marked as one.
+    """
+    year = anchor_date[:4]
+    anchor_month = anchor_date[5:7]
+    months = [m for m in sorted(stats) if m <= anchor_month and stats[m].get(year)]
+    if not months:
+        return None
+
+    seen = set()
+    rows = []
+    for month in months:
+        active = {cna for cna, n in stats[month][year].items() if n > 0}
+        new = active - seen
+        seen |= active
+        rows.append({
+            "month": month,
+            "label": datetime.strptime(month, "%m").strftime("%b"),
+            "active": len(active),
+            "new": len(new),
+            "returning": len(active) - len(new),
+            "cumulative": len(seen),
+            "cves": sum(stats[month][year].values()),
+            "partial": month == anchor_month and not anchor_month_complete,
+        })
+    # The headline quotes whole months only, like every other part-month figure
+    # here; a run inside January has nothing but the part month to quote.
+    whole = [r for r in rows if not r["partial"]] or rows
+    # The denominator: every CNA the CVE Program currently lists (refreshed
+    # daily, see ``cna_roster``). ``None`` when the list could not be read, and
+    # both drawers then simply leave the roster line off.
+    roster = cna_roster()
+    return {
+        "year": year,
+        "rows": rows,
+        "total_cnas": len(seen),
+        "busiest": max(whole, key=lambda r: r["active"]),
+        "anchor_date": anchor_date,
+        "roster_total": roster["total"] if roster else None,
+        "roster_retrieved": roster["retrieved"] if roster else None,
+        "roster_share": (len(seen) / roster["total"] * 100.0) if roster and roster["total"] else None,
+    }
+
+
+def _write_active_cnas_csv(stats, anchor_date, anchor_month_complete=False,
+                           output_filename="cve_monthly_stats_comparison_active_cnas.csv"):
+    """Local-only CSV companion of the active-CNA chart: one row per month."""
+    p = _prep_active_cnas(stats, anchor_date, anchor_month_complete)
+    if p is None:
+        return
+    with open(output_filename, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["month", "active_cnas", "new_this_year", "returning",
+                           "cumulative_cnas", "cves", "partial_month"],
+        )
+        writer.writeheader()
+        for r in p["rows"]:
+            writer.writerow({
+                "month": f"{p['year']}-{r['month']}",
+                "active_cnas": r["active"],
+                "new_this_year": r["new"],
+                "returning": r["returning"],
+                "cumulative_cnas": r["cumulative"],
+                "cves": r["cves"],
+                "partial_month": "yes" if r["partial"] else "no",
+            })
+    saved_files_log.append(f"Saved active-CNA CSV to {os.path.abspath(output_filename)}")
+
+
+def plot_active_cnas(stats, anchor_date, anchor_month_complete=False,
+                     output_filename="cve_monthly_stats_comparison_active_cnas.png"):
+    """How many CNAs actually published, month by month, against how many
+    distinct ones the year has seen. Each bar is that month's active
+    publishers, split into the ones already seen this year and the ones
+    appearing for the first time; the line is the running distinct count, which
+    rises by exactly the new segment of each bar. One shared axis: the line
+    counts the same thing the bars count and always sits above them."""
+    p = _prep_active_cnas(stats, anchor_date, anchor_month_complete)
+    if p is None:
+        return
+    rows = p["rows"]
+
+    plt.style.use("dark_background")
+    fig, ax = plt.subplots(figsize=(max(13, len(rows) * 1.15 + 3.5), 9), facecolor="#1E1E1E")
+    ax.set_facecolor("#1E1E1E")
+
+    x = np.arange(len(rows))
+    returning = np.array([r["returning"] for r in rows], dtype=float)
+    new = np.array([r["new"] for r in rows], dtype=float)
+    cumulative = np.array([r["cumulative"] for r in rows], dtype=float)
+
+    bars_returning = ax.bar(
+        x, returning, 0.62, color=C_BLUE, edgecolor="#1E1E1E", linewidth=1.2, alpha=0.92,
+        label="Active, seen earlier this year",
+    )
+    bars_new = ax.bar(
+        x, new, 0.62, bottom=returning, color=C_GREEN, edgecolor="#1E1E1E", linewidth=1.2,
+        alpha=0.92, label="Active, first time this year",
+    )
+    # A part month is drawn the way the rest of this project draws one: present,
+    # but visibly unfinished — faded and dashed rather than solid, because its
+    # days have not all happened yet and its bar is not comparable.
+    for i, r in enumerate(rows):
+        if not r["partial"]:
+            continue
+        for bar, color in ((bars_returning[i], C_BLUE), (bars_new[i], C_GREEN)):
+            bar.set_alpha(0.38)
+            bar.set_edgecolor(color)
+            bar.set_linewidth(1.6)
+            bar.set_linestyle((0, (3, 2)))
+
+    ax.plot(
+        x, cumulative, color=C_RED, linewidth=3.2, marker="o", markersize=9,
+        markerfacecolor=C_RED, markeredgecolor="#1E1E1E", markeredgewidth=1.6, zorder=5,
+        label="Distinct CNAs since Jan 1 (running total)",
+    )
+
+    y_top = max(cumulative.max() * 1.16, (p["roster_total"] or 0) * 1.07)
+    # Every CNA the CVE Program lists, as the ceiling the running total climbs
+    # towards; the gap is the CNAs that have published nothing this year.
+    if p["roster_total"]:
+        ax.axhline(p["roster_total"], color="#A4B0BE", linestyle=(0, (7, 5)), linewidth=2.0, zorder=4)
+        ax.annotate(
+            f"{p['roster_total']:,} CNAs listed by cve.org, retrieved {p['roster_retrieved']}\n"
+            f"{p['total_cnas']:,} of them ({p['roster_share']:.0f}%) have published in {p['year']}",
+            xy=(len(rows) - 0.4, p["roster_total"]), xytext=(0, -10), textcoords="offset points",
+            ha="right", va="top", fontsize=13.5, fontweight="bold", color="#A4B0BE",
+            linespacing=1.4, zorder=6,
+        )
+    for i, r in enumerate(rows):
+        ax.annotate(
+            f"{r['active']:,}", xy=(x[i], r["active"]), xytext=(0, 7),
+            textcoords="offset points", ha="center", va="bottom",
+            fontsize=15, fontweight="bold", color="#FFFFFF",
+        )
+        # The new arrivals inside their own segment, where it is tall enough.
+        if r["new"] >= 12:
+            ax.annotate(
+                f"+{r['new']}", xy=(x[i], r["returning"] + r["new"] / 2.0),
+                xytext=(0, 0), textcoords="offset points", ha="center", va="center",
+                fontsize=12, fontweight="bold",
+                color=C_GREEN if r["partial"] else "#1E1E1E",
+            )
+        # January's running total sits exactly on its own bar (nobody has been
+        # seen before), so that one label is lifted clear of the bar's.
+        clear = (r["cumulative"] - r["active"]) < 0.06 * y_top
+        ax.annotate(
+            f"{r['cumulative']:,}", xy=(x[i], r["cumulative"]), xytext=(0, 32 if clear else 13),
+            textcoords="offset points", ha="center", va="bottom",
+            fontsize=14.5, fontweight="bold", color=C_RED, zorder=6,
+        )
+
+    labels = [
+        f"{r['label']}\n(1–{int(p['anchor_date'][8:10])})" if r["partial"] else r["label"]
+        for r in rows
+    ]
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=16, fontweight="bold", color="#E0E0E0")
+    ax.tick_params(colors="#CCCCCC", labelsize=14, pad=8)
+    ax.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda val, pos: f"{int(val):,}"))
+    for label in ax.get_yticklabels():
+        label.set_fontweight("bold")
+    ax.set_ylabel("Number of CNAs", fontsize=17, fontweight="bold", color="#FFFFFF", labelpad=12)
+    ax.set_ylim(0, y_top)
+    ax.set_xlim(-0.7, len(rows) - 0.3)
+
+    headline = (
+        f"{p['total_cnas']:,} of the {p['roster_total']:,} listed CNAs have published so far this year  ·  "
+        f"{p['busiest']['active']:,} active in the busiest month"
+        if p["roster_total"] else
+        f"{p['total_cnas']:,} distinct CNAs so far this year  ·  "
+        f"{p['busiest']['active']:,} active in the busiest month"
+    )
+    ax.set_title(
+        f"Active CNAs Month by Month ({p['year']})\n{headline}",
+        fontsize=21, fontweight="bold", color="#FFFFFF", pad=20,
+    )
+    ax.grid(True, axis="y", color="#444444", linestyle="--", alpha=0.6, linewidth=0.9)
+    ax.set_axisbelow(True)
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+    for spine in ["left", "bottom"]:
+        ax.spines[spine].set_color("#555555")
+
+    handles, legend_labels = ax.get_legend_handles_labels()
+    fig.legend(
+        handles, legend_labels, loc="lower center", bbox_to_anchor=(0.10, 0.045, 0.86, 0.05),
+        mode="expand", ncol=3, facecolor="#262626", edgecolor="#444444", fontsize=14,
+        handletextpad=0.6, borderpad=0.5, framealpha=0.95,
+    )
+    plt.figtext(
+        0.5, 0.008,
+        f"{_stamp()} | Data Sources: Vulners CVE Archive, cve.org partner list",
+        ha="center", fontsize=12, color="#747D8C", style="italic", fontweight="bold",
+    )
+    plt.tight_layout(rect=[0.01, 0.13, 0.99, 0.98])
+    fig.subplots_adjust(bottom=0.19)
+    _add_logo(fig)
+    plt.savefig(output_filename, dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.close()
+    saved_files_log.append(f"Saved active-CNA chart to {os.path.abspath(output_filename)}")
+
+
 # Top sources (by overall reach) shown as rows in the candidate heatmap; the
 # long tail is aggregated into an "other sources" row so nothing is dropped.
 _CAND_TOP_SOURCES = 12
@@ -5842,6 +6173,15 @@ def _run_monthly(results, report_buf):
             output_filename="cve_monthly_stats_comparison_sankey_monthly_by_month.png",
             rank_by="anchor_month",
         )
+
+    # How many CNAs were actually active, month by month, and how many distinct
+    # ones the year has seen (the headcount behind the Sankey's ribbons).
+    slide_inputs["active_cnas"] = dict(
+        stats=stats, anchor_date=anchor_date, anchor_month_complete=anchor_month_complete,
+    )
+    plot_active_cnas(stats, anchor_date, anchor_month_complete=anchor_month_complete)
+    if _WRITE_CSV:
+        _write_active_cnas_csv(stats, anchor_date, anchor_month_complete=anchor_month_complete)
 
     # Generate YTD growth chart
     slide_inputs["ytd_growth"] = dict(
