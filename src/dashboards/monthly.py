@@ -44,6 +44,12 @@ _WRITE_CSV = False   # published path writes no CSV; a local caller may flip thi
 # ``monthly_slides``). Off on the published path — the page shows only the six
 # charts in CHART_FILES — and flipped on by the local wrapper.
 _SLIDES = False
+# Experiment: draw the monthly-flow Sankey a second time with its lanes ranked by
+# the anchor month's volume instead of the year's (same data, same colors, same
+# text — only the stack order moves), saved next to it as
+# ``cve_monthly_stats_comparison_sankey_monthly_by_month.png``. Off on the
+# published path, which shows only the charts in CHART_FILES.
+_SANKEY_MONTH_ORDER = False
 
 # Last day the numbers actually cover (the anchor). Set by count_monthly_cves()
 # and stamped into every chart footer next to the generation date; the two are
@@ -1165,6 +1171,10 @@ _SANKEY_BAND_INSET = 1.8
 _SANKEY_MIN_BAND = 1.0
 _SANKEY_LABEL_MIN_H = 12.5   # y units a lane needs before its value is printed
 _SANKEY_CALLOUT_Y = 5.0      # where the callout sits inside the empty wedge
+# Gap kept between the callout's headline and the growth curve overhead, in CVEs
+# (the y axis is the CVE axis). Text that grazes the curve reads as attached to
+# it; a tenth of a ruler step is enough daylight to keep it its own object.
+_SANKEY_CALLOUT_CLEAR = 25.0
 # How close to a whole reference month still counts as carrying one. The callout
 # names the *fewest* CNAs that clear this: three names that come to nine tenths
 # of January is the sharper sentence, and a fourth that tips the sum over the
@@ -2769,11 +2779,19 @@ def sankey_rank_color_map(stats, partial_stats, ytd_2026, anchor_month_str, anch
     )
 
 
-def _prep_sankey_flow(stats, partial_stats, top_names, anchor_date, anchor_month_complete=False):
+def _prep_sankey_flow(stats, partial_stats, top_names, anchor_date, anchor_month_complete=False,
+                      rank_by="ytd"):
     """Everything ``plot_custom_sankey_flow`` draws, before any layout.
 
     Shared with the slide renderer (``monthly_slides``) so both pictures are cut
     from the very same numbers; nothing in here knows about inches or y units.
+
+    ``rank_by`` picks the stack order only. "ytd" is the dashboard's own: lanes
+    ranked by the year's volume, which is the ranking every other Sankey and the
+    colors are keyed on. "anchor_month" ranks them by the last column's volume
+    instead, so the newest month reads top-down in its own order — the same data,
+    resorted. The colors stay keyed on the year's ranking either way, so a CNA
+    wears the same color here as everywhere else and only its place moves.
     """
     anchor_month_str = anchor_date[5:7]  # e.g., "06" for June
     current_year = int(anchor_date[:4])  # display year, derived from the data anchor
@@ -2814,9 +2832,27 @@ def _prep_sankey_flow(stats, partial_stats, top_names, anchor_date, anchor_month
 
     # Sort top_names by total 2026 volume descending. This is the ranking the
     # lane colors are keyed on, so it comes from the shared helper.
-    sorted_top_names = monthly_flow_rank_order(
+    ytd_order = monthly_flow_rank_order(
         stats, partial_stats, top_names, anchor_month_str, anchor_month_complete
     )
+    # The same names ranked by the last column instead. Ties fall back to the
+    # year's order, so the ranking is stable and the two pictures differ only
+    # where the newest month actually disagrees with the year. The callout
+    # counts down this list whichever way the stack is drawn — "the top N CNAs
+    # of this month" is a claim about the month, not about the stack.
+    anchor_data = stages[-1]["data"]
+    ytd_rank = {name: i for i, name in enumerate(ytd_order)}
+    anchor_order = sorted(
+        ytd_order, key=lambda c: (-anchor_data.get(c, 0), ytd_rank[c])
+    )
+    if rank_by == "anchor_month":
+        sorted_top_names = anchor_order
+        order_note = (
+            f"Lanes ordered by {months_abbrev[anchor_month_str]} {current_year} volume."
+        )
+    else:
+        sorted_top_names = ytd_order
+        order_note = f"Lanes ordered by total {current_year} volume."
     all_items = sorted_top_names + ["Others"]
 
     # Month headers
@@ -2841,9 +2877,10 @@ def _prep_sankey_flow(stats, partial_stats, top_names, anchor_date, anchor_month
 
     max_total = max(totals) if totals else 1
 
-    # One color per rank, in the stack's own order — this chart defines the
-    # ranking every other Sankey inherits.
-    colors = sankey_lane_colors(all_items, sankey_rank_colors(sorted_top_names))
+    # One color per rank, in the *year's* order — this chart defines the ranking
+    # every other Sankey inherits, and a lane resorted by month keeps the color
+    # that ranking gave it so it can still be followed across the charts.
+    colors = sankey_lane_colors(all_items, sankey_rank_colors(ytd_order))
 
     # ── The reference guide ──────────────────────────────────────────────────
     # One month's entire output, carried across every column at the depth it
@@ -2864,12 +2901,18 @@ def _prep_sankey_flow(stats, partial_stats, top_names, anchor_date, anchor_month
     # ── The callout ──────────────────────────────────────────────────────────
     # How many of the newest month's top CNAs it takes to cover an entire
     # earlier month, read off the same numbers the chart is drawn from, so it
-    # can never drift from what is on screen.
+    # can never drift from what is on screen. It counts down ``anchor_order``,
+    # the newest month's own ranking: the sentence names that month's top N, so
+    # the N has to be the smallest one that covers the yardstick. Counting down
+    # a year-ranked stack instead answers a different question — how far into
+    # *the year's* leaders you get — and overstates N whenever the month
+    # disagrees with the year, which is why the paragraph is drawn on the
+    # month-ordered chart, where the N it names is the N you can see.
     callout = None
     if show_ref:
         cum = 0
         n_cnas = 0
-        for name in sorted_top_names:
+        for name in anchor_order:
             cum += raw_data[-1][name]
             n_cnas += 1
             if cum >= _SANKEY_ALMOST * ref_total:
@@ -2888,6 +2931,8 @@ def _prep_sankey_flow(stats, partial_stats, top_names, anchor_date, anchor_month
 
     return {
         "anchor_month_str": anchor_month_str,
+        "rank_by": rank_by,
+        "anchor_order": anchor_order,
         "current_year": current_year,
         "prev_year": prev_year,
         "months_abbrev": months_abbrev,
@@ -2899,6 +2944,7 @@ def _prep_sankey_flow(stats, partial_stats, top_names, anchor_date, anchor_month
         "totals": totals,
         "max_total": max_total,
         "colors": colors,
+        "order_note": order_note,
         "ref_idx": ref_idx,
         "ref_total": ref_total,
         "ref_label": ref_label,
@@ -2914,6 +2960,7 @@ def plot_custom_sankey_flow(
     anchor_date,
     anchor_month_complete=False,
     output_filename="cve_monthly_stats_comparison_sankey_monthly.png",
+    rank_by="ytd",
 ):
     """
     Plots a custom Sankey flow visualization of CVE contributions for top YTD
@@ -2935,9 +2982,14 @@ def plot_custom_sankey_flow(
     The last column is the anchor month. It is normally partial, and its header
     carries the day range that says so; when ``anchor_month_complete`` it is a
     whole month and gets a plain month header, like every column before it.
+
+    ``rank_by`` only picks the stack order — see ``_prep_sankey_flow``. The
+    published chart ranks lanes by the year; "anchor_month" draws the same data
+    ranked by the newest month, which local runs save beside it as a variant.
     """
     p = _prep_sankey_flow(
-        stats, partial_stats, top_names, anchor_date, anchor_month_complete
+        stats, partial_stats, top_names, anchor_date, anchor_month_complete,
+        rank_by=rank_by,
     )
     anchor_month_str = p["anchor_month_str"]
     current_year = p["current_year"]
@@ -2986,6 +3038,13 @@ def plot_custom_sankey_flow(
         figsize=(_SANKEY_FIG_W, _SANKEY_FIG_H), facecolor="#1E1E1E"
     )
     ax.set_facecolor("#1E1E1E")
+    # With the frame off there is nothing for the default subplot margins to hold,
+    # and they only pushed the flows inward — roughly a tenth of the picture on the
+    # left went to padding the logo sits in. Spanning the figure hands that width
+    # back to the bands and the CNA names. It is done here, before anything is
+    # drawn, because the axes' width in inches is what turns a text's size in
+    # points into a width in data units, and the callout measures itself.
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
 
     # Horizontal extent. The columns sit at x = 0 .. len(stages)-1; the only things
     # outside that span are text — CNA names in the left gutter, the last column's
@@ -3004,6 +3063,13 @@ def plot_custom_sankey_flow(
     x_left = -_SANKEY_GUTTER_IN * x_range / fig_w
     x_right = span + _SANKEY_VALUES_IN * x_range / fig_w
     x_center = (x_left + x_right) / 2.0
+    # The limits are those numbers, so they are set here rather than at the end:
+    # until they are, ``ax.transData`` describes an autoscaled axis, and anything
+    # that measures drawn text against the data (the callout's clearance test)
+    # would be reading a picture that is not the one being saved.
+    ax.set_xlim(x_left, x_right)
+    ax.set_ylim(_SANKEY_Y_BOTTOM, 1120)
+    ax.axis("off")
     # Everything placed *beside* a column — the node block, its value, the CNA
     # names and their leaders, the ruler — is text or text-sized furniture, so it
     # is offset in inches for the same reason the gutters are. Written in data
@@ -3240,7 +3306,14 @@ def plot_custom_sankey_flow(
     # curve leaves empty. How many of the newest month's top CNAs it takes to
     # cover an entire earlier month is read off the same numbers the chart is
     # drawn from, so it can never drift from what is on screen.
-    if show_ref:
+    #
+    # It belongs to the month-ordered chart. The count it names is the newest
+    # month's top N, so it can only be *pointed at* where the stack is in that
+    # month's order — on the year-ordered chart the N lanes it names are not the
+    # N lanes at the top, and the reader has no way to check the sentence
+    # against the picture. The number is the same either way (see
+    # ``_prep_sankey_flow``); only the drawing moved.
+    if show_ref and rank_by == "anchor_month":
         cum = p["callout"]["cum"]
         n_cnas = p["callout"]["n_cnas"]
         ref_publishers = p["callout"]["ref_publishers"]
@@ -3248,18 +3321,41 @@ def plot_custom_sankey_flow(
         verb = p["callout"]["verb"]
         # The callout lives in the empty wedge under the growth curve. Early in
         # the year there is no wedge yet, and text dropped there would land on
-        # the bands — so it is drawn only where the columns it would run beneath
-        # are short enough to clear it.
+        # the bands — so it is drawn only where the picture's own floor, the
+        # underside of the last lane, clears the headline over the width the
+        # headline actually occupies. Both halves of that used to be estimated:
+        # ~0.2in per character for the width, then whole columns tested against
+        # a fixed height. Between them a long verb ("out-publish" against
+        # "match") pulled one more column into the test and dropped the
+        # paragraph from a picture with room to spare. The headline is measured
+        # where it stands, and the floor is the same curve drawn above, sampled.
         head = (
             f"{stage_labels[-1]}: the top {n_cnas} CNAs alone "
             f"{verb} all of {ref_label}"
         )
-        head_w = 0.20 * len(head) * x_in     # ~0.2in per character at 25pt bold
-        head_top = _SANKEY_CALLOUT_Y + 26 + 34
-        room = all(
-            _SANKEY_Y_TOP - totals[c] * unit > head_top
-            for c in range(min(len(stages), int(head_w) + 2))
+        head_txt = ax.text(
+            0.04 * x_in, _SANKEY_CALLOUT_Y + 26, head,
+            ha="left", va="bottom", color="#FFFFFF", fontsize=25,
+            fontweight="bold",
         )
+        fig.canvas.draw()
+        bb = head_txt.get_window_extent(
+            renderer=fig.canvas.get_renderer()
+        ).transformed(ax.transData.inverted())
+        # The body below the headline is no wider, and the floor only falls
+        # further right, so clearing the headline clears the paragraph.
+        floor_x, floor_y = [], []
+        for c in range(len(stages) - 1):
+            cx, cy = get_curve_points(
+                c, stage_positions[c][all_items[-1]][0],
+                c + 1, stage_positions[c + 1][all_items[-1]][0],
+            )
+            floor_x.append(cx)
+            floor_y.append(cy)
+        floor_x = np.concatenate(floor_x)
+        floor_y = np.concatenate(floor_y)
+        under = (floor_x >= bb.x0) & (floor_x <= bb.x1)
+        room = bool(under.any()) and floor_y[under].min() > bb.y1 + _SANKEY_CALLOUT_CLEAR
         if room and cum >= _SANKEY_ALMOST * ref_total and n_cnas < len(sorted_top_names):
             body = (
                 f"{cum:,} CVEs from {n_cnas} publishers, against {ref_total:,} "
@@ -3269,15 +3365,12 @@ def plot_custom_sankey_flow(
                 f"one {ref_label} of CVEs."
             )
             ax.text(
-                0.04 * x_in, _SANKEY_CALLOUT_Y + 26, head,
-                ha="left", va="bottom", color="#FFFFFF", fontsize=25,
-                fontweight="bold",
-            )
-            ax.text(
                 0.04 * x_in, _SANKEY_CALLOUT_Y + 6, body,
                 ha="left", va="top", color="#A4B0BE", fontsize=17,
                 linespacing=1.6,
             )
+        else:
+            head_txt.remove()
 
     # Title & Subtitle
     ax.text(
@@ -3292,7 +3385,7 @@ def plot_custom_sankey_flow(
     ax.text(
         x_center, 1065,
         "Every column hangs from the same baseline at one scale, so equal heights "
-        f"mean equal CVE counts. Lanes ordered by total {current_year} volume.",
+        f"mean equal CVE counts. {p['order_note']}",
         ha="center",
         va="bottom",
         color="#A4B0BE",
@@ -3300,15 +3393,6 @@ def plot_custom_sankey_flow(
         style="italic"
     )
 
-    ax.set_xlim(x_left, x_right)
-    ax.set_ylim(_SANKEY_Y_BOTTOM, 1120)
-    ax.axis("off")
-
-    # With the frame off there is nothing for the default subplot margins to hold,
-    # and they only pushed the flows inward — roughly a tenth of the picture on the
-    # left went to padding the logo sits in. Spanning the figure hands that width
-    # back to the bands and the CNA names.
-    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
     _add_logo(fig)
     plt.savefig(
         output_filename,
@@ -5743,6 +5827,17 @@ def _run_monthly(results, report_buf):
         anchor_date,
         anchor_month_complete=anchor_month_complete,
     )
+    # The same picture, lanes resorted by the newest month's volume (local only).
+    if _SANKEY_MONTH_ORDER:
+        plot_custom_sankey_flow(
+            stats,
+            partial_stats,
+            ytd_top_cnas,
+            anchor_date,
+            anchor_month_complete=anchor_month_complete,
+            output_filename="cve_monthly_stats_comparison_sankey_monthly_by_month.png",
+            rank_by="anchor_month",
+        )
 
     # Generate YTD growth chart
     slide_inputs["ytd_growth"] = dict(

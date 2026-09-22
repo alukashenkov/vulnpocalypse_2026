@@ -549,7 +549,12 @@ def _draw_names(ax, positions, all_items, geom, column=0, colors=None):
 
 def slide_sankey_flow(stats, partial_stats, top_names, anchor_date, anchor_month_complete=False,
                       output_filename=SLIDE_FILES["sankey_flow"]):
-    p = m._prep_sankey_flow(stats, partial_stats, top_names, anchor_date, anchor_month_complete)
+    # Ordered by the newest month, like the month-ordered web chart: the slide's
+    # one-line takeaway names that month's top N CNAs, and a stack in the year's
+    # order puts a different N lanes at the top — nothing the reader adds up on
+    # the slide would come to the number in the sentence.
+    p = m._prep_sankey_flow(stats, partial_stats, top_names, anchor_date, anchor_month_complete,
+                            rank_by="anchor_month")
     stages, labels = p["stages"], p["stage_labels"]
     all_items, top = p["all_items"], p["sorted_top_names"]
     raw, totals, max_total, colors = p["raw_data"], p["totals"], p["max_total"], p["colors"]
@@ -567,7 +572,7 @@ def slide_sankey_flow(stats, partial_stats, top_names, anchor_date, anchor_month
     else:
         subtitle = (
             "Every column hangs from the same baseline at one scale, so equal heights mean "
-            f"equal CVE counts  ·  lanes ordered by total {cur} volume"
+            f"equal CVE counts  ·  {p['order_note'][0].lower() + p['order_note'][1:-1]}"
         )
     fig = _slide(
         f"CVEs by month and CNA: the top {len(top)} publishers, "
