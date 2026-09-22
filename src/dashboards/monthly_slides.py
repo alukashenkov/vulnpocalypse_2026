@@ -122,6 +122,16 @@ def _fit_text(fig, txt, min_size, wrap_first=False):
         txt.set_fontsize(size)
 
 
+def _data_stamp():
+    """Slides carry the data's own date only, never the build date.
+
+    A deck is read long after it was rendered, where ``m._stamp``'s "Generated
+    on <today>" dates the picture rather than the numbers in it. The site is
+    rebuilt in place and keeps both.
+    """
+    return f"Data through {m._DATA_THROUGH}" if m._DATA_THROUGH else ""
+
+
 def _slide(title, subtitle=None):
     """A blank slide with the title band and footer already in place."""
     plt.style.use("dark_background")
@@ -138,8 +148,11 @@ def _slide(title, subtitle=None):
             linespacing=1.25,
         )
         _fit_text(fig, s, min_size=10.5, wrap_first=True)
+    stamp = _data_stamp()
     fig.text(
-        0.955, FOOT_Y, f"{m._stamp()} | Data Source: Vulners CVE Archive",
+        0.955, FOOT_Y,
+        f"{stamp} | Data Source: Vulners CVE Archive" if stamp
+        else "Data Source: Vulners CVE Archive",
         ha="right", va="bottom", fontsize=F_FOOT, color=INK3, style="italic",
     )
     return fig
