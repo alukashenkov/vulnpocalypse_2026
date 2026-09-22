@@ -724,6 +724,10 @@ KERNEL_FIXES_WINDOW_START = "2022-01-01"   # the archive's daily counts begin he
 # carry no kernel CVEs and are excluded from the CVE plateau.
 KERNEL_CNA = "Linux"
 KERNEL_CNA_START = "2024-02-01"
+# The slide's shared calendar axis. The plateau above is still measured from
+# KERNEL_FIXES_WINDOW_START (5.17 onwards) and quoted in the label; only the
+# bars start here, a month before the kernel CNA's first assignment.
+KERNEL_CALENDAR_START = "2024-01-01"
 
 
 def daily_publication_series(daily_counts, start_date, end_date):

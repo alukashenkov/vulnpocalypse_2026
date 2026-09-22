@@ -1780,149 +1780,198 @@ def slide_exploitation_share(stats, anchor_date, anchor_month_complete=False,
 # ── 13. Kernel bug-fix discovery vs CVE publishing ──────────────────────────
 
 def slide_kernel_fixes(daily_counts_kernel, anchor_date, output_filename=SLIDE_FILES["kernel_fixes"]):
-    """Two bar panels on one release timeline: Fixes:-tagged kernel commits per
-    release (hand-transcribed from LWN, see ``monthly.LWN_FIXES_SERIES``) above
-    the CVEs the kernel's own CNA published during that release's development
-    cycle (the day after the previous release through release day)."""
-    window_start = m.KERNEL_FIXES_WINDOW_START
-    dates, counts = m.daily_publication_series(daily_counts_kernel, window_start, anchor_date)
+    """Two bar panels on one shared calendar axis, Jan 2024 to the anchor.
+
+    Top: Fixes:-tagged kernel commits per mainline release (hand-transcribed
+    from LWN, see ``monthly.LWN_FIXES_SERIES``), each release drawn as a bar
+    spanning its development window — width is duration, and those commits did
+    land across that window. Bottom: the CVEs the kernel's own CNA published,
+    per calendar month.
+
+    The two are deliberately *not* binned the same way. Kernel CVEs come from
+    stable-tree backports and are published continuously in batches of
+    hundreds; binning that stream into release-shaped buckets manufactured
+    swings (7.0 read 431 and 7.1 1,387 only because one ~1,200-CVE batch fell
+    on one side of a release day) and needed an invented "open cycle" bucket
+    for the tail. Calendar months have none of that.
+    """
+    anchor_day = date.fromisoformat(anchor_date[:10])
+    axis_start = date.fromisoformat(m.KERNEL_CALENDAR_START)
+    dates, counts = m.daily_publication_series(daily_counts_kernel, m.KERNEL_CALENDAR_START, anchor_date)
     if len(dates) < 60:
         return
     per_day = {d.date(): c for d, c in zip(dates, counts)}
-    data_start = dates[0].date()
-    cna_start = date.fromisoformat(m.KERNEL_CNA_START)
 
+    # ── the bottom panel: one bar per calendar month, the last one partial ──
+    months = []
+    cur = axis_start
+    while cur <= anchor_day:
+        nxt = date(cur.year + (cur.month == 12), cur.month % 12 + 1, 1)
+        end = min(nxt - timedelta(days=1), anchor_day)
+        months.append({
+            "start": cur, "end": end, "days": (end - cur).days + 1,
+            "full_days": (nxt - cur).days,
+            "cves": sum(per_day.get(cur + timedelta(days=k), 0) for k in range((end - cur).days + 1)),
+            "partial": nxt > anchor_day,
+        })
+        cur = nxt
+    complete = [mo for mo in months if not mo["partial"]]
+    partial = next((mo for mo in months if mo["partial"]), None)
+    if len(complete) < 12:
+        return
+    # Baseline: the last full calendar year the CNA was active for all of.
+    cna_start = date.fromisoformat(m.KERNEL_CNA_START)
+    base_year = anchor_day.year - 1
+    base_months = [mo for mo in complete if mo["start"].year == base_year]
+    if base_year <= cna_start.year or len(base_months) < 12:
+        base_months = [mo for mo in complete if mo["start"] >= date(cna_start.year, cna_start.month, 1)]
+    base_avg = sum(mo["cves"] for mo in base_months) / len(base_months)
+    base_label = str(base_year) if len(base_months) == 12 else "since the CNA began"
+    peak = max(complete, key=lambda mo: mo["cves"])
+    recent = complete[-3:]
+    recent_avg = sum(mo["cves"] for mo in recent) / len(recent)
+
+    # ── the top panel: one bar per release, spanning its development window ──
     releases = list(zip(m.LWN_FIXES_RELEASES, m.LWN_FIXES_SERIES[m.KERNEL_FIXES_SERIES]))
     rel = []
     for i in range(1, len(releases)):
         v, fixes = releases[i]
-        prev_v = releases[i - 1][0]
-        start = date.fromisoformat(m.LWN_FIXES_RELEASE_DATES[prev_v]) + timedelta(days=1)
+        start = date.fromisoformat(m.LWN_FIXES_RELEASE_DATES[releases[i - 1][0]]) + timedelta(days=1)
         end = date.fromisoformat(m.LWN_FIXES_RELEASE_DATES[v])
-        if start < data_start or end > date.fromisoformat(anchor_date[:10]):
-            continue     # only cycles the archive's daily counts cover in full
-        days = (end - start).days + 1
-        cves = sum(per_day.get(start + timedelta(days=k), 0) for k in range(days))
-        rel.append({"v": v, "fixes": fixes, "start": start, "end": end, "days": days, "cves": cves})
-    if len(rel) < 3:
+        if end > anchor_day:
+            continue
+        rel.append({"v": v, "fixes": fixes, "start": start, "end": end, "days": (end - start).days + 1})
+    if len(rel) < 6:
         return
+    drawn = [r for r in rel if r["end"] >= axis_start]
     last = rel[-1]
-    # The cycle after the newest release is still open, so its CVEs belong to no
-    # bar: without this the CVEs published since release day are on every other
-    # chart and missing from this one. Drawn outlined and labelled with the days
-    # it has run, since a part-cycle count is not comparable to a full one.
-    anchor_day = date.fromisoformat(anchor_date[:10])
-    open_start = last["end"] + timedelta(days=1)
-    open_days = (anchor_day - open_start).days + 1
-    open_cycle = None
-    if open_days > 0:
-        open_cycle = {
-            "start": open_start, "end": anchor_day, "days": open_days,
-            "cves": sum(per_day.get(open_start + timedelta(days=k), 0) for k in range(open_days)),
-        }
-    plateau = [r["fixes"] for r in rel[:-3]]
+    # The plateau is measured over the same releases it always was — from
+    # KERNEL_FIXES_WINDOW_START to the last release before the break-out — even
+    # though this axis starts later. Its bars are off-chart, so the reference
+    # line carries its full basis instead of being read off the picture.
+    full = [r for r in rel if r["start"] >= date.fromisoformat(m.KERNEL_FIXES_WINDOW_START)]
+    plateau_rel = full[:-3]
+    plateau = [r["fixes"] for r in plateau_rel]
     plateau_avg = sum(plateau) / len(plateau)
-    # The CVE plateau only over cycles the kernel CNA was active for.
-    cna_rel = [r for r in rel[:-3] if r["start"] >= cna_start]
-    if not cna_rel:
-        return
-    cve_base = [r["cves"] for r in cna_rel]
-    cve_base_avg = sum(cve_base) / len(cve_base)
-    breakout = rel[-3:]                     # the releases that left the plateau
+    breakout = full[-3:]
+    plateau_round = int(round(plateau_avg, -2))   # a plateau is a round number: "near 2,000", not "near 2,039"
 
     # A Fixes: tag names the commit that introduced the bug: each one is a bug
-    # that had already shipped. That is the sentence the panel leads with.
-    plateau_round = int(round(plateau_avg, -2))          # a plateau is a round number: "near 2,000", not "near 2,039"
+    # that had already shipped. That is the sentence the slide leads with, and
+    # the reason it exists; the bottom panel corroborates, it does not carry it.
     fig = _slide(
         f"Kernel {last['v']}: {last['fixes']:,} fixes to bugs already shipped — after {len(plateau)} releases near {plateau_round:,}",
         f"A Fixes: tag names the commit that introduced the bug, so every one is a bug that was already in the tree and running  ·  "
-        f"plateau {plateau_avg:,.0f} a release over {len(plateau)} releases ({rel[0]['v']}–{rel[-4]['v']}), then "
+        f"plateau {plateau_avg:,.0f} a release over {len(plateau)} releases ({plateau_rel[0]['v']}–{plateau_rel[-1]['v']}), then "
         + " / ".join(f"{r['fixes']:,}" for r in breakout)
-        + "  ·  bottom: CVEs the kernel CNA published in each release's cycle",
+        + "  ·  bottom: kernel CNA CVEs per calendar month, same axis",
     )
-    x0 = datetime.fromisoformat(window_start)
-    x1 = datetime.combine(open_cycle["end"] if open_cycle else last["end"], datetime.min.time()) + timedelta(days=45)
+
+    x0 = datetime(axis_start.year, axis_start.month, 1)
+    x1 = datetime.combine(anchor_day, datetime.min.time()) + timedelta(days=20)
     ax_top = fig.add_axes([0.085, 0.50, 0.685, CONTENT_TOP - 0.50])
     ax_bot = fig.add_axes([0.085, AXES_BOTTOM, 0.685, 0.50 - 0.045 - AXES_BOTTOM])
     for ax in (ax_top, ax_bot):
         _style_axes(ax)
         ax.grid(False, axis="x")
         ax.set_xlim(x0, x1)
-        ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=(1, 7)))
+        ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=(1, 4, 7, 10)))
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
         ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{int(v):,}"))
     ax_top.tick_params(axis="x", labelbottom=False, length=0)
     ax_bot.tick_params(axis="x", labelsize=F_TICK - 1)
 
-    xs = [datetime.combine(r["end"], datetime.min.time()) for r in rel]
-    colors = [m.C_RED if r is last else m.C_BLUE for r in rel]
-
-    def panel(ax, key, avg, ylabel, label_main, label_sub, plateau_note, open_bar=None):
-        ys = [r[key] for r in rel]
-        ax.bar(xs, ys, width=26, color=colors, alpha=0.95, edgecolor=BG, linewidth=0.6, zorder=3)
-        ax.axhline(avg, color=INK3, linestyle=(0, (6, 4)), linewidth=1.1, alpha=0.8, zorder=2)
-        y_max = max(ys + ([open_bar[key]] if open_bar else [])) * 1.28
-        ax.set_ylim(0, y_max)
-        ax.text(x0 + timedelta(days=12), y_max * 0.93, plateau_note, ha="left", va="top",
-                fontsize=F_SMALL, color=INK3, style="italic")
-        for i, (r, xx) in enumerate(zip(rel, xs)):
-            if i >= len(rel) - 3:
-                ax.annotate(f"{r[key]:,}", xy=(xx, r[key]), xytext=(0, 3), textcoords="offset points",
+    # ── top panel ───────────────────────────────────────────────────────────
+    y_top = max(r["fixes"] for r in drawn) * 1.30
+    ax_top.set_ylim(0, y_top)
+    for r in drawn:
+        left = max(r["start"], axis_start)
+        width = (r["end"] - left).days + 1
+        ax_top.bar([datetime.combine(left, datetime.min.time())], [r["fixes"]], width=width - 2.0,
+                   align="edge", color=(m.C_RED if r is last else m.C_BLUE), alpha=0.95,
+                   edgecolor=BG, linewidth=0.6, zorder=3)
+        mid = datetime.combine(left + timedelta(days=width // 2), datetime.min.time())
+        if r in breakout:
+            ax_top.annotate(f"{r['fixes']:,}", xy=(mid, r["fixes"]), xytext=(0, 3), textcoords="offset points",
                             ha="center", va="bottom", fontsize=F_SMALL, fontweight="bold", color=INK, zorder=5)
-            t = ax.annotate(r["v"], xy=(xx, 0), xytext=(0, 3), textcoords="offset points", ha="center", va="bottom",
-                            fontsize=7.5, color=INK, fontweight="bold", zorder=5, rotation=90)
+        if width >= 30:   # the first release's window is clipped to a sliver by the axis start
+            t = ax_top.annotate(r["v"], xy=(mid, 0), xytext=(0, 3), textcoords="offset points", ha="center",
+                                va="bottom", fontsize=7.5, color=INK, fontweight="bold", zorder=5)
             _stroke(t, 1.8)
-        labels = [{"y": last[key], "color": m.C_RED, "main": label_main, "sub": label_sub}]
-        if open_bar:
-            # Narrower than a release bar and outlined, so a part-cycle count is
-            # not read as one more full cycle. Its value is on the end label only.
-            xo = datetime.combine(open_bar["end"], datetime.min.time())
-            ax.bar([xo], [open_bar[key]], width=17, facecolor="none", edgecolor=m.C_RED,
-                   linewidth=1.3, linestyle=(0, (3, 2)), alpha=0.9, zorder=3)
-            t = ax.annotate("open", xy=(xo, 0), xytext=(0, 3), textcoords="offset points", ha="center",
-                            va="bottom", fontsize=7.5, color=INK2, fontweight="bold", zorder=5, rotation=90)
-            _stroke(t, 1.8)
-            labels.append({
-                "y": open_bar[key], "color": m.C_RED,
-                "main": f"cycle open: {open_bar[key]:,} CVEs",
-                "sub": f"{open_bar['start'].strftime('%b %-d')} – {open_bar['end'].strftime('%b %-d')}, "
-                       f"{open_bar['days']} days so far",
-            })
-        ax.set_ylabel(ylabel, fontsize=F_TICK - 1, color=INK2)
-        _end_labels(ax, labels, min_gap=0.2)
-
+    ax_top.axhline(plateau_avg, color=INK3, linestyle=(0, (6, 4)), linewidth=1.1, alpha=0.8, zorder=2)
+    ax_top.text(
+        x0 + timedelta(days=12), y_top * 0.955,
+        f"- - -  {plateau_avg:,.0f} a release across the {len(plateau)} releases from {plateau_rel[0]['v']} to "
+        f"{plateau_rel[-1]['v']} ({min(plateau):,}–{max(plateau):,})\n"
+        f"        — most of them before this axis begins\n"
+        f"bar width = the release's development window  ·  nothing after "
+        f"{last['end'].strftime('%-d %b')}: the next release is still in development",
+        ha="left", va="top", fontsize=F_SMALL, color=INK3, style="italic", linespacing=1.4,
+    )
+    ax_top.set_ylabel("Fixes: tags per release", fontsize=F_TICK - 1, color=INK2)
     # Both 7.2 figures, each with its basis: the bar is the chart's polyline, the
     # article's prose counts more broadly. Quoting one over the other is fine once
     # the slide shows both.
     prose = m.LWN_FIXES_ARTICLE_72_COMMITS if last["v"] == "7.2" else None
-    panel(
-        ax_top, "fixes", plateau_avg, "Fixes: tags per release",
-        f"{last['v']}: {last['fixes']:,} fixes",
-        (f"chart value · LWN text: {prose:,}" if prose else f"released {last['end'].strftime('%b %-d, %Y')}"),
-        f"- - -  plateau {plateau_avg:,.0f} a release ({min(plateau):,}–{max(plateau):,}), {len(plateau)} releases",
-    )
-    panel(
-        ax_bot, "cves", cve_base_avg, "kernel CNA CVEs per release cycle",
-        f"{last['v']} cycle: {last['cves']:,} CVEs", f"{last['start'].strftime('%b %-d')} – {last['end'].strftime('%b %-d')}, {last['days']} days",
-        f"- - -  plateau {cve_base_avg:,.0f} a cycle ({min(cve_base):,}–{max(cve_base):,}), {cna_rel[0]['v']}–{cna_rel[-1]['v']}",
-        open_bar=open_cycle,
-    )
-    # The bottom panel's honest reading: the CVE side has moved in one release so
-    # far; fixes lead, CVE assignment follows. Said as a prediction, not a multiple.
-    lead_names = " and ".join(r["v"] for r in breakout[:-1])
+    _end_labels(ax_top, [{
+        "y": last["fixes"], "color": m.C_RED, "main": f"{last['v']}: {last['fixes']:,} fixes",
+        "sub": (f"chart value · LWN text: {prose:,}" if prose else f"released {last['end'].strftime('%-d %b %Y')}"),
+    }], min_gap=0.2)
+
+    # ── bottom panel ────────────────────────────────────────────────────────
+    y_bot = max(mo["cves"] for mo in months) * 1.32
+    ax_bot.set_ylim(0, y_bot)
+    for mo in complete:
+        ax_bot.bar([datetime.combine(mo["start"], datetime.min.time())], [mo["cves"]],
+                   width=mo["days"] - 2.0, align="edge",
+                   color=(m.C_RED if mo is complete[-1] else m.C_BLUE), alpha=0.95,
+                   edgecolor=BG, linewidth=0.6, zorder=3)
+    if partial:
+        # The running month, drawn the way this deck draws every partial period:
+        # present, but visibly unfinished — the bar spans only the days it holds
+        # and is outlined rather than solid, and it is kept out of the figures
+        # quoted above. No invented container, just a month that has not ended.
+        ax_bot.bar([datetime.combine(partial["start"], datetime.min.time())], [partial["cves"]],
+                   width=max(partial["days"] - 1.0, 1.0), align="edge", color=m.C_RED, alpha=0.35,
+                   edgecolor=m.C_RED, linewidth=1.2, linestyle=(0, (3, 2)), zorder=3)
+        t = ax_bot.annotate(
+            f"{partial['start'].strftime('%b')} 1–{partial['end'].day}: {partial['cves']:,}\n(part month)",
+            xy=(datetime.combine(partial["start"], datetime.min.time()) + timedelta(days=partial["days"] / 2),
+                partial["cves"]),
+            xytext=(0, 5), textcoords="offset points", ha="center", va="bottom",
+            fontsize=F_SMALL - 0.5, color=INK2, style="italic", linespacing=1.3, zorder=5)
+        _stroke(t, 2.5)
+    ax_bot.axhline(base_avg, color=INK3, linestyle=(0, (6, 4)), linewidth=1.1, alpha=0.8, zorder=2)
+    ax_bot.set_ylabel("kernel CNA CVEs per month", fontsize=F_TICK - 1, color=INK2)
+    ax_bot.annotate(f"{peak['cves']:,}", xy=(datetime.combine(peak["start"], datetime.min.time())
+                                             + timedelta(days=peak["days"] / 2), peak["cves"]),
+                    xytext=(0, 3), textcoords="offset points", ha="center", va="bottom",
+                    fontsize=F_SMALL, fontweight="bold", color=INK, zorder=5)
+    _end_labels(ax_bot, [
+        {"y": peak["cves"], "color": m.C_RED, "main": f"{peak['start'].strftime('%b %Y')}: {peak['cves']:,} CVEs",
+         "sub": "the busiest month since the CNA began"},
+        {"y": base_avg, "color": INK3, "main": f"{base_avg:,.0f} a month", "sub": f"- - -  {base_label} average"},
+    ], min_gap=0.2)
+
+    # The honest reading of the two panels, now that they share an axis: both
+    # series stepped up in 2026 and the fixes step comes first, but there is one
+    # step in each — the order is visible, the interval is not measurable. No
+    # multiplier, no lag figure and no prediction is claimed from that.
+    pre = full[-4]
     ax_bot.text(
-        0.012, 0.74,
-        f"Fixes lead, CVE assignment follows: {lead_names} stayed at the plateau, {last['v']} broke out.\n"
-        f"If the lag holds, the next two cycles publish far more kernel CVEs. Check in December."
-        + (f"\nOutlined at the right: the cycle open since {open_cycle['start'].strftime('%b %-d')} — "
-           f"{open_cycle['cves']:,} CVEs in {open_cycle['days']} days, not yet a full cycle." if open_cycle else ""),
+        0.012, 0.955,
+        f"Both stepped up in {anchor_day.year}: Fixes: tags {pre['fixes'] / pre['days']:.0f} → "
+        f"{last['fixes'] / last['days']:.0f} a day from the {breakout[0]['v']} cycle "
+        f"({breakout[0]['start'].strftime('%-d %b')} on), kernel CVEs {base_avg:,.0f} → {recent_avg:,.0f} a month "
+        f"({recent[0]['start'].strftime('%b')}–{recent[-1]['start'].strftime('%b')} against the {base_label} average).\n"
+        f"One step in each series: the order is visible, the interval between them is not measurable from it.",
         transform=ax_bot.transAxes, ha="left", va="top", fontsize=F_SMALL, color=INK2, style="italic", linespacing=1.4,
     )
-    # Cycles before the kernel CNA existed have nothing to count.
-    first_cna_x = datetime.combine(cna_rel[0]["start"], datetime.min.time())
-    ax_bot.axvspan(x0, first_cna_x, color=INK3, alpha=0.08, zorder=1)
-    ax_bot.text(0.012, 0.47, f"kernel CNA began assigning CVEs in {cna_start.strftime('%B %Y')}",
-                transform=ax_bot.transAxes, ha="left", va="top", fontsize=F_SMALL, color=INK3, style="italic")
+    # Before February 2024 there was no kernel CNA, so there is nothing to count.
+    ax_bot.axvspan(x0, datetime(cna_start.year, cna_start.month, 1), color=INK3, alpha=0.08, zorder=1)
+    ax_bot.text(datetime(cna_start.year, cna_start.month, 1) - timedelta(days=4), y_bot * 0.035,
+                f"CNA began {cna_start.strftime('%b %Y')}  ", ha="right", va="bottom",
+                fontsize=F_SMALL - 1, color=INK3, style="italic", rotation=90)
 
     # The top panel's numbers are LWN's, credited the way the footer credits
     # Vulners for the bottom. The plot's form is this dashboard's own; only the
@@ -1930,7 +1979,7 @@ def slide_kernel_fixes(daily_counts_kernel, anchor_date, output_filename=SLIDE_F
     fig.text(
         0.77, 0.50 - 0.012,
         "Data Source: Fixes: tag counts per release from LWN.net, Jonathan Corbet, "
-        "\u201cDevelopment statistics for the 7.2 kernel\u201d, 2026-08-17",
+        "“Development statistics for the 7.2 kernel”, 2026-08-17",
         ha="right", va="top", fontsize=F_FOOT, color=INK3, style="italic",
     )
     _save(fig, output_filename, "kernel fixes vs publishing")
