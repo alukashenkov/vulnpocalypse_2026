@@ -619,8 +619,12 @@ figcaption { margin-bottom: 1rem; opacity: .82; line-height: 1.6; }
 section, figure { scroll-margin-top: 1.5rem; }
 a.permalink { margin-left: .35rem; text-decoration: none; opacity: .45; font-weight: 600; }
 a.permalink:hover, a.permalink:focus { opacity: 1; }
-.chart-index { margin: 1.25rem 0 0; padding-left: 1.2rem; opacity: .9; }
-.chart-index li { margin: .15rem 0; }
+/* The jump list: one line per group, the charts run inline after its heading. */
+.chart-index { margin: 1.25rem 0 0; padding: 0; list-style: none; opacity: .9; font-size: .95rem; }
+.chart-index li { margin: .2rem 0; }
+.chart-index .group { font-weight: 600; margin-right: .5rem; }
+.chart-index a { white-space: nowrap; }  /* wrap between charts, never inside a name */
+.chart-index a + a::before { content: "·"; display: inline-block; margin: 0 .5rem; opacity: .5; color: CanvasText; }
 img { max-width: 100%; height: auto; border: 1px solid rgba(128,128,128,.2); border-radius: 6px; }
 a { color: #3b82f6; }
 pre { overflow-x: auto; padding: 1rem; border: 1px solid rgba(128,128,128,.3); border-radius: 6px; background: rgba(128,128,128,.08); font-size: 12.5px; line-height: 1.45; }
@@ -679,14 +683,17 @@ def build_site(results, out_dir):
     index_sections = []
     for r in results:
         figures = []
-        jumps = []
+        jumps = []   # [(group, [link, ...])], consecutive charts of a group merged
         for c in r.charts:
             anchor = html.escape(chart_anchor(r, c))
             label = c.get("label", "")
             if label:
-                jumps.append(
-                    f'    <li><a href="#{anchor}">{html.escape(label)}</a></li>'
-                )
+                link = f'<a href="#{anchor}">{html.escape(label)}</a>'
+                group = c.get("group", "")
+                if jumps and jumps[-1][0] == group:
+                    jumps[-1][1].append(link)
+                else:
+                    jumps.append((group, [link]))
             # The permalink sits with the caption when there is one, and on its
             # own line above the image when there is not.
             permalink = (
@@ -712,7 +719,15 @@ def build_site(results, out_dir):
             f'<section id="{html.escape(r.slug)}">\n'
             f'  <p class="intro">{html.escape(r.blurb)}</p>\n'
             + (
-                f'  <ul class="chart-index">\n' + "\n".join(jumps) + "\n  </ul>\n"
+                f'  <ul class="chart-index">\n'
+                + "\n".join(
+                    "    <li>"
+                    + (f'<span class="group">{html.escape(g)}</span>' if g else "")
+                    + "".join(links)
+                    + "</li>"
+                    for g, links in jumps
+                )
+                + "\n  </ul>\n"
                 if jumps
                 else ""
             )

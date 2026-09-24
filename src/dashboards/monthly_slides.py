@@ -1709,55 +1709,6 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
 
 # ── 12. Exploitation signals vs publication volume ──────────────────────────
 
-def _months_between(first, last):
-    """Month-start dates from ``first`` ("YYYY-MM") to ``last`` inclusive."""
-    cur = datetime.strptime(first, "%Y-%m").date()
-    end = datetime.strptime(last, "%Y-%m").date()
-    out = []
-    while cur <= end:
-        out.append(cur)
-        cur = (cur + timedelta(days=32)).replace(day=1)
-    return out
-
-
-def _exploitation_series(stats, anchor_date, anchor_month_complete):
-    """Complete months from ``EXPLOIT_START_MONTH``, their publication counts,
-    and CISA KEV additions; ``None`` when the catalog is unavailable."""
-    anchor = date.fromisoformat(anchor_date[:10])
-    last = date(anchor.year, anchor.month, 1)
-    if not anchor_month_complete:
-        last = (last - timedelta(days=1)).replace(day=1)
-    months = _months_between(m.EXPLOIT_START_MONTH, last.strftime("%Y-%m"))
-    if len(months) < 3:
-        return None
-    keys = [mo.strftime("%Y-%m") for mo in months]
-    pubs = [sum(stats.get(k[5:7], {}).get(k[:4], {}).values()) for k in keys]
-    kev_all, kev_released = m.kev_additions_by_month()
-    if not kev_all:
-        print("CISA KEV catalog unavailable; exploitation slides skipped.")
-        return None
-    # The running anchor month, when there is one: its count so far, kept out
-    # of the complete-month series (titles, ratios, corridor) and drawn only as
-    # a dashed tail on the volume slide.
-    partial = None
-    if not anchor_month_complete:
-        pm = date(anchor.year, anchor.month, 1)
-        pk = pm.strftime("%Y-%m")
-        partial = {
-            "month": pm, "key": pk, "through": anchor,
-            "pub": sum(stats.get(pk[5:7], {}).get(pk[:4], {}).values()),
-            "kev": kev_all.get(pk, 0),
-            "x": datetime(pm.year, pm.month, 15),
-            "lbl": f"{pm.strftime('%b')} 1\u2013{anchor.day} {anchor.year}",
-        }
-    return {
-        "months": months, "keys": keys, "pubs": pubs, "kev": [kev_all.get(k, 0) for k in keys],
-        "kev_released": kev_released, "last": last, "partial": partial,
-        "x": [datetime(mo.year, mo.month, 15) for mo in months],
-        "first_lbl": months[0].strftime("%b %Y"), "last_lbl": months[-1].strftime("%b %Y"),
-    }
-
-
 def _exploitation_xaxis(ax, d, with_partial=False):
     if with_partial and d["partial"]:
         pm = d["partial"]["month"]
@@ -1778,7 +1729,7 @@ def slide_exploitation_vs_volume(stats, anchor_date, anchor_month_complete=False
     right-hand raw axis with their whole range shaded as a corridor. The right
     axis is scaled so both series meet at the first month — the two lines start
     together, and then one climbs while the band just sits there."""
-    d = _exploitation_series(stats, anchor_date, anchor_month_complete)
+    d = m._prep_exploitation(stats, anchor_date, anchor_month_complete)
     if d is None:
         return
     x, pubs, kev = d["x"], d["pubs"], d["kev"]
@@ -1787,8 +1738,12 @@ def slide_exploitation_vs_volume(stats, anchor_date, anchor_month_complete=False
     ratio_k = kev[-1] / kev[0] if kev[0] else float("nan")
 
     part = d["partial"]
+    title_clause, band_lbl = m._exploitation_corridor_text(d)
     fig = _slide(
-        f"CVE publications ×{ratio_p:.1f}, CISA KEV additions ×{ratio_k:.1f} — and never outside {k_lo}–{k_hi} a month",
+        # "CISA" goes when the running month has broken the corridor: the longer
+        # clause does not fit the title band otherwise (the axis still names it).
+        f"CVE publications ×{ratio_p:.1f}, {'KEV' if part and part['kev'] > k_hi else 'CISA KEV'} "
+        f"additions ×{ratio_k:.1f} — {title_clause}",
         f"{d['first_lbl']} → {d['last_lbl']}  ·  publications {pubs[0]:,} → {pubs[-1]:,} a month (left axis)  ·  "
         f"KEV additions {kev[0]} → {kev[-1]} a month, average {sum(kev) / len(kev):.0f} (right axis, scaled to meet "
         f"publications in {d['first_lbl']})"
@@ -1812,7 +1767,7 @@ def slide_exploitation_vs_volume(stats, anchor_date, anchor_month_complete=False
     ax2.axhspan(k_lo, k_hi, color=m.C_YELLOW, alpha=0.12, zorder=1)
     for y in (k_lo, k_hi):
         ax2.axhline(y, color=m.C_YELLOW, linestyle=(0, (6, 4)), linewidth=1.0, alpha=0.6, zorder=1.5)
-    t = ax2.text(x[-1], k_lo + 0.04 * (k_hi - k_lo), f"every month since {d['first_lbl']}: {k_lo}–{k_hi} KEV additions",
+    t = ax2.text(x[-1], k_lo + 0.04 * (k_hi - k_lo), band_lbl,
                  ha="right", va="bottom", fontsize=F_SMALL, color=m.C_YELLOW, style="italic", zorder=5)
     _stroke(t, 2.5)
 
@@ -1854,7 +1809,7 @@ def slide_exploitation_share(stats, anchor_date, anchor_month_complete=False,
                              output_filename=SLIDE_FILES["exploitation_share"]):
     """The one-number version: CISA KEV additions as a share of the month's CVE
     publications. No indexing, no second axis."""
-    d = _exploitation_series(stats, anchor_date, anchor_month_complete)
+    d = m._prep_exploitation(stats, anchor_date, anchor_month_complete)
     if d is None:
         return
     x, pubs, kev = d["x"], d["pubs"], d["kev"]

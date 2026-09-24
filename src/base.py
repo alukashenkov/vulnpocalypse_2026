@@ -19,11 +19,14 @@ class DashboardResult:
         blurb: the dashboard's intro prose, shown as a lead paragraph on the page.
         charts: chart entries in display order. Each is a dict with ``file`` (a
             path inside ``out_dir``, referenced by basename from the HTML) and
-            three optional keys: ``caption`` (prose shown above the image),
+            four optional keys: ``caption`` (prose shown above the image),
             ``anchor`` (short stable id for the chart's own link — the page turns
             it into ``#<slug>-<anchor>``; derived from the filename if omitted)
-            and ``label`` (short chart name used in the section's jump list and
-            the image alt text; the jump list is skipped for charts without one).
+            ``label`` (short chart name used in the section's jump list and
+            the image alt text; the jump list is skipped for charts without one)
+            and ``group`` (the jump-list line the label goes on; consecutive
+            charts sharing a group share a line, and charts without one share
+            an unheaded line).
         report_text: the dashboard's aligned-table report as a plain string, shown
             verbatim in a ``<pre>`` block on the tables page. For the monthly
             dashboard this is the same content the old console report produced.

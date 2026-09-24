@@ -106,6 +106,7 @@ CHART_FILES = [
     "cve_monthly_stats_comparison_status_yearly.png",
     "cve_monthly_stats_comparison_status_weekly.png",
     "cve_monthly_stats_comparison_status_by_cna.png",
+    "cve_monthly_stats_comparison_exploitation_vs_volume.png",
     "cve_monthly_stats_comparison_candidate_track.png",
 ]
 
@@ -122,7 +123,24 @@ CHART_LINKS = {
     "cve_monthly_stats_comparison_status_yearly.png": ("nvd-status-yearly", "NVD status by year"),
     "cve_monthly_stats_comparison_status_weekly.png": ("nvd-status-weekly", "NVD status by week"),
     "cve_monthly_stats_comparison_status_by_cna.png": ("nvd-status-cna", "NVD status by CNA"),
+    "cve_monthly_stats_comparison_exploitation_vs_volume.png": ("exploitation", "Exploitation vs volume"),
     "cve_monthly_stats_comparison_candidate_track.png": ("reserved", "Reserved but unpublished"),
+}
+
+# The jump list at the top of the page is one line per group, not one line per
+# chart; the names here are those lines' headings.
+CHART_GROUPS = {
+    "cve_monthly_stats_comparison_yearly_cumulative.png": "Volume",
+    "cve_monthly_stats_comparison_ytd_growth.png": "Volume",
+    "cve_monthly_stats_comparison_sankey_monthly.png": "Volume",
+    "cve_monthly_stats_comparison_incomplete_month.png": "Volume",
+    "cve_monthly_stats_comparison_active_cnas.png": "Volume",
+    "cve_monthly_stats_comparison_projection.png": "Volume",
+    "cve_monthly_stats_comparison_status_yearly.png": "NVD status",
+    "cve_monthly_stats_comparison_status_weekly.png": "NVD status",
+    "cve_monthly_stats_comparison_status_by_cna.png": "NVD status",
+    "cve_monthly_stats_comparison_exploitation_vs_volume.png": "Beyond the count",
+    "cve_monthly_stats_comparison_candidate_track.png": "Beyond the count",
 }
 
 MONTHLY_BLURB = (
@@ -196,6 +214,18 @@ CHART_CAPTIONS = {
         "baseline. Both land well above where the prior year finished, which "
         "already reads like the good old days. The asterisks mean projection. The "
         "slope means call the cavalry."
+    ),
+    "cve_monthly_stats_comparison_exploitation_vs_volume.png": (
+        "The pile outgrows the people reading it. Does the part attackers "
+        "actually use grow with it too? The red line is every CVE published in a month, on the left "
+        "axis. The yellow line is how many CVEs CISA added to its Known "
+        "Exploited Vulnerabilities catalog that month, on the right. The two "
+        "axes are scaled so both lines start at the same height, which makes "
+        "the picture honest about multiples: if exploitation kept pace with "
+        "publication, the yellow line would climb alongside the red one. The "
+        "shaded band is the whole range KEV additions have ever covered on "
+        "this chart, lowest month to highest, and the title says whether the "
+        "month still running (the dashed tail) has already stepped outside it."
     ),
     "cve_monthly_stats_comparison_status_yearly.png": (
         "Counting is one thing; looking is another. Every CVE published carries an "
@@ -658,6 +688,57 @@ def kev_additions_by_month(data_dir=None):
         if len(added) >= 7:
             counts[added[:7]] += 1
     return dict(counts), (data.get("dateReleased") or "")[:10] or None
+
+
+def _months_between(first, last):
+    """Month-start dates from ``first`` ("YYYY-MM") to ``last`` inclusive."""
+    cur = datetime.strptime(first, "%Y-%m").date()
+    end = datetime.strptime(last, "%Y-%m").date()
+    out = []
+    while cur <= end:
+        out.append(cur)
+        cur = (cur + timedelta(days=32)).replace(day=1)
+    return out
+
+
+def _prep_exploitation(stats, anchor_date, anchor_month_complete=False):
+    """Complete months from ``EXPLOIT_START_MONTH``, their publication counts,
+    and CISA KEV additions; ``None`` when the catalog is unavailable. Shared by
+    ``plot_exploitation_vs_volume`` and both exploitation slides."""
+    anchor = date.fromisoformat(anchor_date[:10])
+    last = date(anchor.year, anchor.month, 1)
+    if not anchor_month_complete:
+        last = (last - timedelta(days=1)).replace(day=1)
+    months = _months_between(EXPLOIT_START_MONTH, last.strftime("%Y-%m"))
+    if len(months) < 3:
+        return None
+    keys = [mo.strftime("%Y-%m") for mo in months]
+    pubs = [sum(stats.get(k[5:7], {}).get(k[:4], {}).values()) for k in keys]
+    kev_all, kev_released = kev_additions_by_month()
+    if not kev_all:
+        print("CISA KEV catalog unavailable; exploitation charts skipped.")
+        return None
+    # The running anchor month, when there is one: its count so far, kept out
+    # of the complete-month series (titles, ratios, corridor) and drawn only as
+    # a dashed tail on the volume slide.
+    partial = None
+    if not anchor_month_complete:
+        pm = date(anchor.year, anchor.month, 1)
+        pk = pm.strftime("%Y-%m")
+        partial = {
+            "month": pm, "key": pk, "through": anchor,
+            "pub": sum(stats.get(pk[5:7], {}).get(pk[:4], {}).values()),
+            "kev": kev_all.get(pk, 0),
+            "x": datetime(pm.year, pm.month, 15),
+            "lbl": f"{pm.strftime('%b')} 1\u2013{anchor.day} {anchor.year}",
+        }
+    return {
+        "months": months, "keys": keys, "pubs": pubs, "kev": [kev_all.get(k, 0) for k in keys],
+        "kev_released": kev_released, "last": last, "partial": partial,
+        "x": [datetime(mo.year, mo.month, 15) for mo in months],
+        "first_lbl": months[0].strftime("%b %Y"), "last_lbl": months[-1].strftime("%b %Y"),
+    }
+
 
 
 # ── The CNA roster: how many CNAs exist at all ───────────────────────────────
@@ -5665,6 +5746,136 @@ def plot_active_cnas(stats, anchor_date, anchor_month_complete=False,
     saved_files_log.append(f"Saved active-CNA chart to {os.path.abspath(output_filename)}")
 
 
+def _exploitation_corridor_text(d):
+    """``(title clause, band label)`` for the KEV corridor. The corridor is the
+    complete months' range; once the running month has already left it, "never
+    outside" is no longer true, so both texts say where the break is instead."""
+    kev, part = d["kev"], d["partial"]
+    k_lo, k_hi = min(kev), max(kev)
+    if part and part["kev"] > k_hi:
+        return (
+            f"{k_lo}–{k_hi} a month until {part['month'].strftime('%b %Y')}: "
+            f"{part['kev']} in {part['through'].day} days",
+            f"{d['first_lbl']} – {d['last_lbl']}: {k_lo}–{k_hi} KEV additions a month",
+        )
+    return (
+        f"never outside {k_lo}–{k_hi} a month",
+        f"every month since {d['first_lbl']}: {k_lo}–{k_hi} KEV additions",
+    )
+
+
+def plot_exploitation_vs_volume(stats, anchor_date, anchor_month_complete=False,
+                                output_filename="cve_monthly_stats_comparison_exploitation_vs_volume.png"):
+    """The web version of the exploitation-vs-volume slide: CVE publications per
+    month on the left axis, CISA KEV additions on the right with their whole
+    min–max range shaded as a corridor. The right axis is scaled so the two
+    series meet in the first month; a running anchor month is a dashed tail kept
+    out of every quoted figure. Nothing drawn when the KEV catalog is missing."""
+    d = _prep_exploitation(stats, anchor_date, anchor_month_complete)
+    if d is None:
+        return
+    x, pubs, kev = d["x"], d["pubs"], d["kev"]
+    k_lo, k_hi = min(kev), max(kev)
+    k_avg = sum(kev) / len(kev)
+    ratio_p = pubs[-1] / pubs[0] if pubs[0] else float("nan")
+    ratio_k = kev[-1] / kev[0] if kev[0] else float("nan")
+    part = d["partial"]
+    title_clause, band_lbl = _exploitation_corridor_text(d)
+
+    plt.style.use("dark_background")
+    fig, ax = plt.subplots(figsize=(16, 9), facecolor="#1E1E1E")
+    ax.set_facecolor("#1E1E1E")
+    ax2 = ax.twinx()
+    ax2.set_facecolor("none")
+
+    p_top = max(pubs + ([part["pub"]] if part else [])) * 1.12
+    ax.set_ylim(0, p_top)
+    # Same height = same multiple of the first month, on either axis.
+    ax2.set_ylim(0, p_top * kev[0] / pubs[0] if pubs[0] and kev[0] else max(kev) * 1.12)
+
+    ax2.axhspan(k_lo, k_hi, color=C_YELLOW, alpha=0.12, zorder=1)
+    for y in (k_lo, k_hi):
+        ax2.axhline(y, color=C_YELLOW, linestyle=(0, (6, 4)), linewidth=1.2, alpha=0.6, zorder=1.5)
+    t = ax2.text(
+        x[-1], k_lo + 0.04 * (k_hi - k_lo),
+        band_lbl,
+        ha="right", va="bottom", fontsize=14, fontweight="bold", color=C_YELLOW, style="italic", zorder=5,
+    )
+    t.set_path_effects([path_effects.withStroke(linewidth=3, foreground="#1E1E1E")])
+
+    ax.plot(x, pubs, color=C_RED, linewidth=3.4, marker="o", markersize=6, zorder=4,
+            label=f"CVE publications per month (left axis): {pubs[0]:,} → {pubs[-1]:,}")
+    ax2.plot(x, kev, color=C_YELLOW, linewidth=2.6, marker="o", markersize=6, zorder=4,
+             label=f"CISA KEV additions per month (right axis): {kev[0]} → {kev[-1]}, average {k_avg:.0f}")
+
+    if part:
+        dash = (0, (4, 3))
+        ax.plot([x[-1], part["x"]], [pubs[-1], part["pub"]], color=C_RED, linewidth=3.4,
+                linestyle=dash, marker="o", markersize=8, markevery=[1], markerfacecolor="#1E1E1E",
+                markeredgewidth=2, zorder=4)
+        ax2.plot([x[-1], part["x"]], [kev[-1], part["kev"]], color=C_YELLOW, linewidth=2.6,
+                 linestyle=dash, marker="o", markersize=8, markevery=[1], markerfacecolor="#1E1E1E",
+                 markeredgewidth=2, zorder=4)
+        t = ax2.annotate(
+            f"{part['lbl']} (incomplete)\n{part['pub']:,} CVEs · {part['kev']} KEV",
+            xy=(part["x"], k_lo), xytext=(4, -8), textcoords="offset points",
+            ha="right", va="top", fontsize=13, color="#CCCCCC", style="italic", linespacing=1.3, zorder=5,
+        )
+        t.set_path_effects([path_effects.withStroke(linewidth=3, foreground="#1E1E1E")])
+        pm = part["month"]
+        x_end = (datetime(pm.year, pm.month, 1) + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    else:
+        x_end = datetime(d["last"].year, d["last"].month, 1) + timedelta(days=31)
+    ax.set_xlim(datetime(d["months"][0].year, d["months"][0].month, 1), x_end)
+    ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=(1, 4, 7, 10)))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+
+    ax.tick_params(colors="#CCCCCC", labelsize=14, pad=8)
+    ax2.tick_params(axis="y", colors=C_YELLOW, labelsize=14, pad=8)
+    ax.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda val, pos: f"{int(val):,}"))
+    for label in ax.get_xticklabels() + ax.get_yticklabels() + ax2.get_yticklabels():
+        label.set_fontweight("bold")
+    ax.set_ylabel("CVE publications per month", fontsize=17, fontweight="bold", color="#FFFFFF", labelpad=12)
+    ax2.set_ylabel("CISA KEV additions per month", fontsize=17, fontweight="bold", color=C_YELLOW, labelpad=12)
+
+    ax.set_title(
+        f"CVE Publications vs CISA KEV Additions ({d['first_lbl']} – {d['last_lbl']})\n"
+        f"Publications ×{ratio_p:.1f}  ·  KEV additions ×{ratio_k:.1f}, {title_clause}",
+        fontsize=21, fontweight="bold", color="#FFFFFF", pad=20,
+    )
+    ax.grid(True, axis="y", color="#444444", linestyle="--", alpha=0.6, linewidth=0.9)
+    ax.set_axisbelow(True)
+    for a in (ax, ax2):
+        for spine in ["top", "left", "right", "bottom"]:
+            a.spines[spine].set_visible(False)
+    ax.spines["left"].set_visible(True)
+    ax.spines["bottom"].set_visible(True)
+    ax.spines["left"].set_color("#555555")
+    ax.spines["bottom"].set_color("#555555")
+    ax2.spines["right"].set_visible(True)
+    ax2.spines["right"].set_color(C_YELLOW)
+
+    handles = ax.get_legend_handles_labels()[0] + ax2.get_legend_handles_labels()[0]
+    labels = ax.get_legend_handles_labels()[1] + ax2.get_legend_handles_labels()[1]
+    fig.legend(
+        handles, labels, loc="lower center", bbox_to_anchor=(0.08, 0.045, 0.84, 0.05),
+        mode="expand", ncol=2, facecolor="#262626", edgecolor="#444444", fontsize=14,
+        handletextpad=0.6, borderpad=0.5, framealpha=0.95,
+    )
+    released = f" (catalog released {d['kev_released']})" if d.get("kev_released") else ""
+    plt.figtext(
+        0.5, 0.008,
+        f"{_stamp()} | Data Sources: Vulners CVE Archive, CISA KEV catalog{released}",
+        ha="center", fontsize=12, color="#747D8C", style="italic", fontweight="bold",
+    )
+    plt.tight_layout(rect=[0.01, 0.13, 0.99, 0.98])
+    fig.subplots_adjust(bottom=0.19)
+    _add_logo(fig)
+    plt.savefig(output_filename, dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.close()
+    saved_files_log.append(f"Saved exploitation-vs-volume chart to {os.path.abspath(output_filename)}")
+
+
 # Top sources (by overall reach) shown as rows in the candidate heatmap; the
 # long tail is aggregated into an "other sources" row so nothing is dropped.
 _CAND_TOP_SOURCES = 12
@@ -5815,6 +6026,7 @@ def generate(archive_path, out_dir):
             "caption": captions.get(name, ""),
             "anchor": CHART_LINKS.get(name, ("", ""))[0],
             "label": CHART_LINKS.get(name, ("", ""))[1],
+            "group": CHART_GROUPS.get(name, ""),
         }
         for name in CHART_FILES
         if os.path.exists(os.path.join(out_dir, name))
@@ -6137,10 +6349,11 @@ def _run_monthly(results, report_buf):
     slide_inputs["epss"] = dict(epss_rows=results.get("epss_rows", []), anchor_date=anchor_date)
     # Kernel bug-fix discovery against CVE publishing (local only).
     slide_inputs["kernel_fixes"] = dict(daily_counts_kernel=results.get("daily_counts_kernel", {}), anchor_date=anchor_date)
-    # Exploitation signals against publication volume (local only).
+    # Exploitation signals against publication volume (web chart and slides).
     slide_inputs["exploitation_vs_volume"] = dict(
         stats=stats, anchor_date=anchor_date, anchor_month_complete=anchor_month_complete,
     )
+    plot_exploitation_vs_volume(stats, anchor_date, anchor_month_complete=anchor_month_complete)
     # One CVE's downstream advisories, for the fan-out slide (local only).
     fanout_records = results.get("fanout_records", {})
     slide_inputs["fanout_downstream"] = dict(record=fanout_records.get(FANOUT_CVE))
