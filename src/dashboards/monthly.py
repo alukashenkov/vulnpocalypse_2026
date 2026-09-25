@@ -330,6 +330,48 @@ _CHROME_NESSUS_VER = re.compile(r"^(?:MACOSX_)?GOOGLE_CHROME_(\d+)_(\d+)_(\d+)_(
 _CHROME_POST_URL = re.compile(r"chromereleases\.googleblog\.com/(\d{4}/\d{2}/[^\s\"']+)")
 _CHROME_FIX_VER = re.compile(r"prior to (\d+\.\d+\.\d+\.\d+)")
 
+
+def _chrome_row(item, day, candidate=False):
+    """One Chrome CVE's release facts for the fan-in slides: the release posts
+    its references link to, its ``GCSA-…`` advisory ids, the Chrome versions of
+    its Nessus plugins and the fixed version its description names.
+
+    ``candidate`` marks a CVE that is still reserved: Google's advisory and
+    the scanner plugins list it before the CVE record is published, so a
+    release can be entirely made of such CVEs for a few days. Only the advisory
+    and the Nessus plugin identify those as Chrome — they carry no CNA, no
+    release post and a placeholder description.
+    """
+    advisories, versions = [], set()
+    ench = item.get("enchantments")
+    deps = ench.get("dependencies") if isinstance(ench, dict) else None
+    refs = deps.get("references") if isinstance(deps, dict) else None
+    for ref in refs if isinstance(refs, list) else ():
+        if not isinstance(ref, dict):
+            continue
+        if ref.get("type") == "chrome":
+            advisories.extend(str(i) for i in ref.get("idList") or [])
+        elif ref.get("type") == "nessus":
+            for plugin in ref.get("idList") or []:
+                mv = _CHROME_NESSUS_VER.match(str(plugin))
+                if mv:
+                    versions.add(".".join(mv.groups()))
+    posts = []
+    for url in item.get("references") or ():
+        mp = _CHROME_POST_URL.search(str(url))
+        if mp and mp.group(1) not in posts:
+            posts.append(mp.group(1))
+    mf = _CHROME_FIX_VER.search(str(item.get("description") or ""))
+    return {
+        "id": item.get("id"),
+        "day": day,
+        "posts": posts,
+        "advisories": advisories,
+        "versions": sorted(versions),
+        "fix_version": mf.group(1) if mf else None,
+        "candidate": candidate,
+    }
+
 # ── Fan-out: one CVE, many downstream advisories ─────────────────────────────
 # The fan-out slide takes one CVE and counts the distinct downstream records
 # that reference it — a distribution's advisory, a vendor's bulletin, an
@@ -1563,7 +1605,9 @@ def count_monthly_cves(file_path, cut_off_date=None):
     status_cna = collections.defaultdict(collections.Counter)
     # chrome_cves: one row per Chrome-CNA CVE of the anchor year — {"id", "day",
     # "posts": [release-post paths], "advisories": [GCSA ids], "versions":
-    # [Chrome versions], "fix_version": the version its description names}.
+    # [Chrome versions], "fix_version": the version its description names,
+    # "candidate": still reserved}. Reserved CVEs are kept only when they carry
+    # a Chrome advisory, release post or Chrome Nessus plugin.
     chrome_cves = []
     # fanout_records[cve_id] = the archive record's facts the fan-out slide and
     # its shortlist CSV need, for FANOUT_CVE and every FANOUT_SHORTLIST entry.
@@ -1696,6 +1740,14 @@ def count_monthly_cves(file_path, cut_off_date=None):
                                     }
                                     for t in src_types:
                                         candidate_stats[mkey]["ref_types"][t] += 1
+                        # A Chrome release whose CVEs are still reserved: the
+                        # advisory and the Nessus plugin already name them, the
+                        # CVE records do not exist yet. Kept, flagged, for the
+                        # fan-in slides, which draw them apart from published.
+                        if not is_rejected:
+                            row = _chrome_row(item, published_date[:10], candidate=True)
+                            if row["posts"] or row["advisories"] or row["versions"]:
+                                chrome_cves.append(row)
                     continue
 
                 if is_rejected:
@@ -1725,34 +1777,7 @@ def count_monthly_cves(file_path, cut_off_date=None):
 
                     if year in ["2022", "2023", "2024", "2025", "2026"]:
                         if cna_name == CHROME_CNA and year == anchor_year:
-                            advisories, versions = [], set()
-                            ench = item.get("enchantments")
-                            deps = ench.get("dependencies") if isinstance(ench, dict) else None
-                            refs = deps.get("references") if isinstance(deps, dict) else None
-                            for ref in refs if isinstance(refs, list) else ():
-                                if not isinstance(ref, dict):
-                                    continue
-                                if ref.get("type") == "chrome":
-                                    advisories.extend(str(i) for i in ref.get("idList") or [])
-                                elif ref.get("type") == "nessus":
-                                    for plugin in ref.get("idList") or []:
-                                        mv = _CHROME_NESSUS_VER.match(str(plugin))
-                                        if mv:
-                                            versions.add(".".join(mv.groups()))
-                            posts = []
-                            for url in item.get("references") or ():
-                                mp = _CHROME_POST_URL.search(str(url))
-                                if mp and mp.group(1) not in posts:
-                                    posts.append(mp.group(1))
-                            mf = _CHROME_FIX_VER.search(str(item.get("description") or ""))
-                            chrome_cves.append({
-                                "id": item.get("id"),
-                                "day": record_date_str,
-                                "posts": posts,
-                                "advisories": advisories,
-                                "versions": sorted(versions),
-                                "fix_version": mf.group(1) if mf else None,
-                            })
+                            chrome_cves.append(_chrome_row(item, record_date_str))
 
                         # Store in full monthly stats
                         stats[month][year][cna_name] += 1

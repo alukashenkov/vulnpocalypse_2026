@@ -1219,21 +1219,26 @@ def _chrome_releases(chrome_cves, anchor_date):
     a release pinned by those alone is missing from the slide — while every
     other chart already counts its CVEs — until the archive catches up. One
     post can carry two advisories (a desktop and a mobile bulletin for the same
-    build); a record with no post is pinned by its advisory instead, and one
-    with neither joins the release of its own Chrome version published within
-    ``CHROME_ATTACH_DAYS`` of it. Whatever matches none of the three is counted
-    as unattributed.
+    build); a record with no post is pinned by its advisory instead — joining a
+    release of the same Chrome version within ``CHROME_ATTACH_DAYS`` when one
+    exists — and one with neither joins the release of its own Chrome version
+    published within ``CHROME_ATTACH_DAYS`` of it. Whatever matches none of the
+    three is counted as unattributed.
+
+    Rows flagged ``candidate`` are CVEs still reserved: Google's advisory and
+    the Nessus plugin list them before the CVE records are published, so a
+    fresh release can consist of nothing else. They are grouped exactly like
+    published CVEs and counted apart from them.
 
     Returns ``(releases, unattributed)``; each release is a dict with ``key``,
-    ``version`` (or ``None``), ``major``, ``date``, ``linked`` and ``attached``
-    counts, sorted by date.
+    ``version`` (or ``None``), ``major``, ``date``, ``advisories``,
+    ``published`` and ``candidates`` counts, sorted by date.
     """
     rows = [r for r in chrome_cves if r["day"] <= anchor_date[:10]]
 
     def _new(key):
         return {"key": key, "advisories": set(), "date": None,
-                "nessus": collections.Counter(), "fixed": collections.Counter(),
-                "linked_ids": set(), "attached_ids": set()}
+                "nessus": collections.Counter(), "fixed": collections.Counter(), "ids": {}}
 
     releases, by_adv = {}, {}
 
@@ -1243,9 +1248,24 @@ def _chrome_releases(chrome_cves, anchor_date):
         rel["nessus"].update(r["versions"])
         if r.get("fix_version"):
             rel["fixed"][r["fix_version"]] += 1
-        rel["linked_ids"].add(r["id"])
+        rel["ids"][r["id"]] = bool(r.get("candidate"))
         for gid in r["advisories"]:
             by_adv[gid] = rel
+
+    def _nearest_by_version(r):
+        # Both versions a record can name are tried — the Nessus plugin's and
+        # the one its description gives — because Chrome numbers a release's
+        # platforms separately and the two differ by the last component.
+        day = date.fromisoformat(r["day"])
+        best = None
+        for v in list(r["versions"]) + ([r["fix_version"]] if r.get("fix_version") else []):
+            for rel in releases.values():
+                if rel["date"] is None or (v not in rel["nessus"] and v not in rel["fixed"]):
+                    continue
+                gap = abs((date.fromisoformat(rel["date"]) - day).days)
+                if gap <= CHROME_ATTACH_DAYS and (best is None or gap < best[0]):
+                    best = (gap, rel)
+        return best[1] if best else None
 
     for r in rows:
         posts = r.get("posts") or ()
@@ -1253,40 +1273,30 @@ def _chrome_releases(chrome_cves, anchor_date):
             _link(releases.setdefault(posts[0], _new(posts[0])), r)
 
     # No post: the advisory pins the release — the same one if another record
-    # already tied that advisory to a post, otherwise a release of its own,
-    # keyed by the Chrome version so two advisories for one build stay together.
+    # already tied that advisory to a post, or a post's release of the same
+    # Chrome version (a build whose published CVEs carry the post before their
+    # advisory while its reserved ones carry only the advisory), otherwise a
+    # release of its own, keyed by the Chrome version so two advisories for
+    # one build stay together.
     for r in rows:
         if r.get("posts") or not r["advisories"]:
             continue
-        rel = next((by_adv[gid] for gid in r["advisories"] if gid in by_adv), None)
+        rel = next((by_adv[gid] for gid in r["advisories"] if gid in by_adv), None) or _nearest_by_version(r)
         if rel is None:
             key = r["versions"][0] if r["versions"] else r["advisories"][0]
             rel = releases.setdefault(key, _new(key))
         _link(rel, r)
 
-    # Neither: attach by Chrome version to a release published around the same
-    # day. Both versions a record can name are tried — the Nessus plugin's and
-    # the one its description gives — because Chrome numbers a release's
-    # platforms separately and the two differ by the last component.
-    by_version = {}
-    for rel in releases.values():
-        for v in list(rel["nessus"]) + list(rel["fixed"]):
-            by_version.setdefault(v, []).append(rel)
+    # Neither: attach by Chrome version to a release published around the same day.
     unattributed = 0
     for r in rows:
         if r.get("posts") or r["advisories"]:
             continue
-        day = date.fromisoformat(r["day"])
-        best = None
-        for v in list(r["versions"]) + ([r["fix_version"]] if r.get("fix_version") else []):
-            for rel in by_version.get(v, ()):
-                gap = abs((date.fromisoformat(rel["date"]) - day).days)
-                if gap <= CHROME_ATTACH_DAYS and (best is None or gap < best[0]):
-                    best = (gap, rel)
-        if best is None:
+        rel = _nearest_by_version(r)
+        if rel is None:
             unattributed += 1
         else:
-            best[1]["attached_ids"].add(r["id"])
+            rel["ids"].setdefault(r["id"], bool(r.get("candidate")))
 
     out = []
     for rel in releases.values():
@@ -1294,17 +1304,37 @@ def _chrome_releases(chrome_cves, anchor_date):
         # that enrichment lands, the version the CVEs' descriptions give.
         vers = rel["nessus"] or rel["fixed"]
         version = sorted(vers, key=lambda v: (-vers[v], v))[0] if vers else None
+        candidates = sum(rel["ids"].values())
         out.append({
             "key": rel["key"],
             "version": version,
             "major": int(version.split(".")[0]) if version else None,
             "date": date.fromisoformat(rel["date"]),
             "advisories": sorted(rel["advisories"]),
-            "linked": len(rel["linked_ids"]),
-            "attached": len(rel["attached_ids"]),
+            "published": len(rel["ids"]) - candidates,
+            "candidates": candidates,
         })
     out.sort(key=lambda rel: (rel["date"], rel["version"] or ""))
     return out, unattributed
+
+
+# A release's CVEs still reserved — named by Google's advisory and the scanner
+# plugins, CVE record not yet published — sit on top of its published ones in
+# the same colour, hollow and hatched, so the two never read as one number.
+_CHROME_RESERVED_LABEL = "CVE still reserved (in the advisory, record not yet published)"
+
+
+def _chrome_reserved_patch():
+    from matplotlib.patches import Patch
+    return Patch(facecolor="none", edgecolor=INK2, hatch="////", linewidth=1.0, label=_CHROME_RESERVED_LABEL)
+
+
+def _chrome_release_bars(ax, xs, published, reserved, colors, width=0.72):
+    ax.bar(xs, published, width, color=colors, alpha=0.95, edgecolor=BG, linewidth=0.6, zorder=3)
+    for x, p, r, c in zip(xs, published, reserved, colors):
+        if r:
+            ax.bar(x, r, width, bottom=p, color=matplotlib.colors.to_rgba(c, 0.30), edgecolor=c,
+                   hatch="////", linewidth=1.2, zorder=3)
 
 
 def slide_fanin_chrome(chrome_cves, anchor_date, output_filename=SLIDE_FILES["fanin_chrome"]):
@@ -1315,7 +1345,8 @@ def slide_fanin_chrome(chrome_cves, anchor_date, output_filename=SLIDE_FILES["fa
         return
     year = anchor_date[:4]
     n = len(releases)
-    totals = [rel["linked"] + rel["attached"] for rel in releases]
+    totals = [rel["published"] + rel["candidates"] for rel in releases]
+    reserved = [rel["candidates"] for rel in releases]
     milestone_first = {}
     for rel in releases:
         if rel["major"] is not None and rel["major"] not in milestone_first:
@@ -1325,23 +1356,24 @@ def slide_fanin_chrome(chrome_cves, anchor_date, output_filename=SLIDE_FILES["fa
     # from the slide can be checked against them.
     csv_path = os.path.splitext(output_filename)[0].replace("_slide", "") + ".csv"
     with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["release_date", "version", "kind", "cves", "advisories"])
+        writer = csv.DictWriter(f, fieldnames=["release_date", "version", "kind", "cves", "published", "reserved", "advisories"])
         writer.writeheader()
         for rel, tot in zip(releases, totals):
             writer.writerow({
                 "release_date": rel["date"].isoformat(), "version": rel["version"] or "",
                 "kind": "milestone" if milestone_first.get(rel["major"]) is rel else "point update",
-                "cves": tot, "advisories": ";".join(rel["advisories"]),
+                "cves": tot, "published": rel["published"], "reserved": rel["candidates"],
+                "advisories": ";".join(rel["advisories"]),
             })
     m.saved_files_log.append(f"Saved Chrome release CSV to {os.path.abspath(csv_path)}")
     q1 = [(rel, tot) for rel, tot in zip(releases, totals) if rel["date"].month <= 3]
     q1_cves = sum(tot for _, tot in q1)
     print(f"\n[fanin_chrome] {year}: Q1 (Jan 1 – Mar 31): {len(q1)} releases, {q1_cves} CVEs; "
           + (f"largest Q1 release {max(q1, key=lambda rt: rt[1])[0]['version']} with {max(tot for _, tot in q1)} CVEs; " if q1 else "")
-          + f"year to date: {n} releases, {sum(totals):,} CVEs (unattributed {unattributed}); "
+          + f"year to date: {n} releases, {sum(totals):,} CVEs ({sum(reserved):,} still reserved, unattributed {unattributed}); "
           + (f"CVEs per release: Q1 {q1_cves / len(q1):.1f} vs YTD {sum(totals) / n:.1f}" if q1 else ""))
     print("[fanin_chrome] milestone first releases: " + ", ".join(
-        f"{mj}: {milestone_first[mj]['linked'] + milestone_first[mj]['attached']}" for mj in sorted(milestone_first)))
+        f"{mj}: {milestone_first[mj]['published'] + milestone_first[mj]['candidates']}" for mj in sorted(milestone_first)))
     grand = sum(totals)
     big_i = max(range(n), key=totals.__getitem__)
     big = releases[big_i]
@@ -1351,7 +1383,8 @@ def slide_fanin_chrome(chrome_cves, anchor_date, output_filename=SLIDE_FILES["fa
     big_ver = f"Chrome {big['version']}" if big["version"] else "an unnumbered release"
     fig = _slide(
         f"Chrome CVEs per release, {year}: every update, one user action",
-        f"{n} releases, Jan 1 – {releases[-1]['date'].strftime('%b %-d')}, {grand:,} CVEs  ·  "
+        f"{n} releases, Jan 1 – {releases[-1]['date'].strftime('%b %-d')}, {grand:,} CVEs"
+        + (f" ({sum(reserved):,} still reserved)" if any(reserved) else "") + "  ·  "
         f"biggest: {big_ver} on {big['date'].strftime('%b %-d')}, {totals[big_i]:,} CVEs  ·  "
         f"user action for every one of them: exactly one restart",
     )
@@ -1365,13 +1398,13 @@ def slide_fanin_chrome(chrome_cves, anchor_date, output_filename=SLIDE_FILES["fa
 
     xs = np.arange(n)
     colors = [m.C_RED if i in milestone_idx else m.C_BLUE for i in range(n)]
-    ax.bar(xs, totals, 0.72, color=colors, alpha=0.95, edgecolor=BG, linewidth=0.6, zorder=3)
+    _chrome_release_bars(ax, xs, [t - c for t, c in zip(totals, reserved)], reserved, colors)
 
     y_max = max(totals) * 1.30
     ax.set_ylim(0, y_max)
     ax.set_xlim(-0.7, n - 0.3)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{int(v):,}"))
-    ax.set_ylabel("CVEs published with the release", fontsize=F_TICK, color=INK2)
+    ax.set_ylabel("CVEs in the release", fontsize=F_TICK, color=INK2)
 
     # Every release pinned to its day; month names underneath, month breaks as faint rules.
     ax.set_xticks(xs)
@@ -1431,7 +1464,7 @@ def slide_fanin_chrome(chrome_cves, anchor_date, output_filename=SLIDE_FILES["fa
     handles = [
         Patch(facecolor=m.C_RED, alpha=0.95, label="first release of a milestone"),
         Patch(facecolor=m.C_BLUE, alpha=0.95, label="point update"),
-    ]
+    ] + ([_chrome_reserved_patch()] if any(reserved) else [])
     ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.06, 0.55), facecolor="#262626",
               edgecolor="#444444", fontsize=F_SMALL, framealpha=0.95)
 
@@ -1469,7 +1502,8 @@ def slide_fanin_chrome_estate(chrome_cves, anchor_date, output_filename=SLIDE_FI
         return
     with open(csv_path, newline="") as f:
         rows = [{"date": date.fromisoformat(r["release_date"]), "version": r["version"],
-                 "milestone": r["kind"] == "milestone", "cves": int(r["cves"])} for r in csv.DictReader(f)]
+                 "milestone": r["kind"] == "milestone", "cves": int(r["cves"]),
+                 "reserved": int(r.get("reserved") or 0)} for r in csv.DictReader(f)]
     if not rows:
         return
     year = anchor_date[:4]
@@ -1481,16 +1515,18 @@ def slide_fanin_chrome_estate(chrome_cves, anchor_date, output_filename=SLIDE_FI
     big = rows[big_i]
     q1 = [i for i, r in enumerate(rows) if r["date"].month <= 3]
     q1_cves = sum(rows[i]["cves"] for i in q1)
+    total_reserved = sum(r["reserved"] for r in rows)
 
     print(f"\n[fanin_chrome_estate] estate of {ESTATE_SEATS:,} seats, one finding per asset per CVE: "
-          f"{n} releases, {total_cves:,} CVEs -> {total_findings:,} findings; largest release Chrome {big['version']} "
+          f"{n} releases, {total_cves:,} CVEs ({total_reserved:,} still reserved) -> {total_findings:,} findings; largest release Chrome {big['version']} "
           f"on {big['date'].strftime('%b %-d')}: {big['cves']:,} CVEs -> {big['cves'] * ESTATE_SEATS:,} findings"
           + (f"; Jan–Mar: {len(q1)} releases, {q1_cves:,} CVEs -> {q1_cves * ESTATE_SEATS:,} findings" if q1 else ""))
 
     fig = _slide(
         "One year of Chrome updates, counted the way a console counts",
         f"A {ESTATE_SEATS:,}-seat desktop estate, one finding per asset per CVE, before any aggregation  ·  "
-        f"{n} releases in {year} to date: {total_cves:,} CVEs → {total_findings:,} findings  ·  "
+        f"{n} releases in {year} to date: {total_cves:,} CVEs → {total_findings:,} findings"
+        + (f" ({total_reserved:,} CVEs still reserved)" if total_reserved else "") + "  ·  "
         f"Chrome {big['version']} on {big['date'].strftime('%b %-d')}: {big['cves']:,} CVEs → {big['cves'] * ESTATE_SEATS:,} findings",
     )
     # Same frame as the fan-in slide; a little more room on the left for a
@@ -1503,7 +1539,8 @@ def slide_fanin_chrome_estate(chrome_cves, anchor_date, output_filename=SLIDE_FI
 
     xs = np.arange(n)
     colors = [m.C_RED if r["milestone"] else m.C_BLUE for r in rows]
-    ax.bar(xs, findings, 0.72, color=colors, alpha=0.95, edgecolor=BG, linewidth=0.6, zorder=3)
+    _chrome_release_bars(ax, xs, [(r["cves"] - r["reserved"]) * ESTATE_SEATS for r in rows],
+                         [r["reserved"] * ESTATE_SEATS for r in rows], colors)
     y_max = max(findings) * 1.30
     ax.set_ylim(0, y_max)
     ax.set_xlim(-0.7, n - 0.3)
@@ -1561,6 +1598,11 @@ def slide_fanin_chrome_estate(chrome_cves, anchor_date, output_filename=SLIDE_FI
     ax.text(0.012, 0.955, f"{year} to date: {total_cves:,} CVEs across {n} releases\n"
                           f"= {total_findings:,} findings, one per desktop per CVE",
             transform=ax.transAxes, ha="left", va="top", fontsize=F_LABEL, color=INK2, linespacing=1.4, zorder=6)
+    # A scanner flags a reserved CVE as soon as its plugin ships, so those count
+    # as findings too — drawn apart, and keyed only when there are any.
+    if total_reserved:
+        ax.legend(handles=[_chrome_reserved_patch()], loc="upper left", bbox_to_anchor=(0.004, 0.84),
+                  facecolor="#262626", edgecolor="#444444", fontsize=F_SMALL, framealpha=0.95)
     _save(fig, output_filename, "Chrome fan-in at estate scale")
 
 
