@@ -664,8 +664,10 @@ def fanout_breakdown(references):
 # CISA KEV additions by ``dateAdded`` are set against the monthly publication
 # count; the catalog is fetched the way cve_epss_comparison.py does it, once a
 # day into DATA_DIR. (The archive's ``wildExploited`` flag was tried as a second
-# series and dropped: dated by its sources' ``firstSeen`` it spikes when a source
-# is onboarded, and by publication month it says little the KEV series does not.)
+# series on the same chart and dropped: by publication month it says little the
+# KEV series does not. It has a slide of its own instead, the same picture with
+# the flag dated by its earliest source ``firstSeen`` in place of KEV; see
+# ``wild_exploited_by_month``.)
 EXPLOIT_START_MONTH = "2024-01"
 KEV_CATALOG_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 KEV_CATALOG_BASENAME = "known_exploited_vulnerabilities.json"
@@ -745,10 +747,24 @@ def _months_between(first, last):
     return out
 
 
-def _prep_exploitation(stats, anchor_date, anchor_month_complete=False):
+def wild_exploited_by_month(wild_first_seen, anchor_date):
+    """``{"YYYY-MM": CVEs}`` from the archive pass's ``wild_first_seen`` (day →
+    CVEs first flagged wildExploited that day), days after the anchor dropped.
+    Shaped like ``kev_additions_by_month``'s counts, so it can stand in for them."""
+    counts = collections.Counter()
+    for day, n in (wild_first_seen or {}).items():
+        if day <= anchor_date[:10]:
+            counts[day[:7]] += n
+    return dict(counts)
+
+
+def _prep_exploitation(stats, anchor_date, anchor_month_complete=False, exploited=None):
     """Complete months from ``EXPLOIT_START_MONTH``, their publication counts,
     and CISA KEV additions; ``None`` when the catalog is unavailable. Shared by
-    ``plot_exploitation_vs_volume`` and both exploitation slides."""
+    ``plot_exploitation_vs_volume`` and the exploitation slides. ``exploited``
+    (``{"YYYY-MM": count}``) replaces the KEV series when given — the Vulners
+    wildExploited slide passes ``wild_exploited_by_month`` — and still lands
+    under the ``"kev"`` key, so every drawing reads it the same way."""
     anchor = date.fromisoformat(anchor_date[:10])
     last = date(anchor.year, anchor.month, 1)
     if not anchor_month_complete:
@@ -758,10 +774,16 @@ def _prep_exploitation(stats, anchor_date, anchor_month_complete=False):
         return None
     keys = [mo.strftime("%Y-%m") for mo in months]
     pubs = [sum(stats.get(k[5:7], {}).get(k[:4], {}).values()) for k in keys]
-    kev_all, kev_released = kev_additions_by_month()
-    if not kev_all:
-        print("CISA KEV catalog unavailable; exploitation charts skipped.")
-        return None
+    if exploited is not None:
+        kev_all, kev_released = exploited, None
+        if not kev_all:
+            print("No wildExploited dates in the archive; exploitation chart skipped.")
+            return None
+    else:
+        kev_all, kev_released = kev_additions_by_month()
+        if not kev_all:
+            print("CISA KEV catalog unavailable; exploitation charts skipped.")
+            return None
     # The running anchor month, when there is one: its count so far, kept out
     # of the complete-month series (titles, ratios, corridor) and drawn only as
     # a dashed tail on the volume slide.
@@ -1618,6 +1640,12 @@ def count_monthly_cves(file_path, cut_off_date=None):
     # epss_rows: (CVE id, publication day, exploited-in-the-wild flag) for every
     # kept CVE of the last EPSS_ROWS_YEARS_BACK+1 years, for the EPSS slides.
     epss_rows = []
+    # wild_first_seen["YYYY-MM-DD"] = CVEs whose wildExploited flag was first
+    # raised that day: the earliest ``firstSeen`` across the record's
+    # ``wildExploitedSources``. Every non-rejected record, candidates included,
+    # for the Vulners version of the exploitation-vs-volume slide.
+    wild_first_seen = collections.Counter()
+    wild_sources = collections.Counter()
 
     if cut_off_date:
         now = datetime.strptime(cut_off_date, "%Y-%m-%d")
@@ -1674,6 +1702,19 @@ def count_monthly_cves(file_path, cut_off_date=None):
 
                 is_rejected = bool(vuln_status) and vuln_status.lower() == "rejected"
                 is_candidate = bool(reporter) and reporter.lower() == "candidate"
+
+                if not is_rejected:
+                    ench = item.get("enchantments")
+                    expl = ench.get("exploitation") if isinstance(ench, dict) else None
+                    if isinstance(expl, dict) and expl.get("wildExploited") is True:
+                        srcs = [s for s in expl.get("wildExploitedSources") or [] if isinstance(s, dict)]
+                        seen = [str(s.get("firstSeen") or "")[:10] for s in srcs]
+                        seen = [d for d in seen if len(d) == 10]
+                        if seen:
+                            wild_first_seen[min(seen)] += 1
+                        for s in srcs:
+                            if s.get("type"):
+                                wild_sources[s["type"]] += 1
 
                 if item.get("id") in fanout_wanted:
                     ench = item.get("enchantments")
@@ -1835,6 +1876,8 @@ def count_monthly_cves(file_path, cut_off_date=None):
         "chrome_cves": chrome_cves,
         "fanout_records": fanout_records,
         "epss_rows": epss_rows,
+        "wild_first_seen": wild_first_seen,
+        "wild_sources": wild_sources,
     }
 
 
@@ -5773,21 +5816,22 @@ def plot_active_cnas(stats, anchor_date, anchor_month_complete=False,
     saved_files_log.append(f"Saved active-CNA chart to {os.path.abspath(output_filename)}")
 
 
-def _exploitation_corridor_text(d):
+def _exploitation_corridor_text(d, unit="KEV additions"):
     """``(title clause, band label)`` for the KEV corridor. The corridor is the
     complete months' range; once the running month has already left it, "never
-    outside" is no longer true, so both texts say where the break is instead."""
+    outside" is no longer true, so both texts say where the break is instead.
+    ``unit`` names the series in the band label."""
     kev, part = d["kev"], d["partial"]
     k_lo, k_hi = min(kev), max(kev)
     if part and part["kev"] > k_hi:
         return (
             f"{k_lo}–{k_hi} a month until {part['month'].strftime('%b %Y')}: "
             f"{part['kev']} in {part['through'].day} days",
-            f"{d['first_lbl']} – {d['last_lbl']}: {k_lo}–{k_hi} KEV additions a month",
+            f"{d['first_lbl']} – {d['last_lbl']}: {k_lo}–{k_hi} {unit} a month",
         )
     return (
         f"never outside {k_lo}–{k_hi} a month",
-        f"every month since {d['first_lbl']}: {k_lo}–{k_hi} KEV additions",
+        f"every month since {d['first_lbl']}: {k_lo}–{k_hi} {unit}",
     )
 
 
@@ -6381,6 +6425,11 @@ def _run_monthly(results, report_buf):
         stats=stats, anchor_date=anchor_date, anchor_month_complete=anchor_month_complete,
     )
     plot_exploitation_vs_volume(stats, anchor_date, anchor_month_complete=anchor_month_complete)
+    # The same slide with Vulners' wildExploited flag in place of KEV (local only).
+    slide_inputs["exploitation_wild"] = dict(
+        stats=stats, anchor_date=anchor_date, anchor_month_complete=anchor_month_complete,
+        wild_first_seen=results.get("wild_first_seen", {}), wild_sources=results.get("wild_sources", {}),
+    )
     # One CVE's downstream advisories, for the fan-out slide (local only).
     fanout_records = results.get("fanout_records", {})
     slide_inputs["fanout_downstream"] = dict(record=fanout_records.get(FANOUT_CVE))

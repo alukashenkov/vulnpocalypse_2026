@@ -75,6 +75,7 @@ SLIDE_FILES = {
     "fanout_downstream": "cve_monthly_stats_comparison_fanout_downstream_slide.png",
     "exploitation_vs_volume": "cve_monthly_stats_comparison_exploitation_vs_volume_slide.png",
     "exploitation_share": "cve_monthly_stats_comparison_exploitation_share_slide.png",
+    "exploitation_wild": "cve_monthly_stats_comparison_exploitation_wild_vs_volume_slide.png",
     "kernel_fixes": "cve_monthly_stats_comparison_kernel_fixes_vs_publishing_slide.png",
     "epss_cohort_age": "cve_monthly_stats_comparison_epss_recency_cohort_age_slide.png",
     "epss_recall": "cve_monthly_stats_comparison_epss_recall_slide.png",
@@ -2034,6 +2035,35 @@ def _exploitation_xaxis(ax, d, with_partial=False):
     ax.tick_params(axis="x", labelsize=F_TICK - 1)
 
 
+# The words that name the exploitation series, so one drawing serves KEV and
+# Vulners' wildExploited flag alike.
+_KEV_LABELS = {
+    "title": "CISA KEV additions",          # the title, while it fits
+    "title_short": "KEV additions",         # the title, once the corridor broke
+    "sub": "KEV additions",                 # the subtitle's series figure
+    "unit": "KEV additions",                # the corridor's band label
+    "axis": "CISA KEV additions per month",
+    "end": "CISA KEV additions",            # the right-margin label
+    "note": "KEV",                          # the running month's note
+    "note_above": False,                    # that note over the corridor, not under it
+    "basis": "",                            # appended to the subtitle
+    "margin": "",                           # small print under the right-margin labels
+}
+_WILD_LABELS = {
+    "title": "Vulners wildExploited",
+    "title_short": "wildExploited",
+    "sub": "CVEs first flagged exploited",
+    "unit": "CVEs first flagged",
+    "axis": "CVEs first flagged exploited per month",
+    "end": "First flagged exploited",
+    "note": "flagged",
+    # The corridor's floor sits near the axis here, so the note under it
+    # would run into the tick labels.
+    "note_above": True,
+    "basis": "  ·  dated by earliest firstSeen",
+}
+
+
 def slide_exploitation_vs_volume(stats, anchor_date, anchor_month_complete=False,
                                  output_filename=SLIDE_FILES["exploitation_vs_volume"]):
     """CVE publications per month on the left axis; CISA KEV additions on a
@@ -2043,22 +2073,51 @@ def slide_exploitation_vs_volume(stats, anchor_date, anchor_month_complete=False
     d = m._prep_exploitation(stats, anchor_date, anchor_month_complete)
     if d is None:
         return
+    _draw_exploitation_vs_volume(d, output_filename, _KEV_LABELS, "exploitation vs volume")
+
+
+def slide_exploitation_wild(stats, anchor_date, anchor_month_complete=False, wild_first_seen=None,
+                            wild_sources=None, output_filename=SLIDE_FILES["exploitation_wild"]):
+    """The exploitation-vs-volume slide with every CVE Vulners flags
+    ``wildExploited`` in place of CISA KEV. A CVE is dated by the earliest
+    ``firstSeen`` across its ``wildExploitedSources`` — the day the first source
+    reported it exploited, the flag's analogue of KEV's ``dateAdded``."""
+    exploited = m.wild_exploited_by_month(wild_first_seen, anchor_date)
+    d = m._prep_exploitation(stats, anchor_date, anchor_month_complete, exploited=exploited)
+    if d is None:
+        return
+    names = {"vulncheck_kev": "VulnCheck KEV", "cisa_kev": "CISA KEV", "attackerkb": "AttackerKB",
+             "circl": "CIRCL", "cisa": "CISA advisories", "chrome": "Chrome releases"}
+    top = [names.get(t, t) for t, _ in collections.Counter(wild_sources or {}).most_common()]
+    labels = dict(_WILD_LABELS, margin=(
+        "Each CVE flagged wildExploited,\ndated by the earliest firstSeen\namong its sources:\n"
+        + textwrap.fill(", ".join(top), 30) if top else ""
+    ))
+    _draw_exploitation_vs_volume(d, output_filename, labels, "exploitation (wildExploited) vs volume")
+    print(f"wildExploited first seen per month, {d['first_lbl']} → {d['last_lbl']}: "
+          f"{d['kev'][0]} → {d['kev'][-1]}, range {min(d['kev'])}–{max(d['kev'])}, "
+          f"average {sum(d['kev']) / len(d['kev']):.0f}"
+          + (f"; {d['partial']['lbl']}: {d['partial']['kev']}" if d["partial"] else ""))
+
+
+def _draw_exploitation_vs_volume(d, output_filename, lb, what):
     x, pubs, kev = d["x"], d["pubs"], d["kev"]
     k_lo, k_hi = min(kev), max(kev)
     ratio_p = pubs[-1] / pubs[0] if pubs[0] else float("nan")
     ratio_k = kev[-1] / kev[0] if kev[0] else float("nan")
 
     part = d["partial"]
-    title_clause, band_lbl = m._exploitation_corridor_text(d)
+    title_clause, band_lbl = m._exploitation_corridor_text(d, lb["unit"])
     fig = _slide(
         # "CISA" goes when the running month has broken the corridor: the longer
         # clause does not fit the title band otherwise (the axis still names it).
-        f"CVE publications ×{ratio_p:.1f}, {'KEV' if part and part['kev'] > k_hi else 'CISA KEV'} "
-        f"additions ×{ratio_k:.1f} — {title_clause}",
+        f"CVE publications ×{ratio_p:.1f}, {lb['title_short'] if part and part['kev'] > k_hi else lb['title']} "
+        f"×{ratio_k:.1f} — {title_clause}",
         f"{d['first_lbl']} → {d['last_lbl']}  ·  publications {pubs[0]:,} → {pubs[-1]:,} a month (left axis)  ·  "
-        f"KEV additions {kev[0]} → {kev[-1]} a month, average {sum(kev) / len(kev):.0f} (right axis, scaled to meet "
+        f"{lb['sub']} {kev[0]} → {kev[-1]} a month, average {sum(kev) / len(kev):.0f} (right axis, scaled to meet "
         f"publications in {d['first_lbl']})"
-        + (f"  ·  dashed: {part['lbl']}, an incomplete month, not in the figures above" if part else ""),
+        + (f"  ·  dashed: {part['lbl']}, an incomplete month, not in the figures above" if part else "")
+        + lb["basis"],
     )
     ax = fig.add_axes([0.085, AXES_BOTTOM, 0.665, CONTENT_TOP - AXES_BOTTOM])
     _style_axes(ax)
@@ -2097,23 +2156,31 @@ def slide_exploitation_vs_volume(stats, anchor_date, anchor_month_complete=False
                  markeredgewidth=1.6, zorder=4)
         # The note sits under the corridor, beside the hollow KEV marker: the
         # only strip the steep dashed tails never cross.
-        t = ax2.annotate(f"{part['lbl']} (incomplete)\n{part['pub']:,} CVEs · {part['kev']} KEV",
-                         xy=(part["x"], k_lo), xytext=(4, -6), textcoords="offset points",
-                         ha="right", va="top", fontsize=F_SMALL, color=INK2, style="italic",
+        above = lb.get("note_above")
+        t = ax2.annotate(f"{part['lbl']} (incomplete)\n{part['pub']:,} CVEs · {part['kev']} {lb['note']}",
+                         xy=(part["x"], max(k_hi, part["kev"]) if above else k_lo),
+                         xytext=(4, 10 if above else -6), textcoords="offset points",
+                         ha="right", va="bottom" if above else "top", fontsize=F_SMALL, color=INK2, style="italic",
                          linespacing=1.3, zorder=5)
         _stroke(t, 2.5)
 
     _exploitation_xaxis(ax, d, with_partial=True)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{int(v):,}"))
     ax.set_ylabel("CVE publications per month", fontsize=F_TICK, color=INK2)
-    ax2.set_ylabel("CISA KEV additions per month", fontsize=F_TICK, color=m.C_YELLOW, labelpad=10)
+    ax2.set_ylabel(lb["axis"], fontsize=F_TICK, color=m.C_YELLOW, labelpad=10)
 
     # Labels beyond the right axis, each on its own scale.
     _end_labels(ax, [{"y": pubs[-1], "color": m.C_RED, "main": "CVE publications",
                       "sub": f"{pubs[0]:,} → {pubs[-1]:,} a month"}], dx=0.085)
-    _end_labels(ax2, [{"y": kev[-1], "color": m.C_YELLOW, "main": "CISA KEV additions",
+    _end_labels(ax2, [{"y": kev[-1], "color": m.C_YELLOW, "main": lb["end"],
                        "sub": f"{kev[0]} → {kev[-1]} a month, avg {sum(kev) / len(kev):.0f}"}], dx=0.085)
-    _save(fig, output_filename, "exploitation vs volume")
+    if lb.get("margin"):
+        # Hung under the series' own end label, wherever that lands.
+        ax2.annotate(lb["margin"], xy=(0.824, kev[-1]), xytext=(0, -30), textcoords="offset points",
+                     xycoords=matplotlib.transforms.blended_transform_factory(fig.transFigure, ax2.transData),
+                     ha="left", va="top", fontsize=F_SMALL, color=INK3, style="italic",
+                     linespacing=1.3, annotation_clip=False)
+    _save(fig, output_filename, what)
 
 
 def slide_exploitation_share(stats, anchor_date, anchor_month_complete=False,
@@ -2523,6 +2590,7 @@ _RENDERERS = [
     ("fanout_downstream", slide_fanout_downstream),
     ("exploitation_vs_volume", slide_exploitation_vs_volume),
     ("exploitation_vs_volume", slide_exploitation_share),
+    ("exploitation_wild", slide_exploitation_wild),
     ("kernel_fixes", slide_kernel_fixes),
     ("epss", slide_epss_cohort_age),
     ("epss", slide_epss_recall),
