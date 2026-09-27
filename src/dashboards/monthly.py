@@ -362,6 +362,7 @@ def _chrome_row(item, day, candidate=False):
         if mp and mp.group(1) not in posts:
             posts.append(mp.group(1))
     mf = _CHROME_FIX_VER.search(str(item.get("description") or ""))
+    cwes = item.get("cwe") or []
     return {
         "id": item.get("id"),
         "day": day,
@@ -369,6 +370,7 @@ def _chrome_row(item, day, candidate=False):
         "advisories": advisories,
         "versions": sorted(versions),
         "fix_version": mf.group(1) if mf else None,
+        "cwe": sorted({str(c) for c in (cwes if isinstance(cwes, list) else [cwes]) if c}),
         "candidate": candidate,
     }
 

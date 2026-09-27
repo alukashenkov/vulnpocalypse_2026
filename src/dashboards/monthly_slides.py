@@ -71,6 +71,7 @@ SLIDE_FILES = {
     "status_by_cna": "cve_monthly_stats_comparison_status_by_cna_slide.png",
     "fanin_chrome": "cve_monthly_stats_comparison_fanin_chrome_slide.png",
     "fanin_chrome_estate": "cve_monthly_stats_comparison_fanin_chrome_estate_slide.png",
+    "cwe_chrome": "cve_monthly_stats_comparison_cwe_chrome_slide.png",
     "fanout_downstream": "cve_monthly_stats_comparison_fanout_downstream_slide.png",
     "exploitation_vs_volume": "cve_monthly_stats_comparison_exploitation_vs_volume_slide.png",
     "exploitation_share": "cve_monthly_stats_comparison_exploitation_share_slide.png",
@@ -133,25 +134,31 @@ def _data_stamp():
     return f"Data through {m._DATA_THROUGH}" if m._DATA_THROUGH else ""
 
 
-def _slide(title, subtitle=None):
-    """A blank slide with the title band and footer already in place."""
+def _slide(title, subtitle=None, height=SLIDE_H):
+    """A blank slide with the title band and footer already in place.
+
+    ``height`` makes a taller frame for a picture that needs the rows; the
+    title band and footer keep their distance in inches from the top and
+    bottom edges, so they look the same as on every other slide.
+    """
     plt.style.use("dark_background")
-    fig = plt.figure(figsize=(SLIDE_W, SLIDE_H), facecolor=BG)
+    fig = plt.figure(figsize=(SLIDE_W, height), facecolor=BG)
+    k = SLIDE_H / height
     t = fig.text(
-        TEXT_LEFT, TITLE_Y, title,
+        TEXT_LEFT, 1 - (1 - TITLE_Y) * k, title,
         ha="left", va="top", fontsize=F_TITLE, fontweight="bold", color=INK,
     )
     _fit_text(fig, t, min_size=18)
     if subtitle:
         s = fig.text(
-            TEXT_LEFT, SUB_Y, subtitle,
+            TEXT_LEFT, 1 - (1 - SUB_Y) * k, subtitle,
             ha="left", va="top", fontsize=F_SUB, color=INK2, style="italic",
             linespacing=1.25,
         )
         _fit_text(fig, s, min_size=10.5, wrap_first=True)
     stamp = _data_stamp()
     fig.text(
-        0.955, FOOT_Y,
+        0.955, FOOT_Y * k,
         f"{stamp} | Data Source: Vulners CVE Archive" if stamp
         else "Data Source: Vulners CVE Archive",
         ha="right", va="bottom", fontsize=F_FOOT, color=INK3, style="italic",
@@ -1232,7 +1239,8 @@ def _chrome_releases(chrome_cves, anchor_date):
 
     Returns ``(releases, unattributed)``; each release is a dict with ``key``,
     ``version`` (or ``None``), ``major``, ``date``, ``advisories``,
-    ``published`` and ``candidates`` counts, sorted by date.
+    ``published`` and ``candidates`` counts and ``ids`` (CVE id → still
+    reserved), sorted by date.
     """
     rows = [r for r in chrome_cves if r["day"] <= anchor_date[:10]]
 
@@ -1313,6 +1321,7 @@ def _chrome_releases(chrome_cves, anchor_date):
             "advisories": sorted(rel["advisories"]),
             "published": len(rel["ids"]) - candidates,
             "candidates": candidates,
+            "ids": dict(rel["ids"]),
         })
     out.sort(key=lambda rel: (rel["date"], rel["version"] or ""))
     return out, unattributed
@@ -1604,6 +1613,266 @@ def slide_fanin_chrome_estate(chrome_cves, anchor_date, output_filename=SLIDE_FI
         ax.legend(handles=[_chrome_reserved_patch()], loc="upper left", bbox_to_anchor=(0.004, 0.84),
                   facecolor="#262626", edgecolor="#444444", fontsize=F_SMALL, framealpha=0.95)
     _save(fig, output_filename, "Chrome fan-in at estate scale")
+
+
+# ── 10c. Chrome releases by weakness (CWE) ──────────────────────────────────
+# The fan-in slide's releases, each opened up into the CWEs its CVEs carry: one
+# column per release, one row per CWE, bubble area ∝ CVEs. Chrome is one
+# product, so the MS Patch Tuesday bubble chart's product axis becomes the
+# release axis. The CVE count per release runs along the top, the fan-in
+# slide's bars in miniature, so volume and mix read off one picture. A release
+# made only of reserved CVEs (advisory out, records not yet published) has no
+# CWE to show: it keeps its count on top and a hatched, empty column below.
+#
+# The point is each release's own leading weakness, so the rows are chosen
+# for it: first every release's most common CWE (a tie broken by the CWE's
+# yearly total), then the CWEs tied with it, then the year's most common, up
+# to CHROME_CWE_MAX_ROWS; each release's leader is ringed. The frame grows
+# taller than 16:9 when the rows need it rather than shrinking them.
+CHROME_CWE_MAX_ROWS = 20
+CHROME_CWE_ROW_IN = 0.24     # row pitch, inches
+# Short MITRE names for the CWEs Chrome's records carry (the MS bubble chart
+# keeps its own list); unknown ids are shown bare.
+CHROME_CWE_NAMES = {
+    "CWE-20": "Improper Input Validation",
+    "CWE-79": "Cross-site Scripting",
+    "CWE-94": "Code Injection",
+    "CWE-119": "Memory Buffer Bounds",
+    "CWE-122": "Heap-based Buffer Overflow",
+    "CWE-125": "Out-of-bounds Read",
+    "CWE-190": "Integer Overflow",
+    "CWE-200": "Information Exposure",
+    "CWE-203": "Observable Discrepancy",
+    "CWE-269": "Improper Privilege Management",
+    "CWE-284": "Improper Access Control",
+    "CWE-346": "Origin Validation Error",
+    "CWE-352": "Cross-Site Request Forgery",
+    "CWE-362": "Race Condition",
+    "CWE-367": "TOCTOU Race Condition",
+    "CWE-416": "Use After Free",
+    "CWE-451": "UI Misrepresentation",
+    "CWE-457": "Uninitialized Variable",
+    "CWE-472": "Assumed-Immutable Parameter",
+    "CWE-602": "Client-Side Enforcement",
+    "CWE-693": "Protection Mechanism Failure",
+    "CWE-706": "Incorrectly-Resolved Name",
+    "CWE-787": "Out-of-bounds Write",
+    "CWE-843": "Type Confusion",
+    "CWE-862": "Missing Authorization",
+    "CWE-863": "Incorrect Authorization",
+    "CWE-908": "Uninitialized Resource",
+    "CWE-1300": "Physical Side-Channel",
+}
+
+
+def slide_cwe_chrome(chrome_cves, anchor_date, output_filename=SLIDE_FILES["cwe_chrome"]):
+    """Every Chrome release of the year against the CWEs of its CVEs.
+
+    A CVE with several CWEs counts once in each of their rows (about one in
+    twenty-five does), so a column can hold more bubbles' worth than its
+    count on top; the count on top is always distinct CVEs.
+    """
+    releases, _ = _chrome_releases(chrome_cves, anchor_date)
+    if not releases:
+        return
+    cwe_of = {r["id"]: r.get("cwe") or [] for r in chrome_cves}
+    year = anchor_date[:4]
+    n = len(releases)
+    totals = [rel["published"] + rel["candidates"] for rel in releases]
+    reserved = [rel["candidates"] for rel in releases]
+    per_rel = [collections.Counter(w for cid in rel["ids"] for w in cwe_of.get(cid, ())) for rel in releases]
+    no_cwe = [sum(1 for cid in rel["ids"] if not cwe_of.get(cid)) for rel in releases]
+    cwe_totals = sum(per_rel, collections.Counter())
+    by_total = sorted(cwe_totals, key=lambda w: (-cwe_totals[w], w))
+    leaders = [{w for w, v in c.items() if v == max(c.values())} if c else set() for c in per_rel]
+    picks = [max(ld, key=lambda w: (cwe_totals[w], w)) for ld in leaders if ld]
+    chosen = []
+    for w in picks + [w for w in by_total if any(w in ld for ld in leaders)] + by_total:
+        if w not in chosen and len(chosen) < CHROME_CWE_MAX_ROWS:
+            chosen.append(w)
+    top = sorted(chosen, key=by_total.index)
+    missing = sorted({w for w in picks if w not in chosen})
+    if missing:
+        print(f"[cwe_chrome] more release leaders than {CHROME_CWE_MAX_ROWS} rows; not drawn: {', '.join(missing)}")
+    rows = top + (["Other CWEs"] if len(cwe_totals) > len(top) else [])
+    top_set = set(top)
+    cell = {}
+    for i, rel in enumerate(releases):
+        for w in top:
+            if per_rel[i][w]:
+                cell[(i, w)] = per_rel[i][w]
+        # "Other" counts CVEs, not pairs: a CVE with two rare CWEs is one CVE there.
+        other = sum(1 for cid in rel["ids"] if any(w not in top_set for w in cwe_of.get(cid, ())))
+        if other:
+            cell[(i, "Other CWEs")] = other
+    row_totals = {w: cwe_totals[w] for w in top}
+    row_totals["Other CWEs"] = sum(v for (i, w), v in cell.items() if w == "Other CWEs")
+    grand = sum(totals)
+    with_cwe = grand - sum(no_cwe)
+    no_cwe_pub = sum(no_cwe) - sum(min(nc, rs) for nc, rs in zip(no_cwe, reserved))
+    milestone_first = {}
+    for rel in releases:
+        if rel["major"] is not None and rel["major"] not in milestone_first:
+            milestone_first[rel["major"]] = rel
+    milestone_idx = {i for i, rel in enumerate(releases) if milestone_first.get(rel["major"]) is rel}
+    # Releases made only of reserved CVEs: counted on top, no CWE to draw yet.
+    blank = [i for i in range(n) if reserved[i] and not per_rel[i]]
+
+    csv_path = os.path.splitext(output_filename)[0].replace("_slide", "") + ".csv"
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["release_date", "version", "cwe", "cves"])
+        writer.writeheader()
+        for i, rel in enumerate(releases):
+            base = {"release_date": rel["date"].isoformat(), "version": rel["version"] or ""}
+            for w, v in sorted(per_rel[i].items(), key=lambda wv: (-wv[1], wv[0])):
+                writer.writerow({**base, "cwe": w, "cves": v})
+            if no_cwe[i]:
+                writer.writerow({**base, "cwe": "(none)", "cves": no_cwe[i]})
+    m.saved_files_log.append(f"Saved Chrome release × CWE CSV to {os.path.abspath(csv_path)}")
+    lead = ", ".join(f"{w} {cwe_totals[w]:,} ({cwe_totals[w] / grand:.0%})" for w in top[:3])
+    print(f"\n[cwe_chrome] {year}: {n} releases, {grand:,} CVEs, {with_cwe:,} with a CWE; top: {lead}; "
+          f"no CWE: {sum(no_cwe)} ({no_cwe_pub} published, the rest reserved)"
+          + (f"; reserved-only releases: " + ", ".join(
+              f"{releases[i]['date'].strftime('%b %-d')} ({totals[i]} CVEs)" for i in blank) if blank else ""))
+    lead_count = collections.Counter(picks)
+    print("[cwe_chrome] release leaders: " + ", ".join(f"{w} {c}" for w, c in lead_count.most_common()))
+
+    def name(w):
+        return f"{w}  {CHROME_CWE_NAMES[w]}" if w in CHROME_CWE_NAMES else w
+
+    # Laid out in inches from the edges: the title band and the strip on top,
+    # the date ticks and month names underneath, the grid as tall as its rows.
+    top_in = (1 - CONTENT_TOP) * SLIDE_H
+    strip_in, gap_in, bottom_in = 1.05, 0.11, 1.24
+    grid_in = (len(rows) + 0.2) * CHROME_CWE_ROW_IN
+    fig_h = max(SLIDE_H, top_in + strip_in + gap_in + grid_in + bottom_in)
+    lead_w, lead_n = lead_count.most_common(1)[0]
+    fig = _slide(
+        f"Chrome {year}: what each release fixed, by weakness",
+        f"{n} releases, {grand:,} CVEs, {with_cwe:,} with a CWE  ·  "
+        f"ringed: each release's most common CWE; {name(lead_w)} leads {lead_n} of {len(picks)}  ·  "
+        f"bubble area ∝ CVEs; two CWEs count in both rows",
+        height=fig_h,
+    )
+    left, right = 0.235, 0.925
+    content_top = 1 - top_in / fig_h
+    strip_bottom = content_top - strip_in / fig_h
+    grid_top = strip_bottom - gap_in / fig_h
+    ax_bottom = bottom_in / fig_h
+
+    # Top strip: CVEs per release, the fan-in slide's bars in miniature.
+    axc = fig.add_axes([left, strip_bottom, right - left, content_top - strip_bottom])
+    _style_axes(axc)
+    axc.grid(False)
+    axc.spines["left"].set_visible(False)
+    axc.set_yticks([])
+    xs = np.arange(n)
+    colors = [m.C_RED if i in milestone_idx else m.C_BLUE for i in range(n)]
+    _chrome_release_bars(axc, xs, [t - r for t, r in zip(totals, reserved)], reserved, colors)
+    axc.set_ylim(0, max(totals) * 1.45)
+    axc.set_xlim(-0.7, n - 0.3)
+    axc.set_xticks([])
+    for i, tot in enumerate(totals):
+        axc.annotate(f"{tot:,}", xy=(i, tot), xytext=(0, 2), textcoords="offset points", ha="center", va="bottom",
+                     fontsize=6.5, fontweight="bold", color=INK, zorder=5)
+    # The milestone's number over its first release. A "Chrome N" tag is about
+    # four bars wide, so one that would sit level with the previous tag within
+    # that distance is raised clear of it.
+    y_top = max(totals) * 1.45
+    pt_per_cve = strip_in * 72 / y_top
+    prev = None     # (bar index, tag height in points above the axis)
+    for i in sorted(milestone_idx):
+        y_pt = totals[i] * pt_per_cve + 11
+        if prev is not None and i - prev[0] <= 4 and abs(y_pt - prev[1]) < 10:
+            y_pt = prev[1] + 10
+        axc.annotate(f"Chrome {releases[i]['major']}" if totals[i] >= 50 else str(releases[i]["major"]),
+                     xy=(i, totals[i]), xytext=(0, y_pt - totals[i] * pt_per_cve), textcoords="offset points",
+                     ha="center", va="bottom", fontsize=7.5, fontweight="bold", color=m.C_RED, zorder=5)
+        prev = (i, y_pt)
+    fig.text(left - 0.012, strip_bottom + 0.09 / fig_h, "CVEs per release", ha="right", va="bottom",
+             fontsize=F_SMALL, fontweight="bold", color=INK2)
+
+    # The grid: releases across, CWEs down, the most common on top.
+    ax = fig.add_axes([left, ax_bottom, right - left, grid_top - ax_bottom])
+    _style_axes(ax)
+    ax.grid(False)
+    ax_h_in = grid_in
+    ax.set_xlim(-0.7, n - 0.3)
+    ax.set_ylim(len(rows) - 0.4, -0.6)
+    for y in range(len(rows)):
+        ax.axhline(y, color=GRID, linewidth=0.5, alpha=0.6, zorder=1)
+    col_in = (right - left) * SLIDE_W / (n + 0.4)
+    row_in = ax_h_in / (len(rows) + 0.2)
+    d_max_pt = min(1.35 * col_in, 0.98 * row_in) * 72     # the biggest bubble's diameter
+    v_max = max(cell.values())
+    bx, by, bs, bc = [], [], [], []
+    for (i, w), v in cell.items():
+        bx.append(i)
+        by.append(rows.index(w))
+        bs.append((d_max_pt * np.sqrt(v / v_max)) ** 2)
+        bc.append(m.C_RED if i in milestone_idx else m.C_BLUE)
+    ax.scatter(bx, by, s=bs, c=bc, alpha=0.85, edgecolors=INK, linewidths=0.35, zorder=3)
+    # Each release's leader (every one, when tied), ringed a little outside its bubble.
+    ring = [(x, y, (np.sqrt(s_) + 4.5) ** 2) for x, y, s_ in zip(bx, by, bs) if rows[y] in leaders[x]]
+    if ring:
+        rx, ry, rs = zip(*ring)
+        ax.scatter(rx, ry, s=rs, facecolors="none", edgecolors=m.C_YELLOW, linewidths=1.3, zorder=4)
+    for x, y, s_, v in zip(bx, by, bs, (cell[(i, rows[y])] for i, y in zip(bx, by))):
+        if np.sqrt(s_) >= 10.5:
+            t = ax.text(x, y, f"{v}", ha="center", va="center", fontsize=6 if v < 100 else 5.3,
+                        fontweight="bold", color=INK, zorder=4)
+            _stroke(t, 1.2)
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([name(w) for w in rows], fontsize=8.5, color="#CCCCCC")
+    for y, w in enumerate(rows):
+        ax.text(n - 0.3, y, f" {row_totals[w]:,}", ha="left", va="center", fontsize=8, fontweight="bold",
+                color=INK2, clip_on=False)
+    ax.text(n - 0.3, -0.95, " total", ha="left", va="bottom", fontsize=7.5, color=INK3, clip_on=False,
+            style="italic")
+
+    # A release with CVEs but no CWE among them — reserved records carry none —
+    # keeps an empty, hatched column: counted on top, absent from the mix.
+    for i in blank:
+        ax.axvspan(i - 0.42, i + 0.42, facecolor=matplotlib.colors.to_rgba(colors[i], 0.10), edgecolor=colors[i],
+                   hatch="////", linewidth=0.8, zorder=2)
+        t = ax.text(i, (len(rows) - 1) / 2.0, f"{totals[i]} CVEs still reserved · advisory only · no CWE yet", rotation=90,
+                    ha="center", va="center", fontsize=7.5, fontweight="bold", color=INK, zorder=4)
+        _stroke(t, 2.2)
+
+    # Release dates and month names, as on the fan-in slide.
+    ax.set_xticks(xs)
+    ax.set_xticklabels([rel["date"].strftime("%b %-d") for rel in releases], rotation=90, fontsize=7)
+    for i, lbl in enumerate(ax.get_xticklabels()):
+        lbl.set_color(m.C_RED if i in milestone_idx else "#CCCCCC")
+    ax.tick_params(axis="x", pad=3)
+    month_y = -0.52 / ax_h_in
+    month_start = 0
+    for i in range(1, n + 1):
+        if i == n or releases[i]["date"].month != releases[month_start]["date"].month:
+            ax.text((month_start + i - 1) / 2.0, month_y, releases[month_start]["date"].strftime("%B"),
+                    transform=ax.get_xaxis_transform(), ha="center", va="top",
+                    fontsize=F_SMALL, fontweight="bold", color=INK2)
+            if i < n:
+                for a in (ax, axc):
+                    a.axvline(i - 0.5, color=GRID, linewidth=0.8, alpha=0.8, zorder=1)
+            month_start = i
+
+    from matplotlib.patches import Patch
+    handles = [
+        Patch(facecolor=m.C_RED, alpha=0.9, label="first release of a milestone"),
+        Patch(facecolor=m.C_BLUE, alpha=0.9, label="point update"),
+        matplotlib.lines.Line2D([], [], linestyle="none", marker="o", markersize=8, markerfacecolor="none",
+                                markeredgecolor=m.C_YELLOW, markeredgewidth=1.3,
+                                label="the release's most common CWE"),
+    ]
+    if any(reserved):
+        reserved_key = _chrome_reserved_patch()
+        reserved_key.set_label("CVE still reserved (advisory only)")
+        handles.append(reserved_key)
+    # In the empty corner left of the strip, over its label.
+    fig.legend(handles=handles, loc="upper right", bbox_to_anchor=(left - 0.008, content_top + 0.075 / fig_h),
+               facecolor="#262626", edgecolor="#444444", fontsize=7.5, framealpha=0.95)
+    _save(fig, output_filename, "Chrome releases by CWE")
 
 
 # ── 11. Fan-out: one CVE, N downstream package updates ─────────────────────
@@ -2250,6 +2519,7 @@ _RENDERERS = [
     ("candidate_track", slide_candidate_track),
     ("fanin_chrome", slide_fanin_chrome),
     ("fanin_chrome", slide_fanin_chrome_estate),      # reads the CSV the line above writes
+    ("fanin_chrome", slide_cwe_chrome),
     ("fanout_downstream", slide_fanout_downstream),
     ("exploitation_vs_volume", slide_exploitation_vs_volume),
     ("exploitation_vs_volume", slide_exploitation_share),
