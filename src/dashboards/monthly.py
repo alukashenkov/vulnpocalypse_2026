@@ -44,9 +44,9 @@ _WRITE_CSV = False   # published path writes no CSV; a local caller may flip thi
 # ``monthly_slides``). Off on the published path — the page shows only the six
 # charts in CHART_FILES — and flipped on by the local wrapper.
 _SLIDES = False
-# Experiment: draw the monthly-flow Sankey a second time with its lanes ranked by
-# the anchor month's volume instead of the year's (same data, same colors, same
-# text — only the stack order moves), saved next to it as
+# Experiment: draw the monthly-flow Sankey a second time with its lanes picked and
+# ranked by the anchor month's volume instead of the year's (the month's own top
+# TOP_N CNAs, so a month leader outside the year's top gets a lane), saved next to it as
 # ``cve_monthly_stats_comparison_sankey_monthly_by_month.png``. Off on the
 # published path, which shows only the charts in CHART_FILES.
 _SANKEY_MONTH_ORDER = False
@@ -3120,12 +3120,13 @@ def _prep_sankey_flow(stats, partial_stats, top_names, anchor_date, anchor_month
     Shared with the slide renderer (``monthly_slides``) so both pictures are cut
     from the very same numbers; nothing in here knows about inches or y units.
 
-    ``rank_by`` picks the stack order only. "ytd" is the dashboard's own: lanes
-    ranked by the year's volume, which is the ranking every other Sankey and the
-    colors are keyed on. "anchor_month" ranks them by the last column's volume
-    instead, so the newest month reads top-down in its own order — the same data,
-    resorted. The colors stay keyed on the year's ranking either way, so a CNA
-    wears the same color here as everywhere else and only its place moves.
+    ``rank_by`` picks which CNAs get lanes and in what order. "ytd" is the
+    dashboard's own: the year's top CNAs ranked by the year's volume, which is
+    the ranking every other Sankey and the colors are keyed on. "anchor_month"
+    takes the last column's own top ``len(top_names)`` CNAs instead and ranks them
+    by that month, so the newest month reads top-down in its own order. A CNA
+    holding a year rank keeps that rank's color either way; a month leader
+    outside the year's top borrows a rank color no lane on the chart is using.
     """
     anchor_month_str = anchor_date[5:7]  # e.g., "06" for June
     current_year = int(anchor_date[:4])  # display year, derived from the data anchor
@@ -3169,22 +3170,31 @@ def _prep_sankey_flow(stats, partial_stats, top_names, anchor_date, anchor_month
     ytd_order = monthly_flow_rank_order(
         stats, partial_stats, top_names, anchor_month_str, anchor_month_complete
     )
-    # The same names ranked by the last column instead. Ties fall back to the
-    # year's order, so the ranking is stable and the two pictures differ only
-    # where the newest month actually disagrees with the year. The callout
+    # The newest month's ranking: the year's names resorted by the last column
+    # on the year chart, the month's own top N on the month chart. The callout
     # counts down this list whichever way the stack is drawn — "the top N CNAs
     # of this month" is a claim about the month, not about the stack.
     anchor_data = stages[-1]["data"]
     ytd_rank = {name: i for i, name in enumerate(ytd_order)}
-    anchor_order = sorted(
-        ytd_order, key=lambda c: (-anchor_data.get(c, 0), ytd_rank[c])
-    )
     if rank_by == "anchor_month":
+        # The newest month's own top N, not the year's top N resorted: a CNA
+        # that leads this month without leading the year gets a lane, and a
+        # year leader that has gone quiet drops into "Others". Ties fall back to
+        # the year's order, then to the name.
+        n_lanes = len(top_names)
+        anchor_order = sorted(
+            (c for c, v in anchor_data.items() if v > 0),
+            key=lambda c: (-anchor_data[c], ytd_rank.get(c, len(ytd_rank)), c),
+        )[:n_lanes]
         sorted_top_names = anchor_order
         order_note = (
-            f"Lanes ordered by {months_abbrev[anchor_month_str]} {current_year} volume."
+            f"Top {len(anchor_order)} CNAs picked and ordered by "
+            f"{months_abbrev[anchor_month_str]} {current_year} volume."
         )
     else:
+        anchor_order = sorted(
+            ytd_order, key=lambda c: (-anchor_data.get(c, 0), ytd_rank[c])
+        )
         sorted_top_names = ytd_order
         order_note = f"Lanes ordered by total {current_year} volume."
     all_items = sorted_top_names + ["Others"]
@@ -3214,7 +3224,19 @@ def _prep_sankey_flow(stats, partial_stats, top_names, anchor_date, anchor_month
     # One color per rank, in the *year's* order — this chart defines the ranking
     # every other Sankey inherits, and a lane resorted by month keeps the color
     # that ranking gave it so it can still be followed across the charts.
-    colors = sankey_lane_colors(all_items, sankey_rank_colors(ytd_order))
+    rank_colors = sankey_rank_colors(ytd_order)
+    # A month leader outside the year's top N has no rank color of its own, and
+    # gray would make its lane read as "Others". It takes a rank color that no
+    # lane on this chart is wearing — one freed by a year leader that fell out
+    # of the month's top N — so every lane stays distinct and every CNA that
+    # does hold a year rank keeps its color.
+    free = [c for c in SANKEY_RANK_COLORS
+            if c not in {rank_colors[n] for n in sorted_top_names if n in rank_colors}]
+    rank_colors = {n: rank_colors[n] for n in sorted_top_names if n in rank_colors}
+    for n in sorted_top_names:
+        if n not in rank_colors and free:
+            rank_colors[n] = free.pop(0)
+    colors = sankey_lane_colors(all_items, rank_colors)
 
     # ── The reference guide ──────────────────────────────────────────────────
     # One month's entire output, carried across every column at the depth it
@@ -3317,9 +3339,9 @@ def plot_custom_sankey_flow(
     carries the day range that says so; when ``anchor_month_complete`` it is a
     whole month and gets a plain month header, like every column before it.
 
-    ``rank_by`` only picks the stack order — see ``_prep_sankey_flow``. The
-    published chart ranks lanes by the year; "anchor_month" draws the same data
-    ranked by the newest month, which local runs save beside it as a variant.
+    ``rank_by`` picks the lanes and their order — see ``_prep_sankey_flow``. The
+    published chart uses the year's top CNAs; "anchor_month" uses the newest
+    month's own top CNAs, which local runs save beside it as a variant.
     """
     p = _prep_sankey_flow(
         stats, partial_stats, top_names, anchor_date, anchor_month_complete,
