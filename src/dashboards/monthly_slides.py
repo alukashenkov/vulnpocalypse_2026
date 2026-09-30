@@ -73,6 +73,8 @@ SLIDE_FILES = {
     "fanin_chrome_estate": "cve_monthly_stats_comparison_fanin_chrome_estate_slide.png",
     "cwe_chrome": "cve_monthly_stats_comparison_cwe_chrome_slide.png",
     "fanout_downstream": "cve_monthly_stats_comparison_fanout_downstream_slide.png",
+    "fanout_status": "cve_monthly_stats_comparison_fanout_status_slide.png",
+    "fanout_status_timeline": "cve_monthly_stats_comparison_fanout_status_timeline_slide.png",
     "exploitation_vs_volume": "cve_monthly_stats_comparison_exploitation_vs_volume_slide.png",
     "exploitation_share": "cve_monthly_stats_comparison_exploitation_share_slide.png",
     "exploitation_wild": "cve_monthly_stats_comparison_exploitation_wild_vs_volume_slide.png",
@@ -2019,6 +2021,222 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
     _save(fig, output_filename, "fan-out")
 
 
+def slide_fanout_status(record=None, output_filename=SLIDE_FILES["fanout_status"]):
+    """One CVE, and which of the releases its vendors list as affected have
+    shipped the fix: one bar per vendor, fixed releases in green and the ones
+    still waiting in red, each named under its bar.
+
+    The companion of the fan-out slide in the same frame. The table is the
+    hand-assembled ``m.FIXSTATUS_RELEASES`` snapshot (dated on the slide), not
+    live data: ``audit/cve`` lists fixed packages and says nothing of releases
+    still open. Like the fan-out slide it describes the ecosystem, never the
+    viewer — nothing on it is an instruction."""
+    cve = m.FIXSTATUS_CVE
+    vendors = {}
+    for vendor, release, state, detail in m.FIXSTATUS_RELEASES:
+        v = vendors.setdefault(vendor, {"fixed": [], "vulnerable": []})
+        v[state].append((release, detail))
+    rows = sorted(vendors.items(), key=lambda kv: (-len(kv[1]["vulnerable"]), -len(kv[1]["fixed"]), kv[0]))
+    n_fixed = sum(len(v["fixed"]) for _, v in rows)
+    n_open = sum(len(v["vulnerable"]) for _, v in rows)
+    n_all = n_fixed + n_open
+    checked = datetime.strptime(m.FIXSTATUS_CHECKED, "%Y-%m-%d")
+    events = [(datetime.strptime(d, "%Y-%m-%d"), what) for d, what in m.FIXSTATUS_EVENTS]
+    upstream = next((d for d, what in events if what == "fixed upstream"), None)
+    days_up = (checked - upstream).days if upstream else None
+    print(f"Fix status for {cve} ({m.FIXSTATUS_CHECKED}): {n_fixed} of {n_all} affected releases fixed, "
+          f"{n_open} still vulnerable, across {len(rows)} vendors")
+
+    timeline = "  ·  ".join(f"{what} {d.strftime('%b %-d')}" for d, what in events)
+    fig = _slide(
+        f"{days_up} days after the upstream fix, {n_fixed} of {n_all} affected releases have it"
+        if days_up is not None else f"{n_fixed} of {n_all} affected releases have the fix",
+        f"{cve}  ·  Linux kernel af_unix GC use-after-free  ·  {timeline}  ·  "
+        f"vendor trackers as of {checked.strftime('%b %-d, %Y')}",
+    )
+    ax = fig.add_axes([0.175, 0.115, 0.56, CONTENT_TOP - 0.115])
+    _style_axes(ax)
+    ax.grid(False, axis="y")
+    ax.grid(True, axis="x", color=GRID, linestyle="--", linewidth=0.8, alpha=0.7)
+
+    rows = rows[::-1]                                   # most still open at the top
+    ys = np.arange(len(rows))
+    fixed = np.array([len(v["fixed"]) for _, v in rows])
+    open_ = np.array([len(v["vulnerable"]) for _, v in rows])
+    h = 0.46
+    ax.barh(ys + 0.14, fixed, h, color=m.C_GREEN, alpha=0.95, edgecolor=BG, linewidth=0.6, zorder=3,
+            label="fix published")
+    ax.barh(ys + 0.14, open_, h, left=fixed, color=m.C_RED, alpha=0.95, edgecolor=BG, linewidth=0.6, zorder=3,
+            label="affected, no fix published")
+    ax.set_yticks(ys + 0.14)
+    ax.set_yticklabels([vendor for vendor, _ in rows], fontsize=F_LABEL, fontweight="bold", color="#E0E0E0")
+    ax.tick_params(axis="y", pad=8)
+    x_max = max(fixed + open_)
+    ax.set_xlim(0, x_max + 0.4)
+    ax.set_ylim(-0.6, len(rows) - 0.35)
+    ax.xaxis.set_major_locator(plt.MultipleLocator(1))
+    ax.set_xlabel("affected releases, as each vendor's tracker lists them", fontsize=F_TICK, color=INK2)
+
+    def names(items):
+        return ", ".join(f"{r} ({d})" if d else r for r, d in items)
+
+    for y, (vendor, v), f, o in zip(ys, rows, fixed, open_):
+        ax.annotate(f"{f}/{f + o}", xy=(f + o, y + 0.14), xytext=(6, 0), textcoords="offset points",
+                    ha="left", va="center", fontsize=F_SMALL, fontweight="bold", color=INK, zorder=5)
+        parts = []
+        if v["fixed"]:
+            parts.append(("fixed: " + names(v["fixed"]), m.C_GREEN))
+        if v["vulnerable"]:
+            # SUSE's eight products are one short list; say it once.
+            items = v["vulnerable"]
+            txt = names(items) if len(items) <= 4 else ", ".join(r for r, _ in items)
+            parts.append(("open: " + txt, "#FF8A95"))
+        x_px = 0
+        for txt, color in parts:
+            t = ax.annotate(textwrap.shorten(txt, 125, placeholder="…"), xy=(0, y - 0.25),
+                            xytext=(x_px, 0), textcoords="offset points",
+                            ha="left", va="center", fontsize=8.5, color=color, zorder=5)
+            fig.canvas.draw()
+            x_px += t.get_window_extent().width * 72 / fig.dpi + 14
+    ax.legend(loc="lower right", facecolor="#262626", edgecolor="#444444", fontsize=F_SMALL, framealpha=0.95)
+
+    # Right margin: the ladder again, ending in the split.
+    rungs = [("1", "upstream fix"), (f"{len(rows)}", "vendors listing it"),
+             (f"{n_all}", "affected releases"), (f"{n_fixed}", "fixed"), (f"{n_open}", "still vulnerable")]
+    x_rule, x_txt = 0.772, 0.787
+    y_top, step = 0.775, 0.092
+    y_last = y_top - step * (len(rungs) - 1)
+    fig.add_artist(plt.Line2D([x_rule, x_rule], [y_last - 0.012, y_top + 0.012], transform=fig.transFigure,
+                              color=INK3, linewidth=1.4, solid_capstyle="round", zorder=1))
+    for i, (count, what) in enumerate(rungs):
+        y = y_top - step * i
+        color = {3: m.C_GREEN, 4: m.C_RED}.get(i, INK3)
+        fig.add_artist(plt.Line2D([x_rule], [y], transform=fig.transFigure, marker="o",
+                                  markersize=9 if i >= 3 else 6, color=color, zorder=2))
+        fig.text(x_txt, y + 0.004, count, ha="left", va="bottom", fontsize=19 if i >= 3 else 16,
+                 fontweight="bold", color=INK)
+        fig.text(x_txt, y - 0.006, what, ha="left", va="top", fontsize=F_LABEL, color=INK2)
+    y_note = y_last - 0.075
+    fig.text(x_txt, y_note, textwrap.fill(
+        f"Upstream stable has no fix yet for {' or '.join(m.FIXSTATUS_UPSTREAM_OPEN)}; "
+        f"fixed in {', '.join(m.FIXSTATUS_UPSTREAM_FIXED)}.", 38),
+        ha="left", va="top", fontsize=F_SMALL, color=INK, style="italic", linespacing=1.35)
+    fig.text(x_txt, y_note - 0.1, textwrap.fill(f"Not affected: {m.FIXSTATUS_NOT_AFFECTED}.", 38),
+             ha="left", va="top", fontsize=F_SMALL - 0.5, color=INK2, linespacing=1.35)
+    fig.text(0.075, FOOT_Y, "Status: Debian, Ubuntu, Red Hat, SUSE, Microsoft (Azure Linux) and BellSoft "
+             "security trackers, via Vulners and OSV", ha="left", va="bottom", fontsize=F_FOOT, color=INK3,
+             style="italic")
+    _save(fig, output_filename, "fix status")
+
+
+def slide_fanout_status_timeline(record=None, output_filename=SLIDE_FILES["fanout_status_timeline"]):
+    """The fix-status slide on a calendar: from the upstream fix (0 releases
+    fixed, every affected release vulnerable) to the snapshot day, the fixed
+    count steps up on the day each release got its fix
+    (``m.FIXSTATUS_FIXED_ON``) and the vulnerable count steps down with it;
+    whatever is still open is named at the snapshot day.
+
+    The affected set is the one the trackers list on FIXSTATUS_CHECKED, applied
+    back to the upstream fix — vendors listed it later — and the slide says so."""
+    cve = m.FIXSTATUS_CVE
+    checked = datetime.strptime(m.FIXSTATUS_CHECKED, "%Y-%m-%d")
+    events = [(datetime.strptime(d, "%Y-%m-%d"), what) for d, what in m.FIXSTATUS_EVENTS]
+    start = next((d for d, what in events if what == "fixed upstream"), events[0][0])
+    fixes = sorted((datetime.strptime(m.FIXSTATUS_FIXED_ON[(v, r)], "%Y-%m-%d"), v, r)
+                   for v, r, state, _ in m.FIXSTATUS_RELEASES if state == "fixed")
+    open_rel = [(v, r) for v, r, state, _ in m.FIXSTATUS_RELEASES if state != "fixed"]
+    n_all = len(m.FIXSTATUS_RELEASES)
+    n_fixed, n_open = len(fixes), len(open_rel)
+    days = (checked - start).days
+    first_fix = (fixes[0][0] - start).days if fixes else None
+    print(f"Fix timeline for {cve}: first release fixed after {first_fix} days; "
+          f"{n_fixed} fixed / {n_open} vulnerable after {days} days")
+
+    fig = _slide(
+        f"{days} days after the upstream fix: {n_fixed} releases fixed, {n_open} still vulnerable",
+        f"{cve}  ·  Linux kernel af_unix GC use-after-free  ·  affected releases as vendor trackers list them on "
+        f"{checked.strftime('%b %-d, %Y')}, counted from the upstream fix on {start.strftime('%b %-d')}",
+    )
+    ax = fig.add_axes([0.075, 0.13, 0.66, CONTENT_TOP - 0.13])
+    _style_axes(ax)
+
+    # Step series: one point at the start, one per fix day, one at the snapshot.
+    xs, fixed_y = [start], [0]
+    for i, (d, _, _) in enumerate(fixes, 1):
+        xs.append(d)
+        fixed_y.append(i)
+    xs.append(checked)
+    fixed_y.append(n_fixed)
+    vuln_y = [n_all - f for f in fixed_y]
+    ax.step(xs, vuln_y, where="post", color=m.C_RED, linewidth=3, zorder=4, label="vulnerable releases")
+    ax.step(xs, fixed_y, where="post", color=m.C_GREEN, linewidth=3, zorder=4, label="fixed releases")
+    ax.fill_between(xs, vuln_y, step="post", color=m.C_RED, alpha=0.10, zorder=2)
+    ax.fill_between(xs, fixed_y, step="post", color=m.C_GREEN, alpha=0.12, zorder=2)
+
+    # The start: CVE fixed upstream, nothing shipped.
+    ax.plot([start, start], [0, n_all], "o", color=INK, markersize=7, zorder=5)
+    # Each fix on its day, named; stacked labels climb so same-week fixes stay apart.
+    for i, (d, v, r) in enumerate(fixes, 1):
+        ax.plot(d, i, "o", color=m.C_GREEN, markersize=8, markeredgecolor=BG, zorder=6)
+        vendor = "Alpaquita" if v.startswith("BellSoft") else v
+        t = ax.annotate(f"{vendor} {r}  ·  {d.strftime('%b %-d')}", xy=(d, i),
+                        xytext=(-10, 16 + 16 * (i - 1) if i > 1 else 14), textcoords="offset points",
+                        ha="right", va="bottom", fontsize=F_SMALL, color=m.C_GREEN, fontweight="bold", zorder=6,
+                        arrowprops=dict(arrowstyle="-", color=m.C_GREEN, lw=0.8, alpha=0.7))
+        _stroke(t, lw=3)
+    # The snapshot day: every open release sits here.
+    ax.plot(checked, n_open, "o", color=m.C_RED, markersize=10, markeredgecolor=BG, zorder=6)
+    ax.plot(checked, n_fixed, "o", color=m.C_GREEN, markersize=10, markeredgecolor=BG, zorder=6)
+    ax.annotate(f"{n_open}", xy=(checked, n_open), xytext=(9, 0), textcoords="offset points",
+                ha="left", va="center", fontsize=17, fontweight="bold", color=m.C_RED)
+    ax.annotate(f"{n_fixed}", xy=(checked, n_fixed), xytext=(9, 0), textcoords="offset points",
+                ha="left", va="center", fontsize=17, fontweight="bold", color=m.C_GREEN)
+
+    # Dated events other than the start as labelled rules.
+    for d, what in events:
+        if d == start:
+            continue
+        ax.plot([d, d], [0, n_all + 0.9], color=INK3, linestyle=(0, (5, 4)), linewidth=1.1, zorder=1)
+        ax.text(d, n_all + 1.1, f"{what}\n{d.strftime('%b %-d')}", ha="center", va="bottom",
+                fontsize=F_SMALL, color=INK2, linespacing=1.2)
+    ax.text(start, n_all + 1.1, f"fixed upstream\n{start.strftime('%b %-d')}", ha="left", va="bottom",
+            fontsize=F_SMALL, color=INK, fontweight="bold", linespacing=1.2)
+
+    ax.set_xlim(start - timedelta(days=1.5), checked + timedelta(days=3.5))
+    ax.set_ylim(0, n_all + 3.2)
+    ax.yaxis.set_major_locator(plt.MultipleLocator(5))
+    ax.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=mdates.MO))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %-d"))
+    ax.tick_params(axis="x", labelsize=F_TICK - 1)
+    ax.set_ylabel("affected releases", fontsize=F_TICK, color=INK2)
+    ax.legend(loc="center left", facecolor="#262626", edgecolor="#444444", fontsize=F_SMALL, framealpha=0.95)
+
+    # Right margin: what is still open on the snapshot day, by vendor.
+    by_vendor = {}
+    for v, r in open_rel:
+        by_vendor.setdefault(v, []).append(r)
+    x_txt = 0.772
+    y = 0.79
+    fig.text(x_txt, y, f"Still vulnerable on {checked.strftime('%b %-d')}", ha="left", va="top",
+             fontsize=F_LABEL + 1, fontweight="bold", color=m.C_RED)
+    y -= 0.05
+    for v, rels in sorted(by_vendor.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        if v == "SUSE":
+            rels = ["SLES / SAP / HA 16.0 & 16.1", "SL Micro 6.2", "Leap 16.0"]
+        body = textwrap.fill(", ".join(rels), 34)
+        fig.text(x_txt, y, f"{v} ({len(by_vendor[v])})", ha="left", va="top", fontsize=F_SMALL + 0.5,
+                 fontweight="bold", color=INK)
+        fig.text(x_txt, y - 0.027, body, ha="left", va="top", fontsize=F_SMALL - 0.5, color=INK2, linespacing=1.3)
+        y -= 0.027 + 0.026 * (body.count("\n") + 1) + 0.022
+    fig.text(x_txt, y - 0.01, textwrap.fill(
+        f"No upstream stable fix yet for {' or '.join(m.FIXSTATUS_UPSTREAM_OPEN)}.", 38),
+        ha="left", va="top", fontsize=F_SMALL - 0.5, color=INK, style="italic", linespacing=1.3)
+    fig.text(0.075, FOOT_Y, "Status: vendor security trackers via Vulners and OSV · fix dates: Debian package "
+             "tracker, Alpaquita APKINDEX build times", ha="left", va="bottom", fontsize=F_FOOT, color=INK3,
+             style="italic")
+    _save(fig, output_filename, "fix status timeline")
+
+
 # ── 12. Exploitation signals vs publication volume ──────────────────────────
 
 def _exploitation_xaxis(ax, d, with_partial=False):
@@ -2588,6 +2806,8 @@ _RENDERERS = [
     ("fanin_chrome", slide_fanin_chrome_estate),      # reads the CSV the line above writes
     ("fanin_chrome", slide_cwe_chrome),
     ("fanout_downstream", slide_fanout_downstream),
+    ("fanout_status", slide_fanout_status),
+    ("fanout_status", slide_fanout_status_timeline),
     ("exploitation_vs_volume", slide_exploitation_vs_volume),
     ("exploitation_vs_volume", slide_exploitation_share),
     ("exploitation_wild", slide_exploitation_wild),

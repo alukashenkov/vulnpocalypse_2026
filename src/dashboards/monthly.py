@@ -646,6 +646,66 @@ def _fanout_route_advisory(adv_id):
     return rid
 
 
+# ── Fix status: one CVE, which affected releases have the fix ────────────────
+# The fan-out slide counts rebuilt packages; this one asks the question after
+# it — of the releases each vendor lists as affected, which have shipped a fix.
+# ``audit/cve`` cannot answer it (for this CVE it carries Debian only, and lists
+# fixed ranges, not open ones), so the table below is HAND-ASSEMBLED from each
+# vendor's own tracker on FIXSTATUS_CHECKED: Debian security tracker (via
+# Vulners DEBIANCVE + DSA-6528-1), ubuntu.com/security/cves/<id>.json, Red Hat
+# hydra securitydata, suse.com/security/cve/<id>.html, OSV AZL-97814 (Azure
+# Linux) and BELL-CVE-2026-80521 (Alpaquita). A release counts once, as its
+# vendor lists it (SUSE lists modules on one kernel as separate products);
+# "fixed" means a fixed package is published, anything else is "vulnerable".
+# Re-check the trackers and update the table, not the slide, to refresh it.
+FIXSTATUS_CVE = "CVE-2026-80521"
+FIXSTATUS_CHECKED = "2026-09-30"
+FIXSTATUS_EVENTS = [          # (date, what) — from the kernel CNA, THN and the PoC repo
+    ("2026-08-06", "fixed upstream"),
+    ("2026-08-26", "CVE published"),
+    ("2026-09-22", "container-escape exploit public"),
+]
+# (vendor, release, state, detail)
+FIXSTATUS_RELEASES = [
+    ("Ubuntu", "22.04 LTS", "vulnerable", "11 kernels needed"),
+    ("Ubuntu", "24.04 LTS", "vulnerable", "31 needed, 1 pending"),
+    ("Ubuntu", "26.04 LTS", "vulnerable", "13 needed, generic pending"),
+    ("SUSE", "SLES 16.0", "vulnerable", ""),
+    ("SUSE", "SLES 16.1", "vulnerable", ""),
+    ("SUSE", "SLES for SAP 16.0", "vulnerable", ""),
+    ("SUSE", "SLES for SAP 16.1", "vulnerable", ""),
+    ("SUSE", "SLE HA 16.0", "vulnerable", ""),
+    ("SUSE", "SLE HA 16.1", "vulnerable", ""),
+    ("SUSE", "SL Micro 6.2", "vulnerable", ""),
+    ("SUSE", "Leap 16.0", "vulnerable", ""),
+    ("Debian", "12 bookworm", "vulnerable", "6.1, no upstream fix"),
+    ("Debian", "13 trixie", "fixed", "6.12.111-1, DSA-6528-1 (Sep 29)"),
+    ("Debian", "14 forky", "fixed", "7.1.10-1"),
+    ("BellSoft Alpaquita", "23", "vulnerable", "6.1, no upstream fix"),
+    ("BellSoft Alpaquita", "25", "fixed", "6.12.111-r0"),
+    ("BellSoft Alpaquita", "stream", "fixed", "6.18.53-r0"),
+    ("Red Hat", "RHEL 10", "vulnerable", "Affected, no erratum"),
+    ("Azure Linux", "3.0", "vulnerable", "6.6, no upstream fix"),
+]
+# The day each fixed release got its fix, for the timeline version of the
+# slide. Debian: tracker.debian.org news — trixie by DSA-6528-1 into
+# stable-security; forky when 7.1.12-1 MIGRATED to testing (7.1.10-1 reached
+# unstable on Aug 24 but never migrated itself). Alpaquita: the ``t:`` build
+# timestamp of linux-lts in the release's APKINDEX on packages.bell-sw.com.
+FIXSTATUS_FIXED_ON = {
+    ("Debian", "14 forky"): "2026-09-03",
+    ("BellSoft Alpaquita", "stream"): "2026-09-25",
+    ("BellSoft Alpaquita", "25"): "2026-09-28",
+    ("Debian", "13 trixie"): "2026-09-29",
+}
+# Releases the same trackers mark not affected (older kernels, before 6.10 and
+# before the 6.1.141 / 6.6.93 backports).
+FIXSTATUS_NOT_AFFECTED = "RHEL 6–9, SLES 12 / 15, openSUSE Leap 15, Ubuntu 14.04–20.04"
+# Upstream stable branches, from the kernel CNA's affected ranges.
+FIXSTATUS_UPSTREAM_FIXED = ["6.12.111", "6.18.53", "7.1.10", "7.2"]
+FIXSTATUS_UPSTREAM_OPEN = ["6.1 (≥ 6.1.141)", "6.6 (≥ 6.6.93)"]
+
+
 def fanout_breakdown(references):
     """Distinct downstream records per issuer for one CVE's
     ``enchantments.dependencies.references``. Returns ``{issuer: set(ids)}``."""
@@ -1636,7 +1696,7 @@ def count_monthly_cves(file_path, cut_off_date=None):
     # fanout_records[cve_id] = the archive record's facts the fan-out slide and
     # its shortlist CSV need, for FANOUT_CVE and every FANOUT_SHORTLIST entry.
     fanout_records = {}
-    fanout_wanted = set(FANOUT_SHORTLIST) | {FANOUT_CVE}
+    fanout_wanted = set(FANOUT_SHORTLIST) | {FANOUT_CVE, FIXSTATUS_CVE}
     # epss_rows: (CVE id, publication day, exploited-in-the-wild flag) for every
     # kept CVE of the last EPSS_ROWS_YEARS_BACK+1 years, for the EPSS slides.
     epss_rows = []
@@ -6433,6 +6493,8 @@ def _run_monthly(results, report_buf):
     # One CVE's downstream advisories, for the fan-out slide (local only).
     fanout_records = results.get("fanout_records", {})
     slide_inputs["fanout_downstream"] = dict(record=fanout_records.get(FANOUT_CVE))
+    # Which affected releases have FIXSTATUS_CVE's fix (hand snapshot, local only).
+    slide_inputs["fanout_status"] = dict(record=fanout_records.get(FIXSTATUS_CVE))
     if _WRITE_CSV:
         _write_fanout_csv(fanout_records)
 
