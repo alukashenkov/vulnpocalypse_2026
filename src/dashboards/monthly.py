@@ -223,9 +223,11 @@ CHART_CAPTIONS = {
         "axes are scaled so both lines start at the same height, which makes "
         "the picture honest about multiples: if exploitation kept pace with "
         "publication, the yellow line would climb alongside the red one. The "
-        "shaded band is the whole range KEV additions have ever covered on "
-        "this chart, lowest month to highest, and the title says whether the "
-        "month still running (the dashed tail) has already stepped outside it."
+        "shaded band is the range KEV additions covered from the first month "
+        "through August 2026, lowest month to highest, held fixed since: any "
+        "later month outside it is labelled as an outlier at its own point, and "
+        "the title counts them, the month still running (the dashed tail) "
+        "included."
     ),
     "cve_monthly_stats_comparison_status_yearly.png": (
         "Counting is one thing; looking is another. Every CVE published carries an "
@@ -729,6 +731,13 @@ def fanout_breakdown(references):
 # the flag dated by its earliest source ``firstSeen`` in place of KEV; see
 # ``wild_exploited_by_month``.)
 EXPLOIT_START_MONTH = "2024-01"
+# The corridor is measured over EXPLOIT_START_MONTH..EXPLOIT_CORRIDOR_THROUGH
+# and then held: a later complete month outside it is named as an outlier
+# rather than silently widening the band (Sep 2026's 43 KEV additions would
+# otherwise have stretched 9–32 to 9–43 and kept "never outside" true by
+# definition). Each series gets its own band over the same months. Move this
+# forward by hand only to re-baseline.
+EXPLOIT_CORRIDOR_THROUGH = "2026-08"
 KEV_CATALOG_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 KEV_CATALOG_BASENAME = "known_exploited_vulnerabilities.json"
 
@@ -858,8 +867,16 @@ def _prep_exploitation(stats, anchor_date, anchor_month_complete=False, exploite
             "x": datetime(pm.year, pm.month, 15),
             "lbl": f"{pm.strftime('%b')} 1\u2013{anchor.day} {anchor.year}",
         }
+    kev = [kev_all.get(k, 0) for k in keys]
+    base = [v for k, v in zip(keys, kev) if k <= EXPLOIT_CORRIDOR_THROUGH]
+    band = (min(base), max(base))
+    outliers = [(mo, k, v) for mo, k, v in zip(months, keys, kev)
+                if k > EXPLOIT_CORRIDOR_THROUGH and not band[0] <= v <= band[1]]
     return {
-        "months": months, "keys": keys, "pubs": pubs, "kev": [kev_all.get(k, 0) for k in keys],
+        "months": months, "keys": keys, "pubs": pubs, "kev": kev,
+        # The corridor (``EXPLOIT_CORRIDOR_THROUGH``) and the complete months
+        # after it that fall outside, as (month, key, count).
+        "band": band, "band_last_lbl": months[len(base) - 1].strftime("%b %Y"), "outliers": outliers,
         "kev_released": kev_released, "last": last, "partial": partial,
         "x": [datetime(mo.year, mo.month, 15) for mo in months],
         "first_lbl": months[0].strftime("%b %Y"), "last_lbl": months[-1].strftime("%b %Y"),
@@ -5898,23 +5915,41 @@ def plot_active_cnas(stats, anchor_date, anchor_month_complete=False,
     saved_files_log.append(f"Saved active-CNA chart to {os.path.abspath(output_filename)}")
 
 
-def _exploitation_corridor_text(d, unit="KEV additions"):
-    """``(title clause, band label)`` for the KEV corridor. The corridor is the
-    complete months' range; once the running month has already left it, "never
-    outside" is no longer true, so both texts say where the break is instead.
-    ``unit`` names the series in the band label."""
-    kev, part = d["kev"], d["partial"]
-    k_lo, k_hi = min(kev), max(kev)
-    if part and part["kev"] > k_hi:
-        return (
-            f"{k_lo}–{k_hi} a month until {part['month'].strftime('%b %Y')}: "
-            f"{part['kev']} in {part['through'].day} days",
-            f"{d['first_lbl']} – {d['last_lbl']}: {k_lo}–{k_hi} {unit} a month",
-        )
-    return (
-        f"never outside {k_lo}–{k_hi} a month",
-        f"every month since {d['first_lbl']}: {k_lo}–{k_hi} {unit}",
-    )
+def _exploitation_corridor_text(d, unit="KEV additions", name_outliers=True):
+    """``(title clause, band label)`` for the exploitation corridor. The band is
+    the complete months' range through ``EXPLOIT_CORRIDOR_THROUGH``; complete
+    months after it that leave the band are named as outliers, and a running
+    month that has already left it is said too. ``unit`` names the series in
+    the band label; ``name_outliers=False`` only counts them (the slide title
+    has no room, and each one is labelled at its own point anyway)."""
+    (k_lo, k_hi), part, out = d["band"], d["partial"], d["outliers"]
+    named = [f"{mo.strftime('%b %Y')} ({v})" for mo, _, v in out]
+    if part and not k_lo <= part["kev"] <= k_hi:
+        named.append(f"{part['month'].strftime('%b')} so far ({part['kev']} in {part['through'].day} days)")
+    if named:
+        n = len(named)
+        count = {1: "one outlier", 2: "two outliers", 3: "three outliers"}.get(n, f"{n} outliers")
+        clause = f"{k_lo}–{k_hi} a month, {count} so far" + (f": {', '.join(named)}" if name_outliers else "")
+    else:
+        clause = f"never outside {k_lo}–{k_hi} a month"
+    if d["band_last_lbl"] != d["last_lbl"]:
+        band = f"{d['first_lbl']} – {d['band_last_lbl']}: {k_lo}–{k_hi} {unit} a month"
+    else:
+        band = f"every month since {d['first_lbl']}: {k_lo}–{k_hi} {unit}"
+    return clause, band
+
+
+def _exploitation_outlier_notes(ax, d, x, fontsize, color, stroke):
+    """Label each complete month outside the corridor at its own marker."""
+    lo, hi = d["band"]
+    for mo, k, v in d["outliers"]:
+        i = d["keys"].index(k)
+        above = v > hi
+        t = ax.annotate(f"{mo.strftime('%b %Y')}: {v}\noutside the band", xy=(x[i], v),
+                        xytext=(-10, 2 if above else -2), textcoords="offset points",
+                        ha="right", va="bottom" if above else "top", fontsize=fontsize,
+                        fontweight="bold", color=color, linespacing=1.2, zorder=6)
+        stroke(t)
 
 
 def plot_exploitation_vs_volume(stats, anchor_date, anchor_month_complete=False,
@@ -5928,7 +5963,7 @@ def plot_exploitation_vs_volume(stats, anchor_date, anchor_month_complete=False,
     if d is None:
         return
     x, pubs, kev = d["x"], d["pubs"], d["kev"]
-    k_lo, k_hi = min(kev), max(kev)
+    k_lo, k_hi = d["band"]
     k_avg = sum(kev) / len(kev)
     ratio_p = pubs[-1] / pubs[0] if pubs[0] else float("nan")
     ratio_k = kev[-1] / kev[0] if kev[0] else float("nan")
@@ -5960,6 +5995,10 @@ def plot_exploitation_vs_volume(stats, anchor_date, anchor_month_complete=False,
             label=f"CVE publications per month (left axis): {pubs[0]:,} → {pubs[-1]:,}")
     ax2.plot(x, kev, color=C_YELLOW, linewidth=2.6, marker="o", markersize=6, zorder=4,
              label=f"CISA KEV additions per month (right axis): {kev[0]} → {kev[-1]}, average {k_avg:.0f}")
+    _exploitation_outlier_notes(
+        ax2, d, x, 13, C_YELLOW,
+        lambda t: t.set_path_effects([path_effects.withStroke(linewidth=3, foreground="#1E1E1E")]),
+    )
 
     if part:
         dash = (0, (4, 3))

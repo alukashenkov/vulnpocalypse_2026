@@ -2320,16 +2320,17 @@ def slide_exploitation_wild(stats, anchor_date, anchor_month_complete=False, wil
 
 def _draw_exploitation_vs_volume(d, output_filename, lb, what):
     x, pubs, kev = d["x"], d["pubs"], d["kev"]
-    k_lo, k_hi = min(kev), max(kev)
+    k_lo, k_hi = d["band"]
     ratio_p = pubs[-1] / pubs[0] if pubs[0] else float("nan")
     ratio_k = kev[-1] / kev[0] if kev[0] else float("nan")
 
     part = d["partial"]
-    title_clause, band_lbl = m._exploitation_corridor_text(d, lb["unit"])
+    title_clause, band_lbl = m._exploitation_corridor_text(d, lb["unit"], name_outliers=False)
+    broken = bool(d["outliers"]) or bool(part and not k_lo <= part["kev"] <= k_hi)
     fig = _slide(
-        # "CISA" goes when the running month has broken the corridor: the longer
-        # clause does not fit the title band otherwise (the axis still names it).
-        f"CVE publications ×{ratio_p:.1f}, {lb['title_short'] if part and part['kev'] > k_hi else lb['title']} "
+        # "CISA" goes once anything has left the corridor: the longer clause
+        # does not fit the title band otherwise (the axis still names it).
+        f"CVE publications ×{ratio_p:.1f}, {lb['title_short'] if broken else lb['title']} "
         f"×{ratio_k:.1f} — {title_clause}",
         f"{d['first_lbl']} → {d['last_lbl']}  ·  publications {pubs[0]:,} → {pubs[-1]:,} a month (left axis)  ·  "
         f"{lb['sub']} {kev[0]} → {kev[-1]} a month, average {sum(kev) / len(kev):.0f} (right axis, scaled to meet "
@@ -2361,6 +2362,7 @@ def _draw_exploitation_vs_volume(d, output_filename, lb, what):
 
     ax.plot(x, pubs, color=m.C_RED, linewidth=3.2, marker="o", markersize=3.5, zorder=4)
     ax2.plot(x, kev, color=m.C_YELLOW, linewidth=2.2, marker="o", markersize=3.5, zorder=4)
+    m._exploitation_outlier_notes(ax2, d, x, F_SMALL, m.C_YELLOW, lambda t: _stroke(t, 2.5))
 
     if part:
         # The running month: a dashed tail from the last complete month to the
