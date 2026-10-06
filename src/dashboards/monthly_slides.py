@@ -79,6 +79,7 @@ SLIDE_FILES = {
     "exploitation_share": "cve_monthly_stats_comparison_exploitation_share_slide.png",
     "exploitation_wild": "cve_monthly_stats_comparison_exploitation_wild_vs_volume_slide.png",
     "kernel_fixes": "cve_monthly_stats_comparison_kernel_fixes_vs_publishing_slide.png",
+    "epss_by_year": "cve_monthly_stats_comparison_epss_recency_by_year_slide.png",
     "epss_cohort_age": "cve_monthly_stats_comparison_epss_recency_cohort_age_slide.png",
     "epss_recall": "cve_monthly_stats_comparison_epss_recall_slide.png",
 }
@@ -2645,7 +2646,7 @@ def slide_kernel_fixes(daily_counts_kernel, anchor_date, output_filename=SLIDE_F
     _save(fig, output_filename, "kernel fixes vs publishing")
 
 
-# ── 14 & 15. EPSS: the recency penalty, and recall of exploited CVEs ────────
+# ── 14–16. EPSS: the recency penalty (by year, by age), and recall of exploited CVEs ────────
 
 _epss_ctx_cache = {}
 
@@ -2676,6 +2677,90 @@ def _epss_context(epss_rows, anchor_date):
     ctx = {"feed_date": feed_date, "snapshots": snapshots, "aging": aging, "recall": recall, "cutoff_md": cutoff_md}
     _epss_ctx_cache[key] = ctx
     return ctx
+
+
+def slide_epss_by_year(epss_rows, anchor_date, output_filename=SLIDE_FILES["epss_by_year"]):
+    """The top panel of cve_epss_comparison.py's recency dashboard as a slide:
+    each annual EPSS snapshot's cohorts by publication year, every line ending
+    on its own current year (starred), plus the previous year's cohort climbing
+    out of the floor between the last two snapshots."""
+    ctx = _epss_context(epss_rows, anchor_date)
+    if not ctx or not ctx["aging"]:
+        return
+    snapshots, cells = ctx["snapshots"], ctx["aging"]["cells"]
+    cutoff_pct = m.EPSS_HIGH_CUTOFF * 100
+
+    lines = []
+    for snap in snapshots:
+        pts = sorted((y, c["pct_ge_cutoff"]) for y, c in cells[snap["date"]].items() if c)
+        if pts:
+            lines.append({"snap": snap, "pts": pts})
+    if len(lines) < 2:
+        return
+    years = sorted({y for ln in lines for y, _ in ln["pts"]})
+    pos = {y: i for i, y in enumerate(years)}
+    floors = [ln["pts"][-1][1] for ln in lines]
+
+    # The cohort that was the floor in the previous snapshot, seen again now.
+    newest = snapshots[-1]
+    pivot_year = str(int(newest["date"][:4]) - 1)
+    pivot_snap = next((s for s in snapshots if s["date"][:4] == pivot_year), None)
+    pivot = None
+    if pivot_snap and cells[pivot_snap["date"]].get(pivot_year) and cells[newest["date"]].get(pivot_year):
+        pivot = (cells[pivot_snap["date"]][pivot_year]["pct_ge_cutoff"],
+                 cells[newest["date"]][pivot_year]["pct_ge_cutoff"])
+
+    print("\n[epss_by_year] % of scored CVEs with EPSS >= 10%, by publication year")
+    for ln in lines:
+        snap = ln["snap"]
+        print(f"  snapshot {snap['date']} ({snap['model_version'] or 'model n/a'}): "
+              + ", ".join(f"{y}: {p:.1f}%" for y, p in ln["pts"]))
+    if pivot:
+        print(f"  {pivot_year} cohort: {pivot[0]:.1f}% when new -> {pivot[1]:.1f}% a year on")
+
+    fig = _slide(
+        f"Each EPSS snapshot rates its own year's CVEs lowest, {len(lines)} of {len(lines)}",
+        f"Starred: the snapshot's current-year cohort, at {min(floors):.1f}–{max(floors):.1f}%  ·  "
+        + (f"{pivot_year}'s CVEs went {pivot[0]:.1f}% → {pivot[1]:.1f}% once they were no longer the newest  ·  "
+           if pivot else "")
+        + f"% of scored CVEs with EPSS ≥ {cutoff_pct:.0f}%, counting only CVEs published by the snapshot date",
+    )
+    ax = fig.add_axes([0.085, AXES_BOTTOM, 0.865, CONTENT_TOP - AXES_BOTTOM])
+    _style_axes(ax)
+    for ln in lines:
+        snap = ln["snap"]
+        color = m.YEAR_COLORS.get(snap["date"][:4], m.C_GRAY)
+        xs = [pos[y] for y, _ in ln["pts"]]
+        ys = [p for _, p in ln["pts"]]
+        label = f"EPSS {snap['date']}" + (f" ({snap['model_version']})" if snap["model_version"] else "")
+        ax.plot(xs, ys, color=color, linewidth=2.8, marker="o", markersize=7, alpha=0.95, zorder=4, label=label)
+        ax.plot(xs[-1], ys[-1], marker="*", markersize=22, color=color, markeredgecolor=INK,
+                markeredgewidth=1.2, linestyle="None", zorder=5)
+        ax.annotate(f"{ys[-1]:.1f}%", xy=(xs[-1], ys[-1]), xytext=(0, -17), textcoords="offset points",
+                    ha="center", va="top", fontsize=F_LABEL, fontweight="bold", color=color, zorder=6)
+    if pivot:
+        x = pos[pivot_year]
+        ax.annotate("", xy=(x, pivot[1]), xytext=(x, pivot[0]),
+                    arrowprops=dict(arrowstyle="->", color=INK, linewidth=2, alpha=0.9), zorder=6)
+        ax.annotate(f"{pivot_year} was the floor when new.\nA year on: {pivot[0]:.1f}% → {pivot[1]:.1f}%",
+                    xy=(x, (pivot[0] + pivot[1]) / 2), xytext=(0.015, 0.14), textcoords="axes fraction",
+                    ha="left", va="center", fontsize=F_LABEL, fontweight="bold", color=INK,
+                    arrowprops=dict(arrowstyle="-", color=INK, alpha=0.22, linewidth=1.0, shrinkA=4, shrinkB=10))
+    y_max = max(p for ln in lines for _, p in ln["pts"]) * 1.12
+    # Room under 0% for the floor values: the newest cohorts sit almost on it.
+    ax.set_ylim(-y_max * 0.09, y_max)
+    ax.set_yticks([t for t in ax.get_yticks() if 0 <= t <= y_max])
+    ax.spines["left"].set_bounds(0, y_max)
+    ax.set_xlim(-0.3, len(years) - 0.7)
+    ax.set_xticks(range(len(years)))
+    ax.set_xticklabels(years, fontsize=F_TICK + 1, fontweight="bold")
+    ax.set_xlabel("CVE publication year", fontsize=F_TICK, color=INK2)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0f}%"))
+    ax.set_ylabel(f"CVEs with EPSS ≥ {cutoff_pct:.0f}%", fontsize=F_TICK, color=INK2)
+    leg = ax.legend(loc="upper right", facecolor="#262626", edgecolor="#444444", fontsize=F_LABEL,
+                    title="★ = that snapshot's own current year", title_fontsize=F_SMALL + 1)
+    leg.get_title().set_color(INK2)
+    _save(fig, output_filename, "EPSS by publication year")
 
 
 def slide_epss_cohort_age(epss_rows, anchor_date, output_filename=SLIDE_FILES["epss_cohort_age"]):
@@ -2814,6 +2899,7 @@ _RENDERERS = [
     ("exploitation_vs_volume", slide_exploitation_share),
     ("exploitation_wild", slide_exploitation_wild),
     ("kernel_fixes", slide_kernel_fixes),
+    ("epss", slide_epss_by_year),
     ("epss", slide_epss_cohort_age),
     ("epss", slide_epss_recall),
 ]
