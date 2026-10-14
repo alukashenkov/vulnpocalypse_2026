@@ -1523,9 +1523,8 @@ _SANKEY_CALLOUT_Y = 5.0      # where the callout sits inside the empty wedge
 # it; a tenth of a ruler step is enough daylight to keep it its own object.
 _SANKEY_CALLOUT_CLEAR = 25.0
 # How close to a whole reference month still counts as carrying one. The callout
-# names the *fewest* CNAs that clear this: three names that come to nine tenths
-# of January is the sharper sentence, and a fourth that tips the sum over the
-# line only blunts it.
+# names the number of CNAs whose sum lands *nearest* the whole month (ties go to
+# the fewer CNAs); this is only the floor below which no sentence is drawn.
 _SANKEY_ALMOST = 0.85
 
 
@@ -3275,8 +3274,9 @@ def _prep_sankey_flow(stats, partial_stats, top_names, anchor_date, anchor_month
     # How many of the newest month's top CNAs it takes to cover an entire
     # earlier month, read off the same numbers the chart is drawn from, so it
     # can never drift from what is on screen. It counts down ``anchor_order``,
-    # the newest month's own ranking: the sentence names that month's top N, so
-    # the N has to be the smallest one that covers the yardstick. Counting down
+    # the newest month's own ranking: the sentence names that month's top N, and
+    # N is the count whose running sum lands nearest the yardstick — 92% from
+    # five beats 85% from four, and 99% from six beats both. Counting down
     # a year-ranked stack instead answers a different question — how far into
     # *the year's* leaders you get — and overstates N whenever the month
     # disagrees with the year, which is why the paragraph is drawn on the
@@ -3285,10 +3285,12 @@ def _prep_sankey_flow(stats, partial_stats, top_names, anchor_date, anchor_month
     if show_ref:
         cum = 0
         n_cnas = 0
-        for name in anchor_order:
-            cum += raw_data[-1][name]
-            n_cnas += 1
-            if cum >= _SANKEY_ALMOST * ref_total:
+        running = 0
+        for i, name in enumerate(anchor_order, 1):
+            running += raw_data[-1][name]
+            if n_cnas == 0 or abs(running - ref_total) < abs(cum - ref_total):
+                cum, n_cnas = running, i
+            if running >= ref_total:
                 break
         ref_publishers = sum(1 for v in stages[ref_idx]["data"].values() if v > 0)
         pct = round(cum / ref_total * 100)
