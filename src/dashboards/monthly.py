@@ -30,6 +30,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.image as mpimg
 import matplotlib.patheffects as path_effects
+import matplotlib.ticker
 
 from ..base import Dashboard, DashboardResult
 
@@ -107,7 +108,7 @@ CHART_FILES = [
     "cve_monthly_stats_comparison_status_yearly.png",
     "cve_monthly_stats_comparison_status_weekly.png",
     "cve_monthly_stats_comparison_status_by_cna.png",
-    "cve_monthly_stats_comparison_exploitation_vs_volume.png",
+    "cve_monthly_stats_comparison_exploitation_trends.png",
     "cve_monthly_stats_comparison_candidate_track.png",
 ]
 
@@ -125,7 +126,7 @@ CHART_LINKS = {
     "cve_monthly_stats_comparison_status_yearly.png": ("nvd-status-yearly", "NVD status by year"),
     "cve_monthly_stats_comparison_status_weekly.png": ("nvd-status-weekly", "NVD status by week"),
     "cve_monthly_stats_comparison_status_by_cna.png": ("nvd-status-cna", "NVD status by CNA"),
-    "cve_monthly_stats_comparison_exploitation_vs_volume.png": ("exploitation", "Exploitation vs volume"),
+    "cve_monthly_stats_comparison_exploitation_trends.png": ("exploitation", "Exploitation vs volume"),
     "cve_monthly_stats_comparison_candidate_track.png": ("reserved", "Reserved but unpublished"),
 }
 
@@ -142,7 +143,7 @@ CHART_GROUPS = {
     "cve_monthly_stats_comparison_status_yearly.png": "NVD status",
     "cve_monthly_stats_comparison_status_weekly.png": "NVD status",
     "cve_monthly_stats_comparison_status_by_cna.png": "NVD status",
-    "cve_monthly_stats_comparison_exploitation_vs_volume.png": "Beyond the count",
+    "cve_monthly_stats_comparison_exploitation_trends.png": "Beyond the count",
     "cve_monthly_stats_comparison_candidate_track.png": "Beyond the count",
 }
 
@@ -227,19 +228,21 @@ CHART_CAPTIONS = {
         "already reads like the good old days. The asterisks mean projection. The "
         "slope means call the cavalry."
     ),
-    "cve_monthly_stats_comparison_exploitation_vs_volume.png": (
+    "cve_monthly_stats_comparison_exploitation_trends.png": (
         "The pile outgrows the people reading it. Does the part attackers "
-        "actually use grow with it too? The red line is every CVE published in a month, on the left "
-        "axis. The yellow line is how many CVEs CISA added to its Known "
-        "Exploited Vulnerabilities catalog that month, on the right. The two "
-        "axes are scaled so both lines start at the same height, which makes "
-        "the picture honest about multiples: if exploitation kept pace with "
-        "publication, the yellow line would climb alongside the red one. The "
-        "shaded band is the range KEV additions covered from the first month "
-        "through August 2026, lowest month to highest, held fixed since: any "
-        "later month outside it is labelled as an outlier at its own point, and "
-        "the title counts them, the month still running (the dashed tail) "
-        "included."
+        "actually use grow with it? Three counts, one panel each: every CVE "
+        "published in a month, the CVEs CISA added to its Known Exploited "
+        "Vulnerabilities catalog that month, and every CVE Vulners has seen "
+        "exploited in the wild, KEV included, dated by the first source to "
+        "report it. Each panel is a log axis spanning the same ratio, so a "
+        "doubling is the same height in all three and the slopes compare "
+        "directly. The dashed line is the series' growth trend, fitted so a few "
+        "wild months cannot drag it around, and the title gives each one as a "
+        "yearly rate. The shaded band is how far an ordinary month strays from "
+        "it; a ringed month strayed further, and a run of them at the end is a "
+        "series outgrowing its own trend. KEV sits straight under publications "
+        "so those two slopes can be read side by side. Read the slopes, not the "
+        "heights."
     ),
     "cve_monthly_stats_comparison_status_yearly.png": (
         "Counting is one thing; looking is another. Every CVE published carries an "
@@ -895,6 +898,386 @@ def _prep_exploitation(stats, anchor_date, anchor_month_complete=False, exploite
     }
 
 
+
+def robust_log_trend(values):
+    """A steady-growth trend for a noisy monthly count, robust to its spikes.
+
+    Fits ``log(count) = a + b·month`` by Theil–Sen (the median of every
+    pairwise slope, then the median intercept), so a few outlying months cannot
+    tilt it the way they tilt least squares — or stretch it the way they stretch
+    a min–max band. The band is the trend × exp(±2σ), σ being the residuals'
+    MAD scaled to a standard deviation; a month outside it is an outlier.
+    Returns ``None`` for fewer than six months or any month at zero.
+    """
+    y = np.asarray(values, dtype=float)
+    if len(y) < 6 or (y <= 0).any():
+        return None
+    t = np.arange(len(y), dtype=float)
+    ly = np.log(y)
+    i, j = np.triu_indices(len(y), k=1)
+    b = float(np.median((ly[j] - ly[i]) / (j - i)))
+    a = float(np.median(ly - b * t))
+    resid = ly - (a + b * t)
+    sigma = float(1.4826 * np.median(np.abs(resid - np.median(resid))))
+    fit = np.exp(a + b * t)
+    lo, hi = fit * np.exp(-2 * sigma), fit * np.exp(2 * sigma)
+    return {
+        "fit": fit.tolist(), "lo": lo.tolist(), "hi": hi.tolist(),
+        "annual": float(np.exp(12 * b)),          # growth multiple per year
+        "sigma": sigma,
+        "outliers": [k for k in range(len(y)) if not lo[k] <= y[k] <= hi[k]],
+    }
+
+
+def _place_clear(txt, candidates, lines, pad_px=2, inside=None):
+    """Move ``txt`` to the first of ``candidates`` where no line runs through it.
+
+    ``candidates`` are ``(xy, xytext, ha, va, text)`` tuples for an annotation
+    (``text`` None keeps the current string); ``lines`` are ``(ax, xs, ys)``
+    polylines in their axes' data units. The text's box, padded by ``pad_px``,
+    is tested against each line sampled densely in display space, and must lie
+    within ``inside`` (an axes) when given. The first candidate is kept when
+    none is clear.
+    """
+    fig = txt.figure
+    renderer = fig.canvas.get_renderer()
+    paths = []
+    for ax, xs, ys in lines:
+        xs = mdates.date2num(xs) if xs and isinstance(xs[0], (date, datetime)) else np.asarray(xs, float)
+        pts = ax.transData.transform(np.column_stack([xs, ys]))
+        dense = [pts[0]]
+        for a, b in zip(pts[:-1], pts[1:]):
+            n = max(2, int(np.hypot(*(b - a)) / 2))
+            dense.extend(a + (b - a) * t for t in np.linspace(0, 1, n)[1:])
+        paths.append(np.array(dense))
+
+    def clear():
+        bb = txt.get_window_extent(renderer).padded(pad_px)
+        if inside is not None:
+            box = inside.get_window_extent(renderer)
+            if bb.x0 < box.x0 or bb.x1 > box.x1 or bb.y0 < box.y0 or bb.y1 > box.y1:
+                return False
+        return not any(
+            ((pts[:, 0] >= bb.x0) & (pts[:, 0] <= bb.x1) & (pts[:, 1] >= bb.y0) & (pts[:, 1] <= bb.y1)).any()
+            for pts in paths
+        )
+
+    original = txt.get_text()
+    for xy, xytext, ha, va, text in list(candidates) + [candidates[0]]:
+        txt.xy = xy
+        txt.set_position(xytext)
+        txt.set_ha(ha)
+        txt.set_va(va)
+        txt.set_text(original if text is None else text)
+        if clear():
+            return True
+    return False
+
+def _prep_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wild_cve_first_seen=None):
+    """Publications, Vulners wildExploited and CISA KEV per complete month, each
+    as a multiple of its own 2024 monthly average, with a robust trend
+    (``robust_log_trend``) for the two exploited series. ``None`` without the
+    KEV catalog or the archive's wildExploited dates.
+
+    The wildExploited series is the union of the flagged CVEs and the KEV
+    catalog, each CVE dated by the earlier of its first ``firstSeen`` and its
+    KEV ``dateAdded``, so the wider series always contains the narrower one even
+    if the flag ever misses a KEV entry. KEV itself is counted by ``dateAdded``,
+    as on the KEV slide. The running month is left out: half a month on an
+    index axis reads as a collapse.
+    """
+    d = _prep_exploitation(stats, anchor_date, anchor_month_complete)
+    if d is None or not wild_cve_first_seen:
+        return None
+    path = download_cisa_kev()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            kev_added = {
+                str(v["cveID"]).upper().strip(): str(v.get("dateAdded") or "")[:10]
+                for v in json.load(f).get("vulnerabilities", []) if v.get("cveID")
+            }
+    except (OSError, ValueError, TypeError) as e:
+        print(f"Could not read KEV catalog {path}: {e}")
+        return None
+    union = dict(wild_cve_first_seen)
+    for cve, added in kev_added.items():
+        if len(added) == 10 and (cve not in union or added < union[cve]):
+            union[cve] = added
+    wild_by_month = collections.Counter(day[:7] for day in union.values() if day <= anchor_date[:10])
+    keys = d["keys"]
+    series = {
+        "pubs": d["pubs"],
+        "wild": [wild_by_month.get(k, 0) for k in keys],
+        "kev": d["kev"],
+    }
+    base_keys = [k for k in keys if k[:4] == keys[0][:4]]
+    out = {
+        "months": d["months"], "keys": keys, "x": d["x"], "last": d["last"],
+        "first_lbl": d["first_lbl"], "last_lbl": d["last_lbl"], "base_year": keys[0][:4],
+        "kev_only": sum(1 for c in kev_added if c not in wild_cve_first_seen),
+        "kev_total": len(kev_added),
+    }
+    for name, vals in series.items():
+        base = sum(vals[:len(base_keys)]) / len(base_keys)
+        trend = robust_log_trend(vals)
+        # 100% = the series' own trend level in the first month, so all three
+        # start together without riding on that one month's noise.
+        start = trend["fit"][0] if trend else (vals[0] or 1)
+        above = 0
+        if trend:
+            while above < len(vals) and vals[-1 - above] > trend["hi"][-1 - above]:
+                above += 1
+        out[name] = {
+            "values": vals, "base": base,
+            "index": [v / base for v in vals],
+            "trend": trend,
+            "trend_index": {k: [v / base for v in trend[k]] for k in ("fit", "lo", "hi")} if trend else None,
+            "start": start,
+            "pct": [v / start * 100 for v in vals],
+            "trend_pct": {k: [v / start * 100 for v in trend[k]] for k in ("fit", "lo", "hi")} if trend else None,
+            # The newest months in a row above the band: a series outgrowing its
+            # own trend, named from the first of them.
+            "above_since": d["months"][len(vals) - above] if above >= 2 else None,
+        }
+    return out
+
+def _label_trend_outliers(ax, p, srs, color, fontsize, stroke, ring=11, extra_lines=()):
+    """Ring every month outside ``srs``'s trend band and label it with its month
+    and count, each label placed clear of the series, its trend line and the
+    labels already placed (``_place_clear``)."""
+    x = p["x"]
+    renderer = ax.figure.canvas.get_renderer()
+    lines = [(ax, list(x), srs["values"]), (ax, list(x), srs["trend"]["fit"])] + list(extra_lines)
+    # The newest months in a row above the band are one fact, not several: each
+    # is ringed, the run is labelled once at its last month.
+    run = set()
+    if srs.get("above_since"):
+        run = set(range(p["months"].index(srs["above_since"]), len(x)))
+    for i in srs["trend"]["outliers"]:
+        v = srs["values"][i]
+        above = v > srs["trend"]["fit"][i]
+        ax.plot([x[i]], [v], marker="o", markersize=ring, markerfacecolor="none",
+                markeredgecolor=color, markeredgewidth=1.6, zorder=5)
+        if i in run and i != len(x) - 1:
+            continue
+        if i in run:
+            first = p["months"][min(run)]
+            label = f"{first.strftime('%b')}–{p['months'][i].strftime('%b %Y')}: above the band"
+        else:
+            label = f"{p['months'][i].strftime('%b %Y')}: {v:,}"
+        txt = ax.annotate(label, xy=(x[i], v), xytext=(0, 9),
+                          textcoords="offset points", ha="center", va="bottom", fontsize=fontsize,
+                          fontweight="bold", color=color, zorder=6)
+        stroke(txt)
+        # Nearest spots first, on the side the month sticks out to, then
+        # further out and on the other side.
+        sign = 1 if above else -1
+        cands = []
+        for dist in (9, 20, 32):
+            for dx, ha in ((0, "center"), (dist, "left"), (-dist, "right")):
+                for sgn in (sign, -sign):
+                    cands.append(((x[i], v), (dx, sgn * dist), ha, "bottom" if sgn > 0 else "top", None))
+            cands += [((x[i], v), (dist, 0), "left", "center", None),
+                      ((x[i], v), (-dist, 0), "right", "center", None)]
+        _place_clear(txt, cands, lines, inside=ax)
+        bb = txt.get_window_extent(renderer)
+        (x0, y0), (x1, y1) = ax.transData.inverted().transform([(bb.x0, bb.y0), (bb.x1, bb.y1)])
+        xs = [mdates.num2date(v_).replace(tzinfo=None) for v_ in (x0, x1, x1, x0, x0, x1)]
+        lines.append((ax, xs, [y0, y0, y1, y1, y0, y1]))
+
+
+def _trend_panel_ylim(panels):
+    """One log span for every panel — the widest panel's ratio plus room — and
+    each panel's limits centred on its own data, so a doubling is the same
+    height in all of them."""
+    def extent(srs):
+        vals = list(srs["values"])
+        if srs["trend"]:
+            vals += srs["trend"]["lo"] + srs["trend"]["hi"]
+        return min(vals), max(vals)
+    ext = [extent(srs) for srs in panels]
+    span = max(hi / lo for lo, hi in ext) * 1.35
+    return [(np.sqrt(lo * hi) / np.sqrt(span), np.sqrt(lo * hi) * np.sqrt(span)) for lo, hi in ext]
+
+
+def plot_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wild_cve_first_seen=None,
+                             output_filename="cve_monthly_stats_comparison_exploitation_trends.png"):
+    """Web version of the exploitation-trends slide: publications, Vulners
+    wildExploited (all of KEV included) and CISA KEV, one panel each on log
+    axes spanning the same ratio, the two exploited series with a robust growth
+    trend and its ±2σ band. On the page as the exploitation chart
+    (``#monthly-exploitation``), in place of ``plot_exploitation_vs_volume``."""
+    p = _prep_exploitation_trends(stats, anchor_date, anchor_month_complete, wild_cve_first_seen)
+    if p is None or not all(p[k]["trend"] for k in ("pubs", "wild", "kev")):
+        return
+    x = p["x"]
+    pct = lambda srs: f"{(srs['trend']['annual'] - 1) * 100:+.0f}%"   # noqa: E731
+    panels = [
+        (p["pubs"], C_RED, f"CVE publications  ·  trend {pct(p['pubs'])} a year"
+                           + (f", above its band since {p['pubs']['above_since'].strftime('%b %Y')}"
+                              if p["pubs"]["above_since"] else "")),
+        # KEV straight after publications: their trends are close, and side by
+        # side the panels show it.
+        (p["kev"], C_BLUE, f"CISA KEV additions  ·  trend {pct(p['kev'])} a year"),
+        (p["wild"], C_YELLOW, f"Exploited (Vulners wildExploited, every KEV CVE included)  ·  "
+                              f"trend {pct(p['wild'])} a year"),
+    ]
+    limits = _trend_panel_ylim([srs for srs, _, _ in panels])
+
+    plt.style.use("dark_background")
+    fig, axes = plt.subplots(3, 1, figsize=(16, 14), sharex=True, facecolor="#1E1E1E")
+    stroke = lambda t: t.set_path_effects(   # noqa: E731
+        [path_effects.Stroke(linewidth=3, foreground="#1E1E1E"), path_effects.Normal()])
+    for ax, (srs, color, name), (lo, hi) in zip(axes, panels, limits):
+        ax.set_facecolor("#1E1E1E")
+        ax.set_yscale("log")
+        ax.set_ylim(lo, hi)
+        ax.yaxis.set_major_locator(matplotlib.ticker.LogLocator(base=10, subs=(1, 2, 5)))
+        ax.yaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:,.0f}"))
+        if srs["trend"]:
+            tr = srs["trend"]
+            ax.fill_between(x, tr["lo"], tr["hi"], color=color, alpha=0.13, linewidth=0, zorder=1)
+            ax.plot(x, tr["fit"], color=color, linewidth=2.2, linestyle=(0, (6, 4)), zorder=2)
+        ax.plot(x, srs["values"], color=color, linewidth=3.0 if not srs["trend"] else 2.4,
+                marker="o", markersize=5, zorder=3)
+        ax.text(0.01, 0.95, name, transform=ax.transAxes, ha="left", va="top", fontsize=15,
+                fontweight="bold", color=color, zorder=7,
+                path_effects=[path_effects.Stroke(linewidth=4, foreground="#1E1E1E"), path_effects.Normal()])
+        ax.tick_params(colors="#CCCCCC", labelsize=13)
+        for label in ax.get_yticklabels() + ax.get_xticklabels():
+            label.set_fontweight("bold")
+        ax.grid(True, color="#444444", linestyle="--", alpha=0.6, linewidth=0.9)
+        ax.set_axisbelow(True)
+        for spine in ["top", "right"]:
+            ax.spines[spine].set_visible(False)
+        for spine in ["left", "bottom"]:
+            ax.spines[spine].set_color("#555555")
+    axes[1].set_ylabel("Per month (log scale)", fontsize=16, fontweight="bold", color="#FFFFFF", labelpad=12)
+    axes[-1].xaxis.set_major_locator(mdates.MonthLocator(bymonth=(1, 4, 7, 10)))
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    axes[-1].set_xlim(datetime(p["months"][0].year, p["months"][0].month, 1),
+                      datetime(p["last"].year, p["last"].month, 1) + timedelta(days=31))
+    fig.suptitle(
+        f"Exploitation vs Volume: Growth Trends ({p['first_lbl']} – {p['last_lbl']})\n"
+        f"Trend a year: CVE publications {pct(p['pubs'])}, CISA KEV {pct(p['kev'])}, "
+        f"exploited CVEs {pct(p['wild'])}",
+        fontsize=21, fontweight="bold", color="#FFFFFF", y=0.985,
+    )
+    # Laid out before the outliers are placed: placement measures the final boxes.
+    plt.tight_layout(rect=[0.01, 0.085, 0.99, 0.95], h_pad=1.6)
+    for ax, (srs, color, _) in zip(axes, panels):
+        if srs["trend"]:
+            _label_trend_outliers(ax, p, srs, color, 13, stroke, ring=14)
+    plt.figtext(
+        0.5, 0.032,
+        "Log axes spanning the same ratio: a doubling is the same height in every panel.\n"
+        "Dashed: growth trend fitted robustly (Theil–Sen on log counts); shaded: ±2σ; ringed: months outside it.",
+        ha="center", fontsize=12.5, color="#A4B0BE", style="italic", linespacing=1.4,
+    )
+    plt.figtext(
+        0.5, 0.008, f"{_stamp()} | Data Sources: Vulners CVE Archive, CISA KEV catalog",
+        ha="center", fontsize=12, color="#747D8C", style="italic", fontweight="bold",
+    )
+    _add_logo(fig)
+    plt.savefig(output_filename, dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.close()
+    saved_files_log.append(f"Saved exploitation-trends chart to {os.path.abspath(output_filename)}")
+
+_TREND_SERIES = (
+    # key, colour, name — drawn in this order, publications on top
+    ("kev", C_BLUE, "CISA KEV additions"),
+    ("wild", C_YELLOW, "Exploited (Vulners wildExploited, all of KEV included)"),
+    ("pubs", C_RED, "CVE publications"),
+)
+
+
+def _percent_axis(ax, values):
+    """A log y axis in percent of the starting level, ticks at doublings."""
+    lo, hi = min(values), max(values)
+    ax.set_yscale("log")
+    ax.set_ylim(lo / 1.15, hi * 1.18)
+    ticks = [v for v in (12.5, 25, 50, 100, 200, 400, 800, 1600) if lo / 1.15 <= v <= hi * 1.18]
+    ax.set_yticks(ticks)
+    ax.yaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:g}%"))
+
+
+def plot_exploitation_trends_indexed(stats, anchor_date, anchor_month_complete=False, wild_cve_first_seen=None,
+                                     output_filename="cve_monthly_stats_comparison_exploitation_trends_indexed.png"):
+    """The three series from one start: each month as a percentage of the
+    series' own trend level in the first month (100%), on one log axis. The
+    bold lines are the robust growth trends (``robust_log_trend``), straight on
+    a log axis, so their slopes are the yearly rates; the thin lines are the
+    months themselves. Local only for now — not in CHART_FILES."""
+    p = _prep_exploitation_trends(stats, anchor_date, anchor_month_complete, wild_cve_first_seen)
+    if p is None or not all(p[k]["trend"] for k, _, _ in _TREND_SERIES):
+        return
+    x = p["x"]
+    pct = lambda srs: f"{(srs['trend']['annual'] - 1) * 100:+.0f}%"   # noqa: E731
+
+    plt.style.use("dark_background")
+    fig, ax = plt.subplots(figsize=(16, 10), facecolor="#1E1E1E")
+    ax.set_facecolor("#1E1E1E")
+    allv = []
+    for key, color, name in _TREND_SERIES:
+        srs = p[key]
+        allv += srs["pct"] + srs["trend_pct"]["fit"]
+        ax.plot(x, srs["pct"], color=color, linewidth=1.6, marker="o", markersize=4, alpha=0.5, zorder=2)
+        ax.plot(x, srs["trend_pct"]["fit"], color=color, linewidth=4.0, zorder=3,
+                label=f"{name}: trend {pct(srs)} a year")
+        end = srs["trend_pct"]["fit"][-1]
+        t = ax.annotate(f"{end:.0f}%", xy=(x[-1], end), xytext=(8, 0), textcoords="offset points",
+                        ha="left", va="center", fontsize=15, fontweight="bold", color=color, zorder=6)
+        t.set_path_effects([path_effects.Stroke(linewidth=3, foreground="#1E1E1E"), path_effects.Normal()])
+    pubs = p["pubs"]
+    t = ax.annotate(f"{p['last_lbl']}: {pubs['pct'][-1]:.0f}%", xy=(x[-1], pubs["pct"][-1]), xytext=(-10, 4),
+                    textcoords="offset points", ha="right", va="bottom", fontsize=14, fontweight="bold",
+                    color=C_RED, zorder=6)
+    t.set_path_effects([path_effects.Stroke(linewidth=3, foreground="#1E1E1E"), path_effects.Normal()])
+    ax.axhline(100, color="#A4B0BE", linewidth=1.2, linestyle=(0, (2, 3)), zorder=1)
+    _percent_axis(ax, allv)
+    ax.set_xlim(datetime(p["months"][0].year, p["months"][0].month, 1),
+                datetime(p["last"].year, p["last"].month, 1) + timedelta(days=75))
+    ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=(1, 4, 7, 10)))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    ax.tick_params(colors="#CCCCCC", labelsize=14)
+    for label in ax.get_xticklabels() + ax.get_yticklabels():
+        label.set_fontweight("bold")
+    ax.set_ylabel(f"% of the series' own {p['first_lbl']} trend level (log scale)",
+                  fontsize=16, fontweight="bold", color="#FFFFFF", labelpad=12)
+    ax.grid(True, color="#444444", linestyle="--", alpha=0.6, linewidth=0.9)
+    ax.set_axisbelow(True)
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+    for spine in ["left", "bottom"]:
+        ax.spines[spine].set_color("#555555")
+    since = pubs["above_since"]
+    ax.set_title(
+        f"Exploitation vs Volume from One Start ({p['first_lbl']} = 100%)\n"
+        f"Trend a year: publications {pct(pubs)}, CISA KEV {pct(p['kev'])}, exploited CVEs {pct(p['wild'])}",
+        fontsize=20, fontweight="bold", color="#FFFFFF", pad=18,
+    )
+    handles, labels = ax.get_legend_handles_labels()
+    fig.legend(handles[::-1], labels[::-1], loc="lower center", bbox_to_anchor=(0.08, 0.06, 0.88, 0.05),
+               mode="expand", ncol=1, facecolor="#262626", edgecolor="#444444", fontsize=13.5,
+               borderpad=0.6, framealpha=0.95)
+    plt.figtext(
+        0.5, 0.03,
+        "Bold: growth trend fitted robustly (Theil–Sen on log counts); thin: the months themselves. "
+        "Complete months only."
+        + (f" Publications above their trend band since {since.strftime('%b %Y')}." if since else ""),
+        ha="center", fontsize=12.5, color="#A4B0BE", style="italic",
+    )
+    plt.figtext(
+        0.5, 0.006, f"{_stamp()} | Data Sources: Vulners CVE Archive, CISA KEV catalog",
+        ha="center", fontsize=12, color="#747D8C", style="italic", fontweight="bold",
+    )
+    plt.tight_layout(rect=[0.01, 0.20, 0.99, 0.99])
+    _add_logo(fig)
+    plt.savefig(output_filename, dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.close()
+    saved_files_log.append(f"Saved indexed exploitation-trends chart to {os.path.abspath(output_filename)}")
 
 # ── The CNA roster: how many CNAs exist at all ───────────────────────────────
 # The denominator of the active-CNA chart. cve.org's "List of Partners" page is
@@ -1734,6 +2117,9 @@ def count_monthly_cves(file_path, cut_off_date=None):
     # for the Vulners version of the exploitation-vs-volume slide.
     wild_first_seen = collections.Counter()
     wild_sources = collections.Counter()
+    # wild_cve_first_seen[CVE id] = that same earliest firstSeen, per CVE, so
+    # the flagged set can be merged with the CISA KEV catalog by id.
+    wild_cve_first_seen = {}
 
     if cut_off_date:
         now = datetime.strptime(cut_off_date, "%Y-%m-%d")
@@ -1800,6 +2186,8 @@ def count_monthly_cves(file_path, cut_off_date=None):
                         seen = [d for d in seen if len(d) == 10]
                         if seen:
                             wild_first_seen[min(seen)] += 1
+                            if item.get("id"):
+                                wild_cve_first_seen[str(item["id"]).upper()] = min(seen)
                         for s in srcs:
                             if s.get("type"):
                                 wild_sources[s["type"]] += 1
@@ -1965,6 +2353,7 @@ def count_monthly_cves(file_path, cut_off_date=None):
         "fanout_records": fanout_records,
         "epss_rows": epss_rows,
         "wild_first_seen": wild_first_seen,
+        "wild_cve_first_seen": wild_cve_first_seen,
         "wild_sources": wild_sources,
     }
 
@@ -6772,16 +7161,30 @@ def _run_monthly(results, report_buf):
     slide_inputs["epss"] = dict(epss_rows=results.get("epss_rows", []), anchor_date=anchor_date)
     # Kernel bug-fix discovery against CVE publishing (local only).
     slide_inputs["kernel_fixes"] = dict(daily_counts_kernel=results.get("daily_counts_kernel", {}), anchor_date=anchor_date)
-    # Exploitation signals against publication volume (web chart and slides).
+    # Exploitation signals against publication volume (slides). Its web chart
+    # left the page for the trends chart below and is drawn on local runs only.
     slide_inputs["exploitation_vs_volume"] = dict(
         stats=stats, anchor_date=anchor_date, anchor_month_complete=anchor_month_complete,
     )
-    plot_exploitation_vs_volume(stats, anchor_date, anchor_month_complete=anchor_month_complete)
+    if _SLIDES:
+        plot_exploitation_vs_volume(stats, anchor_date, anchor_month_complete=anchor_month_complete)
     # The same slide with Vulners' wildExploited flag in place of KEV (local only).
     slide_inputs["exploitation_wild"] = dict(
         stats=stats, anchor_date=anchor_date, anchor_month_complete=anchor_month_complete,
         wild_first_seen=results.get("wild_first_seen", {}), wild_sources=results.get("wild_sources", {}),
     )
+    # Publications, CISA KEV and wildExploited with robust growth trends: the
+    # page's exploitation chart (#monthly-exploitation), and its slide. The
+    # one-start (indexed) variant is local only.
+    slide_inputs["exploitation_trends"] = dict(
+        stats=stats, anchor_date=anchor_date, anchor_month_complete=anchor_month_complete,
+        wild_cve_first_seen=results.get("wild_cve_first_seen", {}),
+    )
+    plot_exploitation_trends(stats, anchor_date, anchor_month_complete=anchor_month_complete,
+                             wild_cve_first_seen=results.get("wild_cve_first_seen", {}))
+    if _SLIDES:
+        plot_exploitation_trends_indexed(stats, anchor_date, anchor_month_complete=anchor_month_complete,
+                                         wild_cve_first_seen=results.get("wild_cve_first_seen", {}))
     # One CVE's downstream advisories, for the fan-out slide (local only).
     fanout_records = results.get("fanout_records", {})
     slide_inputs["fanout_downstream"] = dict(record=fanout_records.get(FANOUT_CVE))

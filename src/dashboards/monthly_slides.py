@@ -79,6 +79,8 @@ SLIDE_FILES = {
     "exploitation_vs_volume": "cve_monthly_stats_comparison_exploitation_vs_volume_slide.png",
     "exploitation_share": "cve_monthly_stats_comparison_exploitation_share_slide.png",
     "exploitation_wild": "cve_monthly_stats_comparison_exploitation_wild_vs_volume_slide.png",
+    "exploitation_trends": "cve_monthly_stats_comparison_exploitation_trends_slide.png",
+    "exploitation_trends_indexed": "cve_monthly_stats_comparison_exploitation_trends_indexed_slide.png",
     "kernel_fixes": "cve_monthly_stats_comparison_kernel_fixes_vs_publishing_slide.png",
     "epss_by_year": "cve_monthly_stats_comparison_epss_recency_by_year_slide.png",
     "epss_cohort_age": "cve_monthly_stats_comparison_epss_recency_cohort_age_slide.png",
@@ -210,6 +212,8 @@ def _end_labels(ax, items, min_gap=0.088, dx=0.0):
         return
     y0, y1 = ax.get_ylim()
     to_frac = lambda y: (y - y0) / (y1 - y0)   # noqa: E731
+    if ax.get_yscale() == "log":
+        to_frac = lambda y: (np.log(y) - np.log(y0)) / (np.log(y1) - np.log(y0))   # noqa: E731
     items = sorted(items, key=lambda it: it["y"], reverse=True)
     targets = [to_frac(it["y"]) for it in items]
     ys = m._spread_label_ys(targets, min_gap, 0.02, 0.98)
@@ -2337,7 +2341,6 @@ _KEV_LABELS = {
     "axis": "CISA KEV additions per month",
     "end": "CISA KEV additions",            # the right-margin label
     "note": "KEV",                          # the running month's note
-    "note_above": False,                    # that note over the corridor, not under it
     "basis": "",                            # appended to the subtitle
     "margin": "",                           # small print under the right-margin labels
 }
@@ -2351,8 +2354,11 @@ _WILD_LABELS = {
     "note": "flagged",
     # The corridor's floor sits near the axis here, so the note under it
     # would run into the tick labels.
-    "note_above": True,
     "basis": "  ·  dated by earliest firstSeen",
+    # Its line hugs the corridor floor and its newest month is an outlier, so
+    # the corridor label and the running-month note are placed clear of both
+    # lines rather than at the KEV slide's fixed spots.
+    "avoid_lines": True,
 }
 
 
@@ -2390,6 +2396,138 @@ def slide_exploitation_wild(stats, anchor_date, anchor_month_complete=False, wil
           f"{d['kev'][0]} → {d['kev'][-1]}, range {min(d['kev'])}–{max(d['kev'])}, "
           f"average {sum(d['kev']) / len(d['kev']):.0f}"
           + (f"; {d['partial']['lbl']}: {d['partial']['kev']}" if d["partial"] else ""))
+
+
+def _pct(multiple):
+    """A yearly growth multiple as a signed percentage: 1.19 -> "+19%"."""
+    return f"{(multiple - 1) * 100:+.0f}%"
+
+
+def slide_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wild_cve_first_seen=None,
+                              output_filename=SLIDE_FILES["exploitation_trends"]):
+    """Publications, wildExploited (which includes every KEV CVE) and CISA KEV,
+    one panel each on a shared time axis, real monthly counts on log axes that
+    all span the same ratio: a doubling is the same height in every panel, so
+    the slopes compare directly without the lines tangling. The two exploited
+    panels carry a robust growth trend (``monthly.robust_log_trend``) and its
+    ±2σ band; months outside the band are ringed and labelled."""
+    p = m._prep_exploitation_trends(stats, anchor_date, anchor_month_complete, wild_cve_first_seen)
+    if p is None:
+        return
+    x, pubs, wild, kev = p["x"], p["pubs"], p["wild"], p["kev"]
+    if not all(s_["trend"] for s_ in (pubs, wild, kev)):
+        return
+    p_pct, w_pct, k_pct = (_pct(s_["trend"]["annual"]) for s_ in (pubs, wild, kev))
+    since = pubs["above_since"]
+    fig = _slide(
+        f"Trend a year: CVE publications {p_pct}, CISA KEV {k_pct}, exploited {w_pct}",
+        f"{p['first_lbl']} → {p['last_lbl']}, complete months"
+        + (f"  ·  publications above their band since {since.strftime('%b %Y')}" if since else "")
+        + "  ·  log axes, same ratio in every panel  ·  dashed: robust trend (Theil–Sen on log counts), "
+        f"shaded ±2σ, ringed: outside it  ·  wildExploited includes all {p['kev_total']:,} KEV CVEs",
+    )
+    panels = [
+        ("CVE publications", pubs, m.C_RED, p_pct),
+        ("CISA KEV additions", kev, m.C_BLUE, k_pct),
+        ("Exploited (wildExploited)", wild, m.C_YELLOW, w_pct),
+    ]
+
+    limits = m._trend_panel_ylim([srs for _, srs, _c, _p in panels])
+    top, bottom, gap = CONTENT_TOP, AXES_BOTTOM, 0.022
+    h = (top - bottom - 2 * gap) / 3
+    last = p["last_lbl"]
+    axes = []
+    for k, (name, srs, color, pct) in enumerate(panels):
+        ax = fig.add_axes([0.085, top - (k + 1) * h - k * gap, 0.665, h], sharex=axes[0] if axes else None)
+        axes.append(ax)
+        _style_axes(ax)
+        if k == 0:
+            # The shared x axis is final before any outlier label is placed:
+            # placement measures the labels against it.
+            _exploitation_xaxis(ax, p)
+        ax.set_yscale("log")
+        ax.set_ylim(*limits[k])
+        ax.yaxis.set_major_locator(matplotlib.ticker.LogLocator(base=10, subs=(1, 2, 5)))
+        ax.yaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:,.0f}"))
+        ax.tick_params(axis="y", labelsize=F_SMALL)
+
+        if srs["trend"]:
+            t = srs["trend"]
+            ax.fill_between(x, t["lo"], t["hi"], color=color, alpha=0.13, linewidth=0, zorder=1)
+            ax.plot(x, t["fit"], color=color, linewidth=1.8, linestyle=(0, (6, 4)), zorder=2)
+        ax.plot(x, srs["values"], color=color, linewidth=2.0, marker="o", markersize=3.5, zorder=3)
+
+        if srs["trend"]:
+            m._label_trend_outliers(ax, p, srs, color, F_SMALL, lambda t: _stroke(t, 2.5))
+
+        sub = f"trend {pct} a year  ·  {srs['values'][-1]:,} in {last}"
+        n_out = len(srs["trend"]["outliers"])
+        sub2 = f"{n_out} month{'s' if n_out != 1 else ''} outside the band" if n_out else "no month outside the band"
+        y_lab = srs["trend"]["fit"][-1]
+        _end_labels(ax, [{"y": y_lab, "color": color, "main": name, "sub": f"{sub}\n{sub2}"}], min_gap=0.3)
+        if k < 2:
+            ax.tick_params(axis="x", labelbottom=False)
+        else:
+            ax.tick_params(axis="x", labelsize=F_TICK - 1)
+    axes[1].set_ylabel("per month (log scale)", fontsize=F_TICK, color=INK2)
+    _save(fig, output_filename, "exploitation trends")
+    for name, srs in (("wildExploited", wild), ("CISA KEV", kev)):
+        t = srs["trend"]
+        print(f"{name}: trend ×{t['annual']:.2f} a year, σ {t['sigma']:.2f}, outliers "
+              + (", ".join(f"{p['months'][i].strftime('%b %Y')} ({srs['values'][i]})" for i in t["outliers"])
+                 or "none"))
+
+
+def slide_exploitation_trends_indexed(stats, anchor_date, anchor_month_complete=False, wild_cve_first_seen=None,
+                                      output_filename=SLIDE_FILES["exploitation_trends_indexed"]):
+    """The trends slide's three series from one start, the way the original
+    exploitation slide lines its lines up: each month as a percentage of the
+    series' own trend level in the first month (100%), on one log axis. Bold:
+    the robust growth trends, straight lines whose slopes are the yearly rates;
+    thin: the months themselves."""
+    p = m._prep_exploitation_trends(stats, anchor_date, anchor_month_complete, wild_cve_first_seen)
+    if p is None or not all(p[k]["trend"] for k, _, _ in m._TREND_SERIES):
+        return
+    x, pubs = p["x"], p["pubs"]
+    rate = {k: _pct(p[k]["trend"]["annual"]) for k, _, _ in m._TREND_SERIES}
+    since = pubs["above_since"]
+    fig = _slide(
+        f"From one start: publications {rate['pubs']} a year, CISA KEV {rate['kev']}, exploited {rate['wild']}",
+        f"{p['first_lbl']} → {p['last_lbl']}, complete months  ·  100% = each series' own trend level in "
+        f"{p['first_lbl']}, log scale  ·  bold: growth trend fitted robustly (Theil–Sen on log counts), "
+        f"thin: the months themselves"
+        + (f"  ·  publications above their trend band since {since.strftime('%b %Y')}" if since else ""),
+    )
+    ax = fig.add_axes([0.085, AXES_BOTTOM, 0.665, CONTENT_TOP - AXES_BOTTOM])
+    _style_axes(ax)
+    allv = []
+    for key, color, _ in m._TREND_SERIES:
+        srs = p[key]
+        allv += srs["pct"] + srs["trend_pct"]["fit"]
+        ax.plot(x, srs["pct"], color=color, linewidth=1.3, marker="o", markersize=3, alpha=0.45, zorder=2)
+        ax.plot(x, srs["trend_pct"]["fit"], color=color, linewidth=3.2, zorder=3)
+    ax.axhline(100, color=INK2, linewidth=1.0, linestyle=(0, (2, 3)), zorder=1)
+    m._percent_axis(ax, allv)
+    ax.set_ylabel(f"% of the {p['first_lbl']} trend level (log)", fontsize=F_TICK, color=INK2)
+    _exploitation_xaxis(ax, p)
+    t = ax.annotate(f"{p['last_lbl']}: {pubs['pct'][-1]:.0f}%", xy=(x[-1], pubs["pct"][-1]), xytext=(-9, 3),
+                    textcoords="offset points", ha="right", va="bottom", fontsize=F_SMALL, fontweight="bold",
+                    color=m.C_RED, zorder=6)
+    _stroke(t, 2.5)
+    last = p["last_lbl"]
+    names = {"pubs": "CVE publications", "wild": "Exploited (wildExploited)", "kev": "CISA KEV additions"}
+    _end_labels(ax, [
+        {"y": p[k]["trend_pct"]["fit"][-1], "color": color, "main": names[k],
+         "sub": f"trend {rate[k]} a year → {p[k]['trend_pct']['fit'][-1]:.0f}%\n"
+                f"{p[k]['values'][-1]:,} in {last} = {p[k]['pct'][-1]:.0f}%"}
+        for k, color, _ in m._TREND_SERIES
+    ], min_gap=0.13)
+    _save(fig, output_filename, "exploitation trends, indexed")
+
+
+# Shared with the web charts; lives in monthly.
+_place_clear = m._place_clear
 
 
 def _draw_exploitation_vs_volume(d, output_filename, lb, what):
@@ -2433,6 +2571,7 @@ def _draw_exploitation_vs_volume(d, output_filename, lb, what):
     t = ax2.text(x[-1], k_lo + 0.04 * (k_hi - k_lo), band_lbl,
                  ha="right", va="bottom", fontsize=F_SMALL, color=m.C_YELLOW, style="italic", zorder=5)
     _stroke(t, 2.5)
+    band_txt = t
 
     ax.plot(x, pubs, color=m.C_RED, linewidth=3.2, marker="o", markersize=3.5, zorder=4)
     ax2.plot(x, kev, color=m.C_YELLOW, linewidth=2.2, marker="o", markersize=3.5, zorder=4)
@@ -2450,13 +2589,12 @@ def _draw_exploitation_vs_volume(d, output_filename, lb, what):
                  markeredgewidth=1.6, zorder=4)
         # The note sits under the corridor, beside the hollow KEV marker: the
         # only strip the steep dashed tails never cross.
-        above = lb.get("note_above")
         t = ax2.annotate(f"{part['lbl']} (incomplete)\n{part['pub']:,} CVEs · {part['kev']} {lb['note']}",
-                         xy=(part["x"], max(k_hi, part["kev"]) if above else k_lo),
-                         xytext=(4, 10 if above else -6), textcoords="offset points",
-                         ha="right", va="bottom" if above else "top", fontsize=F_SMALL, color=INK2, style="italic",
+                         xy=(part["x"], k_lo), xytext=(4, -6), textcoords="offset points",
+                         ha="right", va="top", fontsize=F_SMALL, color=INK2, style="italic",
                          linespacing=1.3, zorder=5)
         _stroke(t, 2.5)
+        part_txt = t
 
     _exploitation_xaxis(ax, d, with_partial=True)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{int(v):,}"))
@@ -2474,7 +2612,77 @@ def _draw_exploitation_vs_volume(d, output_filename, lb, what):
                      xycoords=matplotlib.transforms.blended_transform_factory(fig.transFigure, ax2.transData),
                      ha="left", va="top", fontsize=F_SMALL, color=INK3, style="italic",
                      linespacing=1.3, annotation_clip=False)
+    if lb.get("avoid_lines"):
+        _place_exploitation_labels(ax, ax2, d, band_txt, part_txt if part else None, band_lbl)
     _save(fig, output_filename, what)
+
+
+def _place_exploitation_labels(ax, ax2, d, band_txt, part_txt, band_lbl):
+    """Keep the corridor label and the running month's note off both lines and
+    off the outlier notes, wherever this month's data puts them.
+
+    Used by the wildExploited slide, whose series sits low in its corridor and
+    whose newest complete month is itself an outlier: the fixed spots the KEV
+    slide uses (corridor label at its floor, running-month note beside the last
+    marker) land on the line and on the outlier's label there.
+    """
+    x, pubs, kev = d["x"], d["pubs"], d["kev"]
+    k_lo, k_hi = d["band"]
+    part = d["partial"]
+    to_ax2 = ax2.transData.inverted().transform
+    from_ax = ax.transData.transform
+    pubs_on_ax2 = [to_ax2(from_ax((mdates.date2num(xi), p)))[1] for xi, p in zip(x, pubs)]
+    lines = [(ax2, list(x), list(kev)), (ax2, list(x), pubs_on_ax2)]
+    if part:
+        lines.append((ax2, [x[-1], part["x"]], [kev[-1], part["kev"]]))
+        p_part = to_ax2(from_ax((mdates.date2num(part["x"]), part["pub"])))[1]
+        lines.append((ax2, [x[-1], part["x"]], [pubs_on_ax2[-1], p_part]))
+    # The outlier notes are fixed; treat each one's box as an obstacle too.
+    renderer = ax2.figure.canvas.get_renderer()
+    inv = ax2.transData.inverted()
+    for t in ax2.texts:
+        if t is band_txt or t is part_txt or "outside the band" not in t.get_text():
+            continue
+        bb = t.get_window_extent(renderer)
+        (x0, y0), (x1, y1) = inv.transform([(bb.x0, bb.y0), (bb.x1, bb.y1)])
+        xs = [mdates.num2date(v).replace(tzinfo=None) for v in (x0, x1, x1, x0, x0, x1)]
+        lines.append((ax2, xs, [y0, y0, y1, y1, y0, y1]))
+
+    # The running month's note: beside the hollow publications marker if the
+    # gap between the two lines is wide enough, else on one line in the strip
+    # under the corridor's floor, which neither line enters (a complete month
+    # below the floor would be an outlier, and publications run far above it).
+    if part_txt is not None:
+        p_xy = (part["x"], p_part)
+        one = part_txt.get_text().replace("\n", ": ", 1)
+        _place_clear(part_txt, [
+            (p_xy, (-12, 0), "right", "center", None),
+            (p_xy, (-12, -14), "right", "top", None),
+            (p_xy, (-12, 14), "right", "bottom", None),
+            ((part["x"], k_lo), (4, -2), "right", "top", one),
+        ], lines, inside=ax2)
+        bb = part_txt.get_window_extent(renderer)
+        (x0, y0), (x1, y1) = inv.transform([(bb.x0, bb.y0), (bb.x1, bb.y1)])
+        xs = [mdates.num2date(v).replace(tzinfo=None) for v in (x0, x1, x1, x0, x0, x1)]
+        lines.append((ax2, xs, [y0, y0, y1, y1, y0, y1]))
+
+    # The corridor label: under the corridor's floor first — no complete month
+    # can sit there without being an outlier, and the publications line runs
+    # far above it — then anywhere inside the band, on one line or two.
+    head, _, tail = band_lbl.partition(": ")
+    two = f"{head}:\n{tail}" if tail else band_lbl
+    pad = 0.04 * (k_hi - k_lo)
+    lbl = ax2.annotate(band_lbl, xy=(x[-1], k_lo + pad), xytext=(0, 0), textcoords="offset points",
+                       ha="right", va="bottom", fontsize=band_txt.get_fontsize(), color=m.C_YELLOW,
+                       style="italic", linespacing=1.25, zorder=5)
+    _stroke(lbl, 2.5)
+    band_txt.remove()
+    cands = [((x[-1], k_lo + pad), (0, 0), "right", "bottom", band_lbl)]
+    cands += [((xi, k_lo), (0, -2), "left", "top", band_lbl) for xi in x]
+    for text in (band_lbl, two):
+        for y, va in ((k_hi - pad, "top"), (k_lo + pad, "bottom")):
+            cands += [((xi, y), (0, 0), "left", va, text) for xi in x]
+    _place_clear(lbl, cands, lines, inside=ax2)
 
 
 def slide_exploitation_share(stats, anchor_date, anchor_month_complete=False,
@@ -2972,6 +3180,8 @@ _RENDERERS = [
     ("exploitation_vs_volume", slide_exploitation_vs_volume),
     ("exploitation_vs_volume", slide_exploitation_share),
     ("exploitation_wild", slide_exploitation_wild),
+    ("exploitation_trends", slide_exploitation_trends),
+    ("exploitation_trends", slide_exploitation_trends_indexed),
     ("kernel_fixes", slide_kernel_fixes),
     ("epss", slide_epss_by_year),
     ("epss", slide_epss_cohort_age),
