@@ -65,6 +65,7 @@ SLIDE_FILES = {
     "projections": "cve_monthly_stats_comparison_projection_slide.png",
     "candidate_track": "cve_monthly_stats_comparison_candidate_track_slide.png",
     "active_cnas": "cve_monthly_stats_comparison_active_cnas_slide.png",
+    "daily_by_month": "cve_monthly_stats_comparison_daily_by_month_slide.png",
     "status_yearly": "cve_monthly_stats_comparison_status_yearly_slide.png",
     "status_weekly_absolute": "cve_monthly_stats_comparison_status_weekly_absolute_slide.png",
     "status_weekly_normalized": "cve_monthly_stats_comparison_status_weekly_normalized_slide.png",
@@ -568,6 +569,78 @@ def _draw_names(ax, positions, all_items, geom, column=0, colors=None):
             column - 0.33 * x_in, y, item, ha="right", va="center",
             color=INK, fontsize=10.5, fontweight="bold",
         )
+
+
+# ── 2b. CVEs per day, one panel per month ───────────────────────────────────
+
+def slide_daily_by_month(daily_counts, anchor_date, anchor_month_complete=False,
+                         output_filename=SLIDE_FILES["daily_by_month"]):
+    """CVEs published per day, a small panel per month on one shared y axis.
+    Same prep as the web chart."""
+    p = m._prep_daily_by_month(daily_counts, anchor_date, anchor_month_complete)
+    if p is None:
+        return
+    panels = p["panels"]
+    n = len(panels)
+    ncols = n if n <= 4 else -(-n // 2)
+    nrows = -(-n // ncols)
+    a, b, busiest = p["first_whole"], p["last_whole"], p["busiest"]
+
+    title = f"CVEs published per day, {p['year']}"
+    if a is not b and a["median"]:
+        title = (f"The median day went from {a['median']:,.0f} CVEs in {a['short']} "
+                 f"to {b['median']:,.0f} in {b['short']}")
+    fig = _slide(
+        title,
+        "One panel per month, every panel on the same scale  ·  bar = CVEs published that day, "
+        "gray = Saturday/Sunday  ·  dashed = the month's median day  ·  "
+        f"red = busiest day so far ({busiest['date'].strftime('%b')} {busiest['date'].day}, "
+        f"{busiest['count']:,})",
+    )
+    left, right, bottom, top = 0.065, 0.975, 0.09, CONTENT_TOP - 0.035
+    gs = fig.add_gridspec(nrows, ncols, left=left, right=right, bottom=bottom, top=top,
+                          wspace=0.12, hspace=0.42)
+    y_top = p["y_max"] * 1.18
+    first_ax = None
+    for i, panel in enumerate(panels):
+        r, c = divmod(i, ncols)
+        ax = fig.add_subplot(gs[r, c], sharey=first_ax)
+        first_ax = first_ax or ax
+        _style_axes(ax)
+        ax.grid(False, axis="x")
+        days = [x for x in panel["days"] if not x["future"]]
+        ax.bar([x["day"] for x in days], [x["count"] for x in days], 0.78,
+               color=[m.C_RED if x is busiest else INK3 if x["weekend"] else m.C_BLUE for x in days],
+               zorder=3)
+        future = [x["day"] for x in panel["days"] if x["future"]]
+        if future:
+            ax.axvspan(future[0] - 0.5, future[-1] + 0.5, color=INK, alpha=0.05, zorder=1)
+        ax.plot([0.5, days[-1]["day"] + 0.5], [panel["median"]] * 2, color=m.C_YELLOW,
+                linewidth=1.6, linestyle=(0, (5, 3)), zorder=4)
+        # Inside the panel, over its first days: the gutter between panels is
+        # too narrow for a label hanging off the line's end.
+        t = ax.annotate(f"median {panel['median']:,.0f}", xy=(0.6, panel["median"]),
+                        xytext=(0, 3), textcoords="offset points", ha="left", va="bottom",
+                        fontsize=F_SMALL, fontweight="bold", color=m.C_YELLOW, zorder=6)
+        _stroke(t, 2.5)
+        pk = panel["peak"]
+        t = ax.annotate(f"{pk['count']:,}", xy=(pk["day"], pk["count"]), xytext=(0, 3),
+                        textcoords="offset points", ha="center", va="bottom", fontsize=F_SMALL,
+                        fontweight="bold", color=m.C_RED if pk is busiest else INK, zorder=6)
+        _stroke(t, 2.5)
+        span = f" 1–{panel['days_seen']}" if panel["partial"] else ""
+        ax.set_title(f"{panel['short']}{span}  ·  {panel['total']:,}", fontsize=F_LABEL,
+                     fontweight="bold", color=INK, pad=6)
+        ax.set_xlim(0.3, 31.7)
+        ax.set_ylim(0, y_top)
+        ax.set_xticks([1, 8, 15, 22, 29])
+        ax.tick_params(labelsize=F_SMALL)
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, pos: f"{int(v):,}"))
+        if c:
+            ax.tick_params(labelleft=False)
+        else:
+            ax.set_ylabel("CVEs per day", fontsize=F_SMALL, color=INK2)
+    _save(fig, output_filename, "CVEs per day by month")
 
 
 # ── 3. Monthly flow by CNA ──────────────────────────────────────────────────
@@ -2879,6 +2952,7 @@ def slide_epss_recall(epss_rows, anchor_date, output_filename=SLIDE_FILES["epss_
 _RENDERERS = [
     ("yearly_cumulative", slide_yearly_cumulative),
     ("ytd_growth", slide_ytd_growth),
+    ("daily_by_month", slide_daily_by_month),
     ("sankey_flow", slide_sankey_flow),
     ("incomplete_month", slide_incomplete_month),
     ("active_cnas", slide_active_cnas),

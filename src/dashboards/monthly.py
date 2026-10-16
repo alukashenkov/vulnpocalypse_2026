@@ -99,6 +99,7 @@ def clamp_growth(g_m):
 CHART_FILES = [
     "cve_monthly_stats_comparison_yearly_cumulative.png",
     "cve_monthly_stats_comparison_ytd_growth.png",
+    "cve_monthly_stats_comparison_daily_by_month.png",
     "cve_monthly_stats_comparison_sankey_monthly.png",
     "cve_monthly_stats_comparison_incomplete_month.png",
     "cve_monthly_stats_comparison_active_cnas.png",
@@ -116,6 +117,7 @@ CHART_FILES = [
 CHART_LINKS = {
     "cve_monthly_stats_comparison_yearly_cumulative.png": ("cumulative", "Cumulative CVEs by year"),
     "cve_monthly_stats_comparison_ytd_growth.png": ("pace", "Year-over-year pace"),
+    "cve_monthly_stats_comparison_daily_by_month.png": ("daily", "CVEs per day, by month"),
     "cve_monthly_stats_comparison_sankey_monthly.png": ("cna-flow", "Monthly flow by CNA"),
     "cve_monthly_stats_comparison_active_cnas.png": ("active-cnas", "Active CNAs by month"),
     "cve_monthly_stats_comparison_incomplete_month.png": ("month-comparison", "Month-to-month comparison"),
@@ -132,6 +134,7 @@ CHART_LINKS = {
 CHART_GROUPS = {
     "cve_monthly_stats_comparison_yearly_cumulative.png": "Volume",
     "cve_monthly_stats_comparison_ytd_growth.png": "Volume",
+    "cve_monthly_stats_comparison_daily_by_month.png": "Volume",
     "cve_monthly_stats_comparison_sankey_monthly.png": "Volume",
     "cve_monthly_stats_comparison_incomplete_month.png": "Volume",
     "cve_monthly_stats_comparison_active_cnas.png": "Volume",
@@ -168,6 +171,15 @@ CHART_CAPTIONS = {
         "This is the speedometer, and the needle is pinned. The current year sits "
         "well above the prior year's line and stays there. The two lines shook "
         "hands once, early on, and have not spoken since."
+    ),
+    "cve_monthly_stats_comparison_daily_by_month.png": (
+        "The speedometer, taken apart one day at a time. Each panel is a month "
+        "and each bar is one day's worth of new CVEs, all on the same scale, so "
+        "a bar means the same number wherever it stands. Gray bars are weekends, "
+        "the only days the pipeline still slows down; the dashed yellow line is "
+        "the month's median day, and the number on top is its busiest day. Read "
+        "left to right and the floor rises, not just the spikes: an ordinary "
+        "weekday late in the year looks like a record day from its first months."
     ),
     "cve_monthly_stats_comparison_sankey_monthly.png": (
         "The lines above tell you how fast; this one tells you who. The same "
@@ -2498,6 +2510,23 @@ def print_all_months_table(
     return all_top_names
 
 
+def _top_n_names(primary, others=()):
+    """The ``TOP_N`` CNAs of ``primary`` (CNA -> count) that published anything.
+
+    A tie at the cut is broken by the CNAs' combined count in ``others`` (the
+    comparison's other periods), then by name, so the CNA that matters more to
+    the picture as a whole gets the lane and the pick is the same on every run
+    (set iteration order, and with it a plain sort's tie order, varies per
+    process).
+    """
+    others = [d for d in others if d]
+
+    def key(cna):
+        return (-primary.get(cna, 0), -sum(d.get(cna, 0) for d in others), cna)
+
+    return {c for c in sorted(primary, key=key)[:TOP_N] if primary.get(c, 0) > 0}
+
+
 def print_combined_incomplete_month_table(
     title,
     data_2025_full,
@@ -2534,13 +2563,11 @@ def print_combined_incomplete_month_table(
             }
         )
 
-    # Top CNAs from the incomplete/partial periods of 2025 and 2026
-    top_c25p = sorted(combined, key=lambda x: x["25_part"], reverse=True)[:TOP_N]
-    top_c26p = sorted(combined, key=lambda x: x["26_part"], reverse=True)[:TOP_N]
-
+    # Top CNAs from the incomplete/partial periods of 2025 and 2026; a tie at
+    # the cut goes to the CNA with more in the other displayed periods.
     top_names = (
-        {r["name"] for r in top_c25p if r["25_part"] > 0}
-        | {r["name"] for r in top_c26p if r["26_part"] > 0}
+        _top_n_names(data_2025_partial, (data_2026_partial, prev_data_2026_full))
+        | _top_n_names(data_2026_partial, (data_2025_partial, prev_data_2026_full))
     )
 
     top_cnas = [r for r in combined if r["name"] in top_names]
@@ -3809,16 +3836,24 @@ def _prep_incomplete_sankey(
         {"label": f"{prev_year} ({range_label})", "data": data_2025_partial},
     ]
 
-    # Sort top CNAs by their current-month (pivot) volume, and drop the ones that
-    # published nothing in it. ``top_names`` also carries the leaders of the
-    # previous month and of last year, so a CNA can be named here purely for a
-    # column that is not the subject of the chart; with no pivot volume its lane
-    # is drawn at the minimum band height across all three stops and reads as a
-    # flow that does not exist. What it did publish in the other two columns is
-    # not lost — it joins "Others" there.
+    # Lanes: every CNA ``top_names`` names (the leaders of all three displayed
+    # columns), sorted by current-month (pivot) volume. A CNA that leads a
+    # flanking column but published nothing in the pivot range keeps its own
+    # lane too, below the pivot publishers and ordered by its larger flank: its
+    # lane pinches to nothing at the centre column, which is exactly what
+    # happened. Folding it into "Others" instead (as this once did) hid a
+    # previous-month leader — Oracle's 634 CVEs on Sep 1-15, say — inside the
+    # left column's "Others" and made that bar look like one giant CNA.
+    def flank(c):
+        return max(prev_data_partial.get(c, 0), data_2025_partial.get(c, 0))
+
     sorted_top_names = sorted(
         (c for c in top_names if data_2026_partial.get(c, 0) > 0),
         key=lambda c: data_2026_partial.get(c, 0),
+        reverse=True,
+    ) + sorted(
+        (c for c in top_names if data_2026_partial.get(c, 0) <= 0 and flank(c) > 0),
+        key=flank,
         reverse=True,
     )
     all_items = sorted_top_names + ["Others"]
@@ -3826,21 +3861,23 @@ def _prep_incomplete_sankey(
     stage_labels = [s["label"] for s in stages]
 
     # As in plot_custom_sankey_flow: the max(5, ...) floor sizes the bands so a
-    # near-empty lane stays visible, but the header must report the real data.
-    # Every lane now has pivot-month volume, but the flanking columns can still
-    # sit at 0 (a CNA that started publishing this month, say), and each of those
-    # would otherwise add 5 to that column's header.
+    # near-empty lane stays visible (and its name clear of its neighbours'),
+    # but the header must report the real data. The one exception is the pivot
+    # column of a lane named only for a flanking column: it gets no floor and
+    # pinches to a point there, rather than drawing a pivot-month flow that does
+    # not exist.
     raw_data = []
     exact_data = []
     totals = []
     display_totals = []
-    for stage in stages:
+    for s_idx, stage in enumerate(stages):
         stage_data = stage["data"]
         volumes = {}
         exact = {}
         for cna in sorted_top_names:
-            volumes[cna] = max(5, stage_data.get(cna, 0))
-            exact[cna] = stage_data.get(cna, 0)
+            v = stage_data.get(cna, 0)
+            volumes[cna] = 0 if (s_idx == 1 and v <= 0) else max(5, v)
+            exact[cna] = v
         others_val = sum(v for k, v in stage_data.items() if k not in sorted_top_names)
         volumes["Others"] = max(5, others_val)
         exact["Others"] = others_val
@@ -5917,6 +5954,206 @@ def plot_active_cnas(stats, anchor_date, anchor_month_complete=False,
     saved_files_log.append(f"Saved active-CNA chart to {os.path.abspath(output_filename)}")
 
 
+def _prep_daily_by_month(daily_counts, anchor_date, anchor_month_complete=False):
+    """Everything ``plot_daily_by_month`` draws, before any layout; ``None`` when
+    there is nothing to draw. Shared with the slide renderer.
+
+    One panel per month of the anchor year up to the anchor month, each holding
+    that month's CVEs published per calendar day (``daily_counts``, the same
+    records the monthly charts count). Days after the anchor are not data yet
+    and are flagged ``future``, never drawn as zeros. The headline compares
+    medians of whole months only, like every other part-month figure here.
+    """
+    year = anchor_date[:4]
+    anchor = date.fromisoformat(anchor_date[:10])
+    counts = daily_counts.get(year, {})
+    panels = []
+    for mo in range(1, anchor.month + 1):
+        first = date(int(year), mo, 1)
+        n_days = ((first.replace(day=28) + timedelta(days=4)).replace(day=1) - first).days
+        days = []
+        for d in range(1, n_days + 1):
+            cur = first.replace(day=d)
+            days.append({
+                "day": d,
+                "date": cur,
+                "count": counts.get(cur.strftime("%m-%d"), 0),
+                "weekend": cur.weekday() >= 5,
+                "future": cur > anchor,
+            })
+        seen = [x for x in days if not x["future"]]
+        values = [x["count"] for x in seen]
+        peak = max(seen, key=lambda x: x["count"])
+        panels.append({
+            "month": f"{mo:02d}",
+            "label": first.strftime("%B"),
+            "short": first.strftime("%b"),
+            "days": days,
+            "total": sum(values),
+            "median": float(np.median(values)),
+            "weekday_median": float(np.median([x["count"] for x in seen if not x["weekend"]] or [0])),
+            "weekend_median": float(np.median([x["count"] for x in seen if x["weekend"]] or [0])),
+            "peak": peak,
+            "partial": mo == anchor.month and not anchor_month_complete,
+            "days_seen": len(seen),
+        })
+    if not any(p["total"] for p in panels):
+        return None
+    whole = [p for p in panels if not p["partial"]] or panels
+    busiest = max((x for p in panels for x in p["days"] if not x["future"]), key=lambda x: x["count"])
+    return {
+        "year": year,
+        "panels": panels,
+        "first_whole": whole[0],
+        "last_whole": whole[-1],
+        "busiest": busiest,
+        "y_max": max(busiest["count"], 1),
+        "anchor_date": anchor_date,
+    }
+
+
+def _write_daily_by_month_csv(daily_counts, anchor_date, anchor_month_complete=False,
+                              output_filename="cve_monthly_stats_comparison_daily_by_month.csv"):
+    """Local-only CSV companion of the per-day chart: one row per elapsed day."""
+    p = _prep_daily_by_month(daily_counts, anchor_date, anchor_month_complete)
+    if p is None:
+        return
+    with open(output_filename, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["date", "weekday", "cves"])
+        for panel in p["panels"]:
+            for x in panel["days"]:
+                if not x["future"]:
+                    writer.writerow([x["date"].isoformat(), x["date"].strftime("%a"), x["count"]])
+    saved_files_log.append(f"Saved per-day CSV to {os.path.abspath(output_filename)}")
+
+
+def plot_daily_by_month(daily_counts, anchor_date, anchor_month_complete=False,
+                        output_filename="cve_monthly_stats_comparison_daily_by_month.png"):
+    """CVEs published per day, one small panel per month of the anchor year.
+
+    Every panel shares one y axis, so a bar is the same height for the same
+    count in any month and the year's climb reads straight across the grid.
+    Weekends are drawn in gray (they are the quiet days, and without telling
+    them apart the dips look like noise); the dashed line is the month's
+    median day and the tallest bar carries its count. Days of the running month
+    that have not happened yet are left empty under a faint band.
+    """
+    p = _prep_daily_by_month(daily_counts, anchor_date, anchor_month_complete)
+    if p is None:
+        return
+    panels = p["panels"]
+    n = len(panels)
+    ncols = n if n <= 4 else -(-n // 2)
+    nrows = -(-n // ncols)
+
+    plt.style.use("dark_background")
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(max(13, ncols * 3.6 + 1.5), 4.6 * nrows + 2.6),
+        sharey=True, squeeze=False, facecolor="#1E1E1E",
+    )
+    y_top = p["y_max"] * 1.16
+
+    for i, ax in enumerate(axes.flat):
+        if i >= n:
+            ax.set_visible(False)
+            continue
+        panel = panels[i]
+        ax.set_facecolor("#1E1E1E")
+        days = [x for x in panel["days"] if not x["future"]]
+        ax.bar(
+            [x["day"] for x in days], [x["count"] for x in days], 0.78,
+            color=[C_RED if x is p["busiest"] else C_GRAY if x["weekend"] else C_BLUE for x in days],
+            zorder=3,
+        )
+        future = [x["day"] for x in panel["days"] if x["future"]]
+        if future:
+            ax.axvspan(future[0] - 0.5, future[-1] + 0.5, color="#FFFFFF", alpha=0.05, zorder=1)
+            ax.text(
+                (future[0] + future[-1]) / 2.0, y_top * 0.5, "not yet",
+                ha="center", va="center", fontsize=12, color="#747D8C", style="italic",
+                rotation=90 if len(future) < 6 else 0,
+            )
+        ax.plot(
+            [0.5, days[-1]["day"] + 0.5], [panel["median"]] * 2, color=C_YELLOW,
+            linewidth=2.0, linestyle=(0, (5, 3)), zorder=4,
+        )
+        t = ax.annotate(
+            f"{panel['median']:,.0f}", xy=(days[-1]["day"] + 0.5, panel["median"]), xytext=(4, 0),
+            textcoords="offset points", ha="left", va="center", fontsize=12,
+            fontweight="bold", color=C_YELLOW, zorder=6,
+        )
+        t.set_path_effects([path_effects.Stroke(linewidth=3, foreground="#1E1E1E"), path_effects.Normal()])
+        pk = panel["peak"]
+        t = ax.annotate(
+            f"{pk['count']:,}", xy=(pk["day"], pk["count"]), xytext=(0, 5),
+            textcoords="offset points", ha="center", va="bottom", fontsize=12.5,
+            fontweight="bold", color=C_RED if pk is p["busiest"] else "#FFFFFF", zorder=6,
+        )
+        t.set_path_effects([path_effects.Stroke(linewidth=3, foreground="#1E1E1E"), path_effects.Normal()])
+
+        span = f" (1–{panel['days_seen']})" if panel["partial"] else ""
+        ax.set_title(
+            f"{panel['label']}{span}\n{panel['total']:,} CVEs",
+            fontsize=15, fontweight="bold", color="#FFFFFF", pad=10, linespacing=1.35,
+        )
+        ax.set_xlim(0.3, 31.7)
+        ax.set_ylim(0, y_top)
+        ax.set_xticks([1, 8, 15, 22, 29])
+        ax.tick_params(colors="#CCCCCC", labelsize=12, length=0, pad=6)
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, pos: f"{int(v):,}"))
+        for label in ax.get_xticklabels() + ax.get_yticklabels():
+            label.set_fontweight("bold")
+        ax.grid(True, axis="y", color="#444444", linestyle="--", alpha=0.6, linewidth=0.9)
+        ax.set_axisbelow(True)
+        for spine in ["top", "right"]:
+            ax.spines[spine].set_visible(False)
+        for spine in ["left", "bottom"]:
+            ax.spines[spine].set_color("#555555")
+        if i % ncols == 0:
+            ax.set_ylabel("CVEs per day", fontsize=15, fontweight="bold", color="#FFFFFF", labelpad=10)
+        if i // ncols == nrows - 1 or i + ncols >= n:
+            ax.set_xlabel("Day of month", fontsize=13, color="#A4B0BE", labelpad=6)
+
+    a, b, busiest = p["first_whole"], p["last_whole"], p["busiest"]
+    if a is b:
+        headline = f"Median day: {a['median']:,.0f} CVEs in {a['label']}"
+    else:
+        ratio = b["median"] / a["median"] if a["median"] else 0
+        headline = (
+            f"Median day: {a['median']:,.0f} CVEs in {a['label']}, {b['median']:,.0f} in {b['label']}"
+            + (f" ({ratio:.1f}×)" if ratio else "")
+        )
+    headline += f"  ·  busiest day so far: {busiest['date'].strftime('%b')} {busiest['date'].day}, {busiest['count']:,} CVEs"
+    fig.suptitle(
+        f"CVEs Published per Day, Month by Month ({p['year']})\n{headline}",
+        fontsize=21, fontweight="bold", color="#FFFFFF", y=0.995,
+    )
+
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+    handles = [
+        Patch(color=C_BLUE, label="Weekday"),
+        Patch(color=C_GRAY, label="Saturday / Sunday"),
+        Line2D([], [], color=C_YELLOW, linewidth=2.0, linestyle=(0, (5, 3)), label="Median day of the month"),
+        Patch(color=C_RED, label="Busiest day of the year (count in red)"),
+    ]
+    fig.legend(
+        handles=handles, loc="lower center", bbox_to_anchor=(0.10, 0.035, 0.80, 0.05),
+        mode="expand", ncol=4, facecolor="#262626", edgecolor="#444444", fontsize=14,
+        handletextpad=0.6, borderpad=0.5, framealpha=0.95,
+    )
+    plt.figtext(
+        0.5, 0.008, f"{_stamp()} | Data Source: Vulners CVE Archive",
+        ha="center", fontsize=12, color="#747D8C", style="italic", fontweight="bold",
+    )
+    plt.tight_layout(rect=[0.01, 0.10, 0.99, 0.94], h_pad=2.5, w_pad=1.2)
+    _add_logo(fig)
+    plt.savefig(output_filename, dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.close()
+    saved_files_log.append(f"Saved per-day chart to {os.path.abspath(output_filename)}")
+
+
 def _exploitation_corridor_text(d, unit="KEV additions", name_outliers=True):
     """``(title clause, band label)`` for the exploitation corridor. The band is
     the complete months' range through ``EXPLOIT_CORRIDOR_THROUGH``; complete
@@ -6401,11 +6638,7 @@ def _run_monthly(results, report_buf):
             # month's *full prior-year* leaders, which the chart never shows.
             prev_month_name = months_map.get(prev_month_str, prev_month_str)
             prev_range_label = f"{prev_month_name[:3]} 1-{current_day}"
-            prev_shown_top = {
-                k for k, v in sorted(
-                    prev_data_2026_partial.items(), key=lambda kv: kv[1], reverse=True
-                )[:TOP_N] if v > 0
-            }
+            prev_shown_top = _top_n_names(prev_data_2026_partial, (data_2026_partial, data_2025_partial))
             sankey_named_cnas = set(top_names) | prev_shown_top
             slide_inputs["incomplete_month"] = dict(
                 data_2025_partial=data_2025_partial,
@@ -6472,11 +6705,7 @@ def _run_monthly(results, report_buf):
             print_table=False,
             prev_data_2026_full=prev_data_full,
         )
-        prev_shown_top = {
-            k for k, v in sorted(
-                prev_data_full.items(), key=lambda kv: kv[1], reverse=True
-            )[:TOP_N] if v > 0
-        }
+        prev_shown_top = _top_n_names(prev_data_full, (data_2026_full, data_2025_full))
         slide_inputs["incomplete_month"] = dict(
             data_2025_partial=data_2025_full,
             data_2026_partial=data_2026_full,
@@ -6604,6 +6833,14 @@ def _run_monthly(results, report_buf):
         anchor_date_str=anchor_date,
     )
     plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date)
+
+    # CVEs per day, one small panel per month of the anchor year.
+    slide_inputs["daily_by_month"] = dict(
+        daily_counts=daily_counts, anchor_date=anchor_date, anchor_month_complete=anchor_month_complete,
+    )
+    plot_daily_by_month(daily_counts, anchor_date, anchor_month_complete=anchor_month_complete)
+    if _WRITE_CSV:
+        _write_daily_by_month_csv(daily_counts, anchor_date, anchor_month_complete=anchor_month_complete)
 
     # Generate Yearly Cumulative YoY comparison chart (2022-2025 full year, 2026 YTD)
     slide_inputs["yearly_cumulative"] = dict(daily_counts=daily_counts, anchor_date_str=anchor_date)
