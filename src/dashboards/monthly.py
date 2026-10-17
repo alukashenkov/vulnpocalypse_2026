@@ -1016,7 +1016,12 @@ def _prep_exploitation_trends(stats, anchor_date, anchor_month_complete=False, w
         "first_lbl": d["first_lbl"], "last_lbl": d["last_lbl"], "base_year": keys[0][:4],
         "kev_only": sum(1 for c in kev_added if c not in wild_cve_first_seen),
         "kev_total": len(kev_added),
+        # The running month, for a dashed tail only: never fitted, never quoted.
+        "partial": d["partial"],
     }
+    part = d["partial"]
+    part_vals = ({"pubs": part["pub"], "wild": wild_by_month.get(part["key"], 0), "kev": part["kev"]}
+                 if part else {})
     for name, vals in series.items():
         base = sum(vals[:len(base_keys)]) / len(base_keys)
         trend = robust_log_trend(vals)
@@ -1038,6 +1043,7 @@ def _prep_exploitation_trends(stats, anchor_date, anchor_month_complete=False, w
             # The newest months in a row above the band: a series outgrowing its
             # own trend, named from the first of them.
             "above_since": d["months"][len(vals) - above] if above >= 2 else None,
+            "partial": part_vals.get(name),
         }
     return out
 
@@ -1086,12 +1092,14 @@ def _label_trend_outliers(ax, p, srs, color, fontsize, stroke, ring=11, extra_li
         lines.append((ax, xs, [y0, y0, y1, y1, y0, y1]))
 
 
-def _trend_panel_ylim(panels):
+def _trend_panel_ylim(panels, with_partial=False):
     """One log span for every panel — the widest panel's ratio plus room — and
     each panel's limits centred on its own data, so a doubling is the same
-    height in all of them."""
+    height in all of them. ``with_partial`` keeps the running month in view."""
     def extent(srs):
         vals = list(srs["values"])
+        if with_partial and srs.get("partial"):
+            vals.append(srs["partial"])
         if srs["trend"]:
             vals += srs["trend"]["lo"] + srs["trend"]["hi"]
         return min(vals), max(vals)
@@ -1122,7 +1130,8 @@ def plot_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wi
         (p["wild"], C_YELLOW, f"Exploited (Vulners wildExploited, every KEV CVE included)  ·  "
                               f"trend {pct(p['wild'])} a year"),
     ]
-    limits = _trend_panel_ylim([srs for srs, _, _ in panels])
+    part = p["partial"]
+    limits = _trend_panel_ylim([srs for srs, _, _ in panels], with_partial=True)
 
     plt.style.use("dark_background")
     fig, axes = plt.subplots(3, 1, figsize=(16, 14), sharex=True, facecolor="#1E1E1E")
@@ -1141,6 +1150,12 @@ def plot_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wi
             ax.plot(x, tr["fit"], color=color, linewidth=2.2, linestyle=(0, (6, 4)), zorder=2)
         ax.plot(x, srs["values"], color=color, linewidth=3.0 if not srs["trend"] else 2.4,
                 marker="o", markersize=5, zorder=3)
+        if part and srs["partial"]:
+            # The running month as a dashed tail to a hollow marker, the way
+            # the other monthly charts draw theirs; kept out of the trend.
+            ax.plot([x[-1], part["x"]], [srs["values"][-1], srs["partial"]], color=color, linewidth=2.4,
+                    linestyle=(0, (4, 3)), marker="o", markersize=8, markevery=[1],
+                    markerfacecolor="#1E1E1E", markeredgewidth=2, zorder=3)
         ax.text(0.01, 0.95, name, transform=ax.transAxes, ha="left", va="top", fontsize=15,
                 fontweight="bold", color=color, zorder=7,
                 path_effects=[path_effects.Stroke(linewidth=4, foreground="#1E1E1E"), path_effects.Normal()])
@@ -1156,8 +1171,12 @@ def plot_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wi
     axes[1].set_ylabel("Per month (log scale)", fontsize=16, fontweight="bold", color="#FFFFFF", labelpad=12)
     axes[-1].xaxis.set_major_locator(mdates.MonthLocator(bymonth=(1, 4, 7, 10)))
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
-    axes[-1].set_xlim(datetime(p["months"][0].year, p["months"][0].month, 1),
-                      datetime(p["last"].year, p["last"].month, 1) + timedelta(days=31))
+    if part:
+        pm = part["month"]
+        x_end = (datetime(pm.year, pm.month, 1) + timedelta(days=32)).replace(day=1) + timedelta(days=12)
+    else:
+        x_end = datetime(p["last"].year, p["last"].month, 1) + timedelta(days=31)
+    axes[-1].set_xlim(datetime(p["months"][0].year, p["months"][0].month, 1), x_end)
     fig.suptitle(
         f"Exploitation vs Volume: Growth Trends ({p['first_lbl']} – {p['last_lbl']})\n"
         f"Trend a year: CVE publications {pct(p['pubs'])}, CISA KEV {pct(p['kev'])}, "
@@ -1167,12 +1186,32 @@ def plot_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wi
     # Laid out before the outliers are placed: placement measures the final boxes.
     plt.tight_layout(rect=[0.01, 0.085, 0.99, 0.95], h_pad=1.6)
     for ax, (srs, color, _) in zip(axes, panels):
+        tail = []
+        if part and srs["partial"]:
+            tail = [(ax, [x[-1], part["x"]], [srs["values"][-1], srs["partial"]])]
+            xy = (part["x"], srs["partial"])
+            t = ax.annotate(f"{part['lbl']}\nso far: {srs['partial']:,}", xy=xy, xytext=(0, -12),
+                            textcoords="offset points", ha="center", va="top", fontsize=12,
+                            color="#CCCCCC", style="italic", linespacing=1.2, zorder=6)
+            stroke(t)
+            lines = tail + [(ax, list(x), srs["values"])]
+            if srs["trend"]:
+                lines += [(ax, list(x), srs["trend"][k]) for k in ("fit", "lo", "hi")]
+            _place_clear(t, [(xy, (0, -12), "center", "top", None), (xy, (0, 12), "center", "bottom", None),
+                             (xy, (-12, -12), "right", "top", None), (xy, (-12, 12), "right", "bottom", None),
+                             (xy, (0, -26), "center", "top", None), (xy, (0, 26), "center", "bottom", None)],
+                         lines, inside=ax)
+            bb = t.get_window_extent(fig.canvas.get_renderer())
+            (x0, y0), (x1, y1) = ax.transData.inverted().transform([(bb.x0, bb.y0), (bb.x1, bb.y1)])
+            xs = [mdates.num2date(v_).replace(tzinfo=None) for v_ in (x0, x1, x1, x0, x0, x1)]
+            tail.append((ax, xs, [y0, y0, y1, y1, y0, y1]))
         if srs["trend"]:
-            _label_trend_outliers(ax, p, srs, color, 13, stroke, ring=14)
+            _label_trend_outliers(ax, p, srs, color, 13, stroke, ring=14, extra_lines=tail)
     plt.figtext(
         0.5, 0.032,
         "Log axes spanning the same ratio: a doubling is the same height in every panel.\n"
-        "Dashed: growth trend fitted robustly (Theil–Sen on log counts); shaded: ±2σ; ringed: months outside it.",
+        "Dashed: growth trend fitted robustly (Theil–Sen on log counts); shaded: ±2σ; ringed: months outside it."
+        + ("\nHollow marker on a dashed tail: the running month so far, left out of the trend." if part else ""),
         ha="center", fontsize=12.5, color="#A4B0BE", style="italic", linespacing=1.4,
     )
     plt.figtext(
