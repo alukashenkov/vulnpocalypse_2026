@@ -51,6 +51,29 @@ _SLIDES = False
 # ``cve_monthly_stats_comparison_sankey_monthly_by_month.png``. Off on the
 # published path, which shows only the charts in CHART_FILES.
 _SANKEY_MONTH_ORDER = False
+# The two kinds of run. The site build (``python -m src``) draws the page's
+# charts from the one ``cve`` archive plus the two small feeds those charts
+# need (the CISA KEV catalog and the CVE Program's CNA roster), and nothing
+# else. A local run (``configure_local_run``, called by the wrapper
+# cve_monthly_stats_comparison.py) adds the slides, CSVs and experiments and
+# every source only they read: the EPSS feeds and Vulners ``audit/cve`` and
+# ``search/id``. Each of those fetches calls
+# ``_local_only`` first, so a site build that reached one fails loudly instead
+# of quietly downloading more.
+_LOCAL = False
+
+
+def configure_local_run():
+    """Switch this module to a local run: slides, CSVs, the experiments, and the
+    local-only data sources."""
+    global _LOCAL, _WRITE_CSV, _SLIDES, _SANKEY_MONTH_ORDER
+    _LOCAL = _WRITE_CSV = _SLIDES = _SANKEY_MONTH_ORDER = True
+
+
+def _local_only(what):
+    if not _LOCAL:
+        raise RuntimeError(f"{what} is a local-only data source; the site build must not fetch it "
+                           "(see configure_local_run).")
 
 # Last day the numbers actually cover (the anchor). Set by count_monthly_cves()
 # and stamped into every chart footer next to the generation date; the two are
@@ -420,6 +443,11 @@ FANOUT_SHORTLIST = [
     "CVE-2026-11979",   # libxml2
     "CVE-2026-4480",    # Samba, KEV
 ]
+# Further CVEs drawn on the same frame, one slide each, saved as
+# cve_monthly_stats_comparison_fanout_downstream_<cve id, lower case>_slide.png.
+FANOUT_EXTRA_CVES = [
+    "CVE-2026-109618",  # PHP, VulnCheck KEV
+]
 # Reference types that are not downstream changes: scanners and detection
 # content, CVE mirrors and aggregators, exploit and news feeds, KEV lists.
 FANOUT_EXCLUDE = {
@@ -541,6 +569,7 @@ FANOUT_PRODUCTS = {
     "sle-rt": "SUSE Linux Enterprise Real Time", "sl-micro": "SUSE Linux Micro",
     "opensuse-leap": "openSUSE Leap", "opensuse-tumbleweed": "openSUSE Tumbleweed",
     "amzn": "Amazon Linux", "fedora": "Fedora", "oracle": "Oracle Linux", "oraclelinux": "Oracle Linux",
+    "ol": "Oracle Linux",
     "astra": "Astra Linux", "mageia": "Mageia", "openeuler": "openEuler", "alpine": "Alpine Linux",
     "wolfi": "Wolfi (Chainguard)", "chainguard": "Chainguard", "minimos": "MinimOS (Minimus)",
     "hummingbird": "Hummingbird", "freebsd": "FreeBSD", "photon": "VMware Photon OS",
@@ -557,10 +586,12 @@ def _audit_cache_path():
     return os.path.join(os.path.abspath(os.getenv("DATA_DIR") or os.getcwd()), AUDIT_CACHE_BASENAME)
 
 
-def fetch_audit_cve(cve_id):
+def fetch_audit_cve(cve_id, max_age_h=AUDIT_CACHE_MAX_AGE_H):
     """``audit/cve`` result for one CVE (``{"cve", "affectedPackages", "affectedCpe"}``),
-    from the day's cache or the API. ``None`` without an API key or on failure —
-    the caller falls back to the archive references."""
+    from a cache entry younger than ``max_age_h`` or the API (``max_age_h=0``
+    always asks the API, keeping the cache as the fallback). ``None`` without an
+    API key or on failure — the caller falls back to the archive references."""
+    _local_only("Vulners audit/cve")
     path = _audit_cache_path()
     cache = {}
     if os.path.exists(path):
@@ -575,7 +606,7 @@ def fetch_audit_cve(cve_id):
             age_h = (datetime.now() - datetime.fromisoformat(hit["fetched"])).total_seconds() / 3600
         except ValueError:
             age_h = float("inf")
-        if age_h < AUDIT_CACHE_MAX_AGE_H and hit.get("result") is not None:
+        if age_h < max_age_h and hit.get("result") is not None:
             return hit["result"]
     api_key = os.getenv("VULNERS_API_KEY")
     if not api_key:
@@ -605,6 +636,150 @@ def fetch_audit_cve(cve_id):
     except OSError as e:
         print(f"Could not write {path}: {e}")
     return result
+
+
+VULNERS_SEARCH_ID_URL = "https://vulners.com/api/v3/search/id/"
+SEARCH_ID_CACHE_BASENAME = "vulners_search_id_cache.json"
+
+
+def cache_fetched_at(basename, key):
+    """When the cached entry ``key`` in DATA_DIR/``basename`` was fetched (a
+    ``datetime``), or ``None``. After a ``fetch_*`` call this dates the data it
+    returned: a fresh fetch rewrote it, a failed one fell back to it."""
+    path = os.path.join(os.path.abspath(os.getenv("DATA_DIR") or os.getcwd()), basename)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return datetime.fromisoformat(json.load(f)[key]["fetched"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def fetch_cve_document(cve_id, max_age_h=AUDIT_CACHE_MAX_AGE_H):
+    """The live Vulners document for one CVE (``GET /api/v3/search/id/?id=``),
+    cached in DATA_DIR like ``fetch_audit_cve`` and with the same ``max_age_h``
+    rule. ``None`` without an API key or on failure."""
+    _local_only("Vulners search/id")
+    path = os.path.join(os.path.abspath(os.getenv("DATA_DIR") or os.getcwd()), SEARCH_ID_CACHE_BASENAME)
+    cache = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+        except (OSError, ValueError):
+            cache = {}
+    hit = cache.get(cve_id)
+    if hit and isinstance(hit, dict) and "fetched" in hit:
+        try:
+            age_h = (datetime.now() - datetime.fromisoformat(hit["fetched"])).total_seconds() / 3600
+        except ValueError:
+            age_h = float("inf")
+        if age_h < max_age_h and hit.get("result") is not None:
+            return hit["result"]
+    api_key = os.getenv("VULNERS_API_KEY")
+    if not api_key:
+        return hit.get("result") if hit else None
+    try:
+        r = requests.get(VULNERS_SEARCH_ID_URL, params={"id": cve_id}, headers={"X-Api-Key": api_key}, timeout=60)
+        r.raise_for_status()
+        result = r.json()["data"]["documents"][cve_id]
+    except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+        print(f"search/id failed for {cve_id}: {e}")
+        return hit.get("result") if hit else None
+    if not isinstance(result, dict):
+        return hit.get("result") if hit else None
+    cache[cve_id] = {"fetched": datetime.now().isoformat(timespec="seconds"), "result": result}
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except OSError as e:
+        print(f"Could not write {path}: {e}")
+    return result
+
+
+def nvd_cpe_matches(doc):
+    """NVD's vulnerable ``cpeMatch`` entries (``criteria``, ``versionStartIncluding``,
+    ``versionEndExcluding``, …) from a Vulners CVE document's
+    ``cpeConfigurations.nvdCpeConfiguration``."""
+    configs = ((doc or {}).get("cpeConfigurations") or {}).get("nvdCpeConfiguration") or []
+    return [c for conf in configs for node in conf.get("nodes") or [] for c in node.get("cpeMatch") or []
+            if isinstance(c, dict) and c.get("vulnerable")]
+
+
+def fanout_record(item):
+    """The facts the fan-out slides read from one CVE document — an archive
+    item or a live ``fetch_cve_document`` result, which share the schema."""
+    ench = item.get("enchantments")
+    deps = ench.get("dependencies") if isinstance(ench, dict) else None
+    refs = deps.get("references") if isinstance(deps, dict) else None
+    refs = refs if isinstance(refs, list) else []
+    return {
+        "id": item["id"],
+        "published": (item.get("published") or "")[:10],
+        "reporter": item.get("reporter"),
+        "short": (ench.get("short_description") if isinstance(ench, dict) else None) or "",
+        "software": sorted({
+            str(a.get("name") or a.get("cpeName") or "")
+            for a in (item.get("affectedSoftware") or []) if isinstance(a, dict)
+        }),
+        "kev": any(isinstance(r, dict) and r.get("type") == "vulncheck_kev" for r in refs),
+        "references": [
+            {"type": r.get("type"), "idList": [str(i) for i in (r.get("idList") or [])]}
+            for r in refs if isinstance(r, dict)
+        ],
+    }
+
+
+def _version_tuple(text):
+    """Leading dotted number of a version string (epoch dropped), padded to three parts."""
+    mv = re.match(r"(?:\d+:)?(\d+(?:\.\d+)*)", text or "")
+    if not mv:
+        return None
+    parts = [int(x) for x in mv.group(1).split(".")]
+    return tuple(parts + [0] * (3 - len(parts)))
+
+
+def fanout_cpe_mismatch(audit_result, cpe_matches):
+    """The fixed downstream builds of the CPE's own product that NVD's version
+    ranges still match as vulnerable — fixes backported onto an older upstream
+    version. Only packages named after the CPE product (``php``, ``php8.4``,
+    ``php-8.2``, ``php82``, …) with a ``<fixed`` range are compared.
+
+    Returns ``{"product", "ranges": [(start or None, end)], "builds": n,
+    "matched": [{"family", "release", "package", "fixed"}]}``, or ``None``
+    when there is nothing to compare."""
+    ranges, products = [], set()
+    for c in cpe_matches or []:
+        parts = str(c.get("criteria") or "").split(":")
+        end = _version_tuple(c.get("versionEndExcluding"))
+        if len(parts) < 5 or end is None:
+            continue
+        products.add(parts[4])
+        ranges.append((c.get("versionStartIncluding"), c["versionEndExcluding"]))
+    if len(products) != 1 or not audit_result:
+        return None
+    product = products.pop()
+
+    def in_nvd_range(v):
+        return any((start is None or _version_tuple(start) <= v) and v < _version_tuple(end)
+                   for start, end in ranges)
+
+    builds, matched = set(), []
+    for p in audit_result.get("affectedPackages") or []:
+        name, rng = str(p.get("name") or ""), str(p.get("range") or "")
+        if re.sub(r"[-_.]?\d[\d.]*$", "", name.lower()) != product or not rng.startswith("<") or rng.startswith("<="):
+            continue
+        distro = p.get("distro") or []
+        family = distro[0] if distro else (p.get("registry") or "?")
+        release = distro[1] if len(distro) > 1 else family
+        fixed = re.sub(r"^\d+:", "", rng[1:])
+        v = _version_tuple(fixed)
+        if v is None or (family, release, name, fixed) in builds:
+            continue
+        builds.add((family, release, name, fixed))
+        if in_nvd_range(v):
+            matched.append({"family": family, "release": release, "package": name, "fixed": fixed})
+    return {"product": product, "ranges": ranges, "builds": len(builds), "matched": matched}
 
 
 def fanout_packages(audit_result):
@@ -642,7 +817,8 @@ def fanout_packages(audit_result):
     rows = [{
         "product": product, "updates": len(r["updates"]), "releases": len(r["releases"]),
         "advisories": len(r["advisories"]),
-        "packages": [n for n, _ in r["packages"].most_common()],
+        # Ties broken by name: the API's own order varies call to call.
+        "packages": [n for n, _ in sorted(r["packages"].items(), key=lambda kv: (-kv[1], kv[0]))],
     } for product, r in per.items()]
     rows.sort(key=lambda r: (-r["updates"], r["product"]))
     totals = {"updates": len(all_updates), "products": len(rows), "releases": len(all_releases),
@@ -1547,6 +1723,7 @@ def download_latest_epss_scores(data_dir=None):
     """Path to the newest EPSS daily feed (today, walking back up to 7 days),
     downloaded into ``data_dir`` unless already there; falls back to the newest
     local feed. Ported from cve_epss_comparison.py."""
+    _local_only("EPSS feeds")
     import urllib.error
     import urllib.request
 
@@ -1583,6 +1760,7 @@ def download_latest_epss_scores(data_dir=None):
 def download_historical_epss_scores(data_dir, target_date_str):
     """``(path, actual_date)`` for the EPSS feed nearest ``target_date_str``
     (exact day first, then ±1..7 days). Ported from cve_epss_comparison.py."""
+    _local_only("EPSS feeds")
     import urllib.error
     import urllib.request
 
@@ -2146,7 +2324,7 @@ def count_monthly_cves(file_path, cut_off_date=None):
     # fanout_records[cve_id] = the archive record's facts the fan-out slide and
     # its shortlist CSV need, for FANOUT_CVE and every FANOUT_SHORTLIST entry.
     fanout_records = {}
-    fanout_wanted = set(FANOUT_SHORTLIST) | {FANOUT_CVE, FIXSTATUS_CVE}
+    fanout_wanted = set(FANOUT_SHORTLIST) | set(FANOUT_EXTRA_CVES) | {FANOUT_CVE, FIXSTATUS_CVE}
     # epss_rows: (CVE id, publication day, exploited-in-the-wild flag) for every
     # kept CVE of the last EPSS_ROWS_YEARS_BACK+1 years, for the EPSS slides.
     epss_rows = []
@@ -2232,25 +2410,7 @@ def count_monthly_cves(file_path, cut_off_date=None):
                                 wild_sources[s["type"]] += 1
 
                 if item.get("id") in fanout_wanted:
-                    ench = item.get("enchantments")
-                    deps = ench.get("dependencies") if isinstance(ench, dict) else None
-                    refs = deps.get("references") if isinstance(deps, dict) else None
-                    refs = refs if isinstance(refs, list) else []
-                    fanout_records[item["id"]] = {
-                        "id": item["id"],
-                        "published": (published_date or "")[:10],
-                        "reporter": reporter,
-                        "short": (ench.get("short_description") if isinstance(ench, dict) else None) or "",
-                        "software": sorted({
-                            str(a.get("name") or a.get("cpeName") or "")
-                            for a in (item.get("affectedSoftware") or []) if isinstance(a, dict)
-                        }),
-                        "kev": any(isinstance(r, dict) and r.get("type") == "vulncheck_kev" for r in refs),
-                        "references": [
-                            {"type": r.get("type"), "idList": [str(i) for i in (r.get("idList") or [])]}
-                            for r in refs if isinstance(r, dict)
-                        ],
-                    }
+                    fanout_records[item["id"]] = fanout_record(item)
 
                 if (
                     published_date and len(published_date) >= 10
@@ -7227,6 +7387,7 @@ def _run_monthly(results, report_buf):
     # One CVE's downstream advisories, for the fan-out slide (local only).
     fanout_records = results.get("fanout_records", {})
     slide_inputs["fanout_downstream"] = dict(record=fanout_records.get(FANOUT_CVE))
+    slide_inputs["fanout_downstream_extra"] = dict(records=[fanout_records.get(c) for c in FANOUT_EXTRA_CVES])
     # Which affected releases have FIXSTATUS_CVE's fix (hand snapshot, local only).
     slide_inputs["fanout_status"] = dict(record=fanout_records.get(FIXSTATUS_CVE))
     if _WRITE_CSV:

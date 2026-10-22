@@ -19,7 +19,9 @@ page lists only the six files in ``monthly.CHART_FILES``.
 import collections
 import csv
 import os
+import re
 import textwrap
+import time
 import traceback
 from datetime import date, datetime, timedelta
 
@@ -141,12 +143,14 @@ def _data_stamp():
     return f"Data through {m._DATA_THROUGH}" if m._DATA_THROUGH else ""
 
 
-def _slide(title, subtitle=None, height=SLIDE_H):
+def _slide(title, subtitle=None, height=SLIDE_H, stamp=None):
     """A blank slide with the title band and footer already in place.
 
     ``height`` makes a taller frame for a picture that needs the rows; the
     title band and footer keep their distance in inches from the top and
     bottom edges, so they look the same as on every other slide.
+    ``stamp`` replaces the footer's "Data through" for a slide whose data is
+    not the archive pass's.
     """
     plt.style.use("dark_background")
     fig = plt.figure(figsize=(SLIDE_W, height), facecolor=BG)
@@ -163,7 +167,7 @@ def _slide(title, subtitle=None, height=SLIDE_H):
             linespacing=1.25,
         )
         _fit_text(fig, s, min_size=10.5, wrap_first=True)
-    stamp = _data_stamp()
+    stamp = stamp or _data_stamp()
     fig.text(
         0.955, FOOT_Y * k,
         f"{stamp} | Data Source: Vulners CVE Archive" if stamp
@@ -1960,7 +1964,7 @@ def slide_cwe_chrome(chrome_cves, anchor_date, output_filename=SLIDE_FILES["cwe_
 
 _FANOUT_MAX_BARS = 15   # products drawn individually; the rest pool into one bar
 # Readable names for the affected-software strings the archive carries.
-_FANOUT_SOFTWARE_LABELS = {"linux linux_kernel": "Linux kernel", "openssl": "OpenSSL", "haxx curl": "curl"}
+_FANOUT_SOFTWARE_LABELS = {"linux linux_kernel": "Linux kernel", "openssl": "OpenSSL", "haxx curl": "curl", "php": "PHP"}
 
 
 def _fanout_rows(record):
@@ -1980,7 +1984,7 @@ def _fanout_rows(record):
     return rows, totals, "references"
 
 
-def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstream"]):
+def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstream"], nvd=None, stamp=None):
     """One CVE, and how far its fix travels: every downstream package rebuilt for
     it, grouped by the product that ships it. The matched pair of the Chrome
     fan-in slide — same frame, opposite direction of travel.
@@ -1995,7 +1999,12 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
     references carry only ids, so the propagation delay per product is not in
     this data. (The cache holds 4,261 entries for FANOUT_CVE with no date-bearing
     field, checked 2026-09-03.) Do not estimate it; add it only from real
-    per-advisory dates."""
+    per-advisory dates.
+
+    ``nvd`` (``monthly.fanout_cpe_mismatch``) adds a panel under the bars: NVD's
+    CPE ranges next to the fixed builds those ranges still call vulnerable. The
+    frame grows by ``_FANOUT_NVD_PANEL_H`` for it; everything above keeps its
+    place in inches from the top."""
     if not record:
         return
     rows, totals, source = _fanout_rows(record)
@@ -2013,7 +2022,12 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
     cve = record["id"]
     software = record["software"][0] if record["software"] else (record["reporter"] or "")
     software = _FANOUT_SOFTWARE_LABELS.get(software, software.replace("_", " "))
-    kev_txt = "  ·  CISA KEV" if record["kev"] else ""
+    # The record's ``kev`` flag is its vulncheck_kev reference; CISA is named only
+    # when the CVE is in CISA's own catalog.
+    if cve.upper() in m.load_cisa_kev_cves():
+        kev_txt = "  ·  CISA KEV"
+    else:
+        kev_txt = "  ·  VulnCheck KEV" if record["kev"] else ""
     published = datetime.strptime(record["published"], "%Y-%m-%d").strftime("%b %-d, %Y") if record["published"] else ""
     unit = "rebuilt packages" if source == "audit" else "downstream records"
     if source == "audit":
@@ -2025,11 +2039,16 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
           + (f" → {totals['releases']} product releases" if source == "audit" else "")
           + f" → {total:,} {unit}")
 
+    height = SLIDE_H + _FANOUT_NVD_PANEL_H if nvd else SLIDE_H
+    k = SLIDE_H / height
+    # Positions below are in the 16:9 frame; Y maps them into a taller one.
+    Y = (lambda y: 1 - (1 - y) * k) if nvd else (lambda y: y)
     fig = _slide(
         f"One {software} fix, and how far it travels before everyone has it",
         f"{cve}  ·  {software}  ·  published {published}{kev_txt}  ·  {scope}",
+        height=height, stamp=stamp,
     )
-    ax = fig.add_axes([0.225, 0.115, 0.51, CONTENT_TOP - 0.115])
+    ax = fig.add_axes([0.225, Y(0.115), 0.51, Y(CONTENT_TOP) - Y(0.115)])
     _style_axes(ax)
     ax.grid(False, axis="y")
     ax.grid(True, axis="x", color=GRID, linestyle="--", linewidth=0.8, alpha=0.7)
@@ -2074,7 +2093,7 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
     else:
         rungs = [("1", "upstream fix"), (f"{n_products}", "issuers"), (f"{total:,}", unit)]
     x_rule, x_txt = 0.772, 0.787
-    y_top, step = 0.775, 0.105
+    y_top, step = Y(0.775), 0.105 * k
     y_last = y_top - step * (len(rungs) - 1)
     fig.add_artist(plt.Line2D([x_rule, x_rule], [y_last - 0.012, y_top + 0.012], transform=fig.transFigure,
                               color=INK3, linewidth=1.4, solid_capstyle="round", zorder=1))
@@ -2087,16 +2106,117 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
                  fontweight="bold", color=INK)
         fig.text(x_txt, y - 0.006, what, ha="left", va="top", fontsize=F_LABEL, color=INK2)
     # What the number is not, in print, so the rest is credible; then the reading.
-    y_note = y_last - 0.085
+    y_note = y_last - 0.085 * k
     fig.text(x_txt, y_note, textwrap.fill(
         f"The {total:,} {unit} are the ecosystem's rebuilds, not any one organisation's queue.", 36),
         ha="left", va="top", fontsize=F_SMALL, color=INK, style="italic", linespacing=1.35)
     who = f"{n_products} vendors" if source == "audit" else f"{n_products} issuers"
-    fig.text(x_txt, y_note - 0.085, textwrap.fill(
+    fig.text(x_txt, y_note - 0.085 * k, textwrap.fill(
         f"{who} rebuilding on {n_products} uncoordinated schedules: the CVE ID says nothing about "
         "when the fix arrives downstream.", 36),
         ha="left", va="top", fontsize=F_SMALL, color=INK2, linespacing=1.35)
+    if nvd:
+        _fanout_nvd_panel(fig, height, nvd, [r["label"] for r in rows[::-1]])
     _save(fig, output_filename, "fan-out")
+
+
+_FANOUT_NVD_PANEL_H = 3.8   # inches added under the fan-out bars for the NVD panel
+# Short product names for the panel's release labels ("RHEL 9", "Ubuntu Pro 20.04").
+_FANOUT_RELEASE_SHORT = {"rhel": "RHEL", "rocky": "Rocky", "ol": "Oracle Linux", "oracle": "Oracle Linux",
+                         "ubuntu-pro": "Ubuntu Pro", "wolfi": "Wolfi", "sles": "SLES", "almalinux": "AlmaLinux"}
+
+
+def _fanout_nvd_panel(fig, height, nvd, product_order):
+    """NVD's CPE ranges (left) against the fixed builds they still match (right).
+    Positions are in inches from the bottom edge, inside the added band."""
+    def yin(inches):
+        return inches / height
+
+    mono = "DejaVu Sans Mono"
+    x_left, x_right, x_pkg = 0.07, 0.40, 0.60
+    fig.add_artist(plt.Line2D([x_left, 0.955], [yin(3.92)] * 2, transform=fig.transFigure,
+                              color=GRID, linewidth=1.0))
+    fig.text(x_left, yin(3.72), "NVD's CPEs say which upstream versions are affected, not which build carries the fix",
+             ha="left", va="top", fontsize=F_LABEL + 3, fontweight="bold", color=INK)
+
+    # Left: the configuration as NVD publishes it.
+    fig.text(x_left, yin(3.18), "NVD CPE configuration", ha="left", va="top", fontsize=F_SMALL, color=INK2)
+    fig.text(x_left, yin(2.88), f"cpe:2.3:a:{nvd['product']}:{nvd['product']}", ha="left", va="top",
+             fontsize=F_LABEL, color=INK, family=mono)
+    y = 2.58
+    for start, end in nvd["ranges"]:
+        fig.text(x_left + 0.015, yin(y), f"{start} ≤ v < {end}" if start else f"v < {end}", ha="left", va="top",
+                 fontsize=F_LABEL - 1, color=INK, family=mono)
+        y -= 0.24
+    n_ranges = len(nvd["ranges"])
+    fig.text(x_left, yin(y - 0.08), textwrap.fill(
+        f"One product, {n_ranges} upstream version range{'s' if n_ranges != 1 else ''}. "
+        "No distribution, release, package name or fixed build.", 48),
+        ha="left", va="top", fontsize=F_SMALL, color=INK2, linespacing=1.35)
+
+    # Right: the fixed builds those ranges still match. A backported fix keeps
+    # the old upstream version, so a range match reads the patched build as
+    # vulnerable. One line per (package, fixed version); releases sharing a
+    # build share the line, and a release with several such builds lists them.
+    matched, builds = nvd["matched"], nvd["builds"]
+    fig.text(x_right, yin(3.22), f"{len(matched)} of {builds}", ha="left", va="top",
+             fontsize=20, fontweight="bold", color=m.C_RED)
+    fig.text(x_right, yin(2.84), textwrap.fill(
+        f"fixed {nvd['product']} builds ship an upstream version these ranges still call vulnerable: "
+        "the fix was backported, the version number kept.", 100),
+        ha="left", va="top", fontsize=F_SMALL, color=INK2, linespacing=1.3)
+
+    def release_label(b):
+        short = _FANOUT_RELEASE_SHORT.get(b["family"], m.FANOUT_PRODUCTS.get(b["family"], b["family"]))
+        rel = b["release"]
+        num = rel[len(b["family"]) + 1:] if rel.startswith(b["family"] + "-") else ("" if rel == b["family"] else rel)
+        return f"{short} {num}".strip()
+
+    def rank(b):
+        name = m.FANOUT_PRODUCTS.get(b["family"], b["family"])
+        return product_order.index(name) if name in product_order else len(product_order)
+
+    by_build = collections.defaultdict(list)
+    for b in matched:
+        shown = re.sub(r"\+\d+\+[0-9a-f]+$", "", b["fixed"])   # drop the RPM module build hash
+        by_build[(b["package"], shown)].append(b)
+    by_releases = collections.defaultdict(list)
+    for (pkg, shown), bs in by_build.items():
+        bs = sorted({release_label(b): b for b in bs}.values(), key=lambda b: (rank(b), release_label(b)))
+        by_releases[tuple(release_label(b) for b in bs)].append(f"{pkg} {shown}")
+    y = 2.3
+    for releases, pkgs in sorted(by_releases.items(), key=lambda kv: kv[0]):
+        fig.text(x_right, yin(y), ", ".join(releases), ha="left", va="top",
+                 fontsize=F_SMALL + 0.5, fontweight="bold", color=INK)
+        lines = textwrap.wrap(", ".join(sorted(pkgs)), 58)
+        fig.text(x_pkg, yin(y), "\n".join(lines), ha="left", va="top",
+                 fontsize=F_SMALL, color=INK2, family=mono, linespacing=1.3)
+        y -= 0.235 * len(lines)
+
+
+def slide_fanout_downstream_extra(records):
+    """The fan-out slide again for each of ``FANOUT_EXTRA_CVES``, one file per CVE.
+
+    Nothing here is bound to the archive's anchor day: ``audit/cve`` and the CVE
+    document are asked live (``max_age_h=0``, the day's cache only as the
+    fallback), the record is rebuilt from the live document, and the footer
+    dates the slide by those fetches instead of "Data through"."""
+    for record in records:
+        if not record:
+            continue
+        cve = record["id"]
+        audit = m.fetch_audit_cve(cve, max_age_h=0)
+        doc = m.fetch_cve_document(cve, max_age_h=0)
+        if doc:
+            record = m.fanout_record(doc)
+        nvd = m.fanout_cpe_mismatch(audit, m.nvd_cpe_matches(doc))
+        times = [t for t in (m.cache_fetched_at(m.AUDIT_CACHE_BASENAME, cve) if audit else None,
+                             m.cache_fetched_at(m.SEARCH_ID_CACHE_BASENAME, cve) if doc else None) if t]
+        stamp = (f"Vulners API as of {min(times).strftime('%b %-d, %Y %H:%M')}"
+                 + (f" {time.strftime('%Z')}" if time.strftime("%Z") else "")) if times else None
+        slide_fanout_downstream(record, output_filename=(
+            f"cve_monthly_stats_comparison_fanout_downstream_{cve.lower()}_slide.png"),
+            nvd=nvd if nvd and nvd["matched"] else None, stamp=stamp)
 
 
 def slide_fanout_status(record=None, output_filename=SLIDE_FILES["fanout_status"]):
@@ -3175,6 +3295,7 @@ _RENDERERS = [
     ("fanin_chrome", slide_fanin_chrome_estate),      # reads the CSV the line above writes
     ("fanin_chrome", slide_cwe_chrome),
     ("fanout_downstream", slide_fanout_downstream),
+    ("fanout_downstream_extra", slide_fanout_downstream_extra),
     ("fanout_status", slide_fanout_status),
     ("fanout_status", slide_fanout_status_timeline),
     ("exploitation_vs_volume", slide_exploitation_vs_volume),

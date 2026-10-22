@@ -27,6 +27,11 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 ARCHIVE_BASENAME = "vulners_archive_cve.json"
+
+
+def archive_basename(collection):
+    """``vulners_archive_<collection>.json`` — the name both downloaders use."""
+    return f"vulners_archive_{collection}.json"
 COLLECTION_URL = "https://vulners.com/api/v4/archive/collection/"
 UPDATE_URL = "https://vulners.com/api/v4/archive/collection-update/"
 STATE_URL = "https://vulners.com/api/v4/archive/collection-state/"
@@ -55,6 +60,11 @@ MAX_SNAPSHOT_AGE = timedelta(days=7)
 # only ever *reads* the downloader's as a fallback.
 SITE_STATE_SUFFIX = ".site-state.json"
 DOWNLOADER_STATE_SUFFIX = ".state.json"
+
+# The merge writes each document compactly, one per line, as the CDN serves
+# them; ``indent=4`` once grew a 21 GB snapshot to 35 GB. Readers
+# stream with ijson, so the layout is not part of the format.
+_COMPACT = (",", ":")
 
 # How often the merge reports progress, in documents (no tqdm here).
 _MERGE_PROGRESS_EVERY = 100_000
@@ -241,7 +251,7 @@ def _stream_gzip_to(session, url, params, headers, dest, timeout):
     return os.path.getsize(dest)
 
 
-def _published_archive_head(session, headers):
+def _published_archive_head(session, headers, collection="cve"):
     """The first document of the published CDN archive, or ``None``.
 
     Published archives are sorted newest-modified-first, so their first document
@@ -255,7 +265,7 @@ def _published_archive_head(session, headers):
     """
     decoder = json.JSONDecoder()
     with session.get(
-        COLLECTION_URL, params={"type": "cve"}, headers=headers,
+        COLLECTION_URL, params={"type": collection}, headers=headers,
         stream=True, timeout=(10, 60),
     ) as r:
         r.raise_for_status()
@@ -280,7 +290,7 @@ def _published_archive_head(session, headers):
     return None
 
 
-def _report_published_archive(session, headers, watermark, now):
+def _report_published_archive(session, headers, watermark, now, collection="cve"):
     """Print what the CDN is publishing right now, against this local copy.
 
     The watermark line above says how current *this* archive is; it cannot say
@@ -293,7 +303,7 @@ def _report_published_archive(session, headers, watermark, now):
     the line and nothing else.
     """
     try:
-        r = session.get(STATE_URL, params={"type": "cve"}, headers=headers, timeout=30)
+        r = session.get(STATE_URL, params={"type": collection}, headers=headers, timeout=30)
         r.raise_for_status()
         state = r.json().get("result") or {}
     except Exception as e:  # noqa: BLE001 - a missing report must not stop the run
@@ -301,7 +311,7 @@ def _report_published_archive(session, headers, watermark, now):
         print(f"Note: collection-state unavailable ({e}).")
 
     try:
-        head = _published_archive_head(session, headers)
+        head = _published_archive_head(session, headers, collection)
     except Exception as e:  # noqa: BLE001 - ditto
         head = None
         print(f"Note: could not read the published archive's newest record ({e}).")
@@ -384,7 +394,7 @@ def _apply_updates(path, update_file):
                     continue
                 cur.execute(
                     "INSERT OR REPLACE INTO updates (id, data) VALUES (?, ?)",
-                    (doc_id, json.dumps(item, indent=4, cls=_DecimalEncoder)),
+                    (doc_id, json.dumps(item, separators=_COMPACT, cls=_DecimalEncoder)),
                 )
                 staged += 1
                 item_dt = _to_dt(
@@ -416,7 +426,7 @@ def _apply_updates(path, update_file):
                     cur.execute("DELETE FROM updates WHERE id = ?", (doc_id,))
                     modified += 1
                 else:
-                    json.dump(item, new_f, indent=4, cls=_DecimalEncoder)
+                    json.dump(item, new_f, separators=_COMPACT, cls=_DecimalEncoder)
                 first = False
                 total += 1
                 if total % _MERGE_PROGRESS_EVERY == 0:
@@ -448,12 +458,12 @@ def _apply_updates(path, update_file):
                     pass
 
 
-def _download_snapshot(session, path, headers):
+def _download_snapshot(session, path, headers, collection="cve"):
     """Fetch the full ``archive/collection`` snapshot and return its watermark."""
-    print(f"Downloading cve collection snapshot to {path} ...")
+    print(f"Downloading {collection} collection snapshot to {path} ...")
     start = time.time()
     size = _stream_gzip_to(
-        session, COLLECTION_URL, {"type": "cve"}, headers, path, timeout=(10, 300)
+        session, COLLECTION_URL, {"type": collection}, headers, path, timeout=(10, 300)
     )
     if not _is_json_file_complete(path):
         print("Error: downloaded archive failed the completeness check.")
@@ -511,8 +521,10 @@ def _reusable_watermark(path, oldest_allowed_after):
     return watermark
 
 
-def download_archive_once():
-    """Ensure a current ``cve`` archive exists in ``DATA_DIR`` and return its path.
+def download_archive_once(collection="cve"):
+    """Ensure a current archive of ``collection`` (the site needs only ``cve``)
+    exists in ``DATA_DIR`` as ``vulners_archive_<collection>.json``, and return
+    its path.
 
     A complete local archive within the 25h ``collection-update`` window is kept
     and patched with deltas; anything older, missing, or corrupt is refetched as a
@@ -526,7 +538,7 @@ def download_archive_once():
     """
     data_dir = get_data_dir()
     os.makedirs(data_dir, exist_ok=True)
-    path = os.path.join(data_dir, ARCHIVE_BASENAME)
+    path = os.path.join(data_dir, archive_basename(collection))
 
     headers = {"X-Api-Key": get_api_key(), "Accept-Encoding": "gzip"}
     now = datetime.now(timezone.utc)
@@ -536,7 +548,7 @@ def download_archive_once():
     try:
         watermark = _reusable_watermark(path, oldest_allowed_after)
         if watermark is None:
-            watermark = _download_snapshot(session, path, headers)
+            watermark = _download_snapshot(session, path, headers, collection)
         if watermark is None:
             # Only reachable if the fresh snapshot's head would not parse; the
             # widest legal window re-applies more than needed, which is harmless.
@@ -551,7 +563,7 @@ def download_archive_once():
             f"({(now - watermark).total_seconds() / 3600:.1f}h behind); "
             f"fetching updates after {after} ..."
         )
-        _report_published_archive(session, headers, watermark, now)
+        _report_published_archive(session, headers, watermark, now, collection)
 
         update_file = path + ".update.tmp"
         start = time.time()
@@ -559,7 +571,7 @@ def download_archive_once():
             size = _stream_gzip_to(
                 session,
                 UPDATE_URL,
-                {"type": "cve", "after": after},
+                {"type": collection, "after": after},
                 headers,
                 update_file,
                 timeout=(10, 120),
