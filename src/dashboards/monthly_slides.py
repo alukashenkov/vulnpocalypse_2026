@@ -1984,7 +1984,8 @@ def _fanout_rows(record):
     return rows, totals, "references"
 
 
-def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstream"], nvd=None, stamp=None):
+def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstream"], nvd=None, stamp=None,
+                            libdeps=None):
     """One CVE, and how far its fix travels: every downstream package rebuilt for
     it, grouped by the product that ships it. The matched pair of the Chrome
     fan-in slide — same frame, opposite direction of travel.
@@ -2004,7 +2005,12 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
     ``nvd`` (``monthly.fanout_cpe_mismatch``) adds a panel under the bars: NVD's
     CPE ranges next to the fixed builds those ranges still call vulnerable. The
     frame grows by ``_FANOUT_NVD_PANEL_H`` for it; everything above keeps its
-    place in inches from the top."""
+    place in inches from the top.
+
+    ``libdeps`` (``monthly.library_dependents``: rows, totals) adds the second
+    layer below that: the library packages that depend on an affected version,
+    from Vulners' ``vulnersosv`` records. It grows the frame by
+    ``_FANOUT_LIBDEPS_PANEL_H`` and sits at the bottom, under the NVD panel."""
     if not record:
         return
     rows, totals, source = _fanout_rows(record)
@@ -2039,10 +2045,11 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
           + (f" → {totals['releases']} product releases" if source == "audit" else "")
           + f" → {total:,} {unit}")
 
-    height = SLIDE_H + _FANOUT_NVD_PANEL_H if nvd else SLIDE_H
+    lib_h = _FANOUT_LIBDEPS_PANEL_H if libdeps else 0
+    height = SLIDE_H + (_FANOUT_NVD_PANEL_H if nvd else 0) + lib_h
     k = SLIDE_H / height
     # Positions below are in the 16:9 frame; Y maps them into a taller one.
-    Y = (lambda y: 1 - (1 - y) * k) if nvd else (lambda y: y)
+    Y = (lambda y: 1 - (1 - y) * k) if height != SLIDE_H else (lambda y: y)
     fig = _slide(
         f"One {software} fix, and how far it travels before everyone has it",
         f"{cve}  ·  {software}  ·  published {published}{kev_txt}  ·  {scope}",
@@ -2116,7 +2123,9 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
         "when the fix arrives downstream.", 36),
         ha="left", va="top", fontsize=F_SMALL, color=INK2, linespacing=1.35)
     if nvd:
-        _fanout_nvd_panel(fig, height, nvd, [r["label"] for r in rows[::-1]])
+        _fanout_nvd_panel(fig, height, nvd, [r["label"] for r in rows[::-1]], base=lib_h)
+    if libdeps:
+        _fanout_libdeps_panel(fig, height, *libdeps)
     _save(fig, output_filename, "fan-out")
 
 
@@ -2126,11 +2135,12 @@ _FANOUT_RELEASE_SHORT = {"rhel": "RHEL", "rocky": "Rocky", "ol": "Oracle Linux",
                          "ubuntu-pro": "Ubuntu Pro", "wolfi": "Wolfi", "sles": "SLES", "almalinux": "AlmaLinux"}
 
 
-def _fanout_nvd_panel(fig, height, nvd, product_order):
+def _fanout_nvd_panel(fig, height, nvd, product_order, base=0):
     """NVD's CPE ranges (left) against the fixed builds they still match (right).
-    Positions are in inches from the bottom edge, inside the added band."""
+    Positions are in inches from the bottom of the added band, which sits
+    ``base`` inches above the frame's bottom edge."""
     def yin(inches):
-        return inches / height
+        return (inches + base) / height
 
     mono = "DejaVu Sans Mono"
     x_left, x_right, x_pkg = 0.07, 0.40, 0.60
@@ -2194,6 +2204,71 @@ def _fanout_nvd_panel(fig, height, nvd, product_order):
         y -= 0.235 * len(lines)
 
 
+_FANOUT_LIBDEPS_PANEL_H = 3.4   # inches added at the bottom for the library-dependents layer
+_FANOUT_LIBDEPS_MAX_BARS = 6
+
+
+def _fanout_libdeps_panel(fig, height, rows, totals):
+    """The second layer: library packages whose dependency ranges admit an
+    affected version, per affected library (bars, right) under one headline
+    count (left). Positions are in inches from the frame's bottom edge.
+
+    Exposure as the dependency graph states it, not confirmed use, and the
+    panel says so in print; like the rest of the slide it addresses no one."""
+    def yin(inches):
+        return inches / height
+
+    x_left, x_right = 0.07, 0.40
+    deps = totals["dependents"]
+    regs = sorted(totals["registries"].items(), key=lambda kv: -kv[1])
+    reg_txt = " and ".join(m.VULNERSOSV_REGISTRIES.get(r, r) for r, _ in regs[:2]) + (" …" if len(regs) > 2 else "")
+    names = sorted({r["name"] for r in rows}, key=lambda n: -max(r["dependents"] for r in rows if r["name"] == n))
+    lib_txt = (" or ".join([", ".join(names[:-1]), names[-1]]) if len(names) > 1 else names[0]) \
+        if len(names) <= 3 else f"{len(names)} libraries"
+    fig.add_artist(plt.Line2D([x_left, 0.955], [yin(3.52)] * 2, transform=fig.transFigure,
+                              color=GRID, linewidth=1.0))
+    fig.text(x_left, yin(3.32), f"Second layer: {deps:,} {reg_txt} packages depend on an affected {lib_txt}"
+             if len(names) <= 3 else f"Second layer: {deps:,} {reg_txt} packages depend on one of {lib_txt}",
+             ha="left", va="top", fontsize=F_LABEL + 3, fontweight="bold", color=INK)
+
+    # Left: the count, and what it is and is not.
+    fig.text(x_left, yin(2.78), f"{deps:,}", ha="left", va="top", fontsize=26, fontweight="bold", color=m.C_RED)
+    fig.text(x_left, yin(2.18), "library packages", ha="left", va="top", fontsize=F_LABEL, color=INK2)
+    basis = ("Packages whose published dependency ranges admit an affected version, directly or transitively: "
+             "exposure the dependency graph states, not confirmed use. Counted apart from the rebuilt "
+             "packages above.")
+    fig.text(x_left, yin(1.82), textwrap.fill(basis, 52), ha="left", va="top", fontsize=F_SMALL,
+             color=INK2, linespacing=1.35)
+    snap = (datetime.strptime(totals["snapshot"], "%Y-%m-%d").strftime("%b %-d, %Y")
+            if totals.get("snapshot") else "undated")
+    fig.text(x_left, yin(0.95), f"Vulners vulnersosv  ·  dependency snapshot {snap}"
+             + ("  ·  first 2,000 records" if totals.get("truncated") else ""),
+             ha="left", va="top", fontsize=F_SMALL - 0.5, color=INK3, style="italic")
+
+    # Right: one bar per affected library, its affected versions underneath.
+    shown = rows[:_FANOUT_LIBDEPS_MAX_BARS]
+    rest = rows[_FANOUT_LIBDEPS_MAX_BARS:]
+    ax = fig.add_axes([x_right + 0.17, yin(0.95), 0.955 - x_right - 0.27, yin(2.85) - yin(0.95)])
+    _style_axes(ax)
+    ax.grid(False, axis="y")
+    ax.grid(True, axis="x", color=GRID, linestyle="--", linewidth=0.8, alpha=0.7)
+    ys = np.arange(len(shown))[::-1]
+    vals = [r["dependents"] for r in shown]
+    ax.barh(ys, vals, 0.62, color=m.C_RED, alpha=0.95, edgecolor=BG, linewidth=0.6, zorder=3)
+    ax.set_yticks(ys)
+    ax.set_yticklabels([f"{r['name']} ({m.VULNERSOSV_REGISTRIES.get(r['registry'], r['registry'])})" for r in shown],
+                       fontsize=F_SMALL + 0.5, fontweight="bold", color="#E0E0E0")
+    ax.set_ylim(-0.6, len(shown) - 0.4)
+    ax.set_xlim(0, max(vals) * 1.35)
+    ax.tick_params(axis="x", labelsize=F_SMALL)
+    ax.set_xlabel("dependent packages, distinct by name" + (f"  ·  {len(rest)} more libraries not drawn" if rest else ""),
+                  fontsize=F_SMALL, color=INK2)
+    for y, r in zip(ys, shown):
+        t = ax.annotate(f"{r['dependents']:,}   affected {r['span']}", xy=(r["dependents"], y), xytext=(5, 0),
+                        textcoords="offset points", ha="left", va="center", fontsize=8.5, color=INK, zorder=5)
+        _stroke(t, lw=2.5)
+
+
 def slide_fanout_downstream_extra(records):
     """The fan-out slide again for each of ``FANOUT_EXTRA_CVES``, one file per CVE.
 
@@ -2210,13 +2285,25 @@ def slide_fanout_downstream_extra(records):
         if doc:
             record = m.fanout_record(doc)
         nvd = m.fanout_cpe_mismatch(audit, m.nvd_cpe_matches(doc))
+        osv = m.fetch_vulnersosv(cve, max_age_h=0)
+        lib_rows, lib_totals = m.library_dependents(osv)
+        if lib_rows:
+            print(f"Library layer for {cve}: {lib_totals['dependents']:,} dependent packages on "
+                  f"{lib_totals['libraries']} affected libraries (snapshot {lib_totals['snapshot']})")
+        else:
+            # None for a registry vulnersosv does not cover (Composer, OS packages), or a
+            # CVE newer than its dependency snapshot.
+            print(f"Library layer for {cve}: " + ("no vulnersosv records" if osv is not None
+                                                   else "vulnersosv search unavailable"))
         times = [t for t in (m.cache_fetched_at(m.AUDIT_CACHE_BASENAME, cve) if audit else None,
-                             m.cache_fetched_at(m.SEARCH_ID_CACHE_BASENAME, cve) if doc else None) if t]
+                             m.cache_fetched_at(m.SEARCH_ID_CACHE_BASENAME, cve) if doc else None,
+                             m.cache_fetched_at(m.VULNERSOSV_CACHE_BASENAME, cve) if lib_rows else None) if t]
         stamp = (f"Vulners API as of {min(times).strftime('%b %-d, %Y %H:%M')}"
                  + (f" {time.strftime('%Z')}" if time.strftime("%Z") else "")) if times else None
         slide_fanout_downstream(record, output_filename=(
             f"cve_monthly_stats_comparison_fanout_downstream_{cve.lower()}_slide.png"),
-            nvd=nvd if nvd and nvd["matched"] else None, stamp=stamp)
+            nvd=nvd if nvd and nvd["matched"] else None, stamp=stamp,
+            libdeps=(lib_rows, lib_totals) if lib_rows else None)
 
 
 def slide_fanout_status(record=None, output_filename=SLIDE_FILES["fanout_status"]):

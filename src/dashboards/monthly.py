@@ -447,6 +447,7 @@ FANOUT_SHORTLIST = [
 # cve_monthly_stats_comparison_fanout_downstream_<cve id, lower case>_slide.png.
 FANOUT_EXTRA_CVES = [
     "CVE-2026-109618",  # PHP, VulnCheck KEV
+    "CVE-2026-111497",  # brotli (Google)
 ]
 # Reference types that are not downstream changes: scanners and detection
 # content, CVE mirrors and aggregators, exploit and news feeds, KEV lists.
@@ -697,6 +698,138 @@ def fetch_cve_document(cve_id, max_age_h=AUDIT_CACHE_MAX_AGE_H):
     return result
 
 
+# The fan-out slides' second layer: libraries that depend on the vulnerable
+# one. Vulners' ``vulnersosv`` records name one affected library
+# (``baseAffectedLibrary``: registry, name, a version or a version range) and
+# the packages that pull it in transitively (``transitiveAffectedLibraries``),
+# from a dependency snapshot (``snapshot_date``); they cover maven, pypi, npm
+# and cargo only. Each source advisory (PYSEC, GHSA, Snyk, …) carries its own
+# copy of the same graph, so dependents are counted distinct per registry and
+# name. Asked per CVE through search, never through the ~21 GB archive.
+VULNERS_SEARCH_LUCENE_URL = "https://vulners.com/api/v3/search/lucene/"
+VULNERSOSV_CACHE_BASENAME = "vulners_vulnersosv_cache.json"
+VULNERSOSV_FIELDS = ["id", "cvelist", "href", "snapshot_date", "baseAffectedLibrary", "transitiveAffectedLibraries"]
+VULNERSOSV_MAX_DOCS = 2000      # pages of 100; a CVE with more is cut here and says so
+VULNERSOSV_REGISTRIES = {"pypi": "PyPI", "npm": "npm", "maven": "Maven", "cargo": "crates.io"}
+
+
+def fetch_vulnersosv(cve_id, max_age_h=AUDIT_CACHE_MAX_AGE_H):
+    """The ``vulnersosv`` records naming one CVE (``type:vulnersosv AND
+    cvelist:<id>``), trimmed to ``VULNERSOSV_FIELDS``; cached in DATA_DIR with
+    ``fetch_audit_cve``'s ``max_age_h`` rule. Returns ``{"docs", "total"}``
+    (``total`` as search reports it, which exceeds ``len(docs)`` only past
+    ``VULNERSOSV_MAX_DOCS``), or ``None`` without an API key or on failure."""
+    _local_only("Vulners vulnersosv search")
+    path = os.path.join(os.path.abspath(os.getenv("DATA_DIR") or os.getcwd()), VULNERSOSV_CACHE_BASENAME)
+    cache = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+        except (OSError, ValueError):
+            cache = {}
+    hit = cache.get(cve_id)
+    if hit and isinstance(hit, dict) and "fetched" in hit:
+        try:
+            age_h = (datetime.now() - datetime.fromisoformat(hit["fetched"])).total_seconds() / 3600
+        except ValueError:
+            age_h = float("inf")
+        if age_h < max_age_h and hit.get("result") is not None:
+            return hit["result"]
+    api_key = os.getenv("VULNERS_API_KEY")
+    if not api_key:
+        return hit.get("result") if hit else None
+    docs, total = [], None
+    try:
+        while total is None or len(docs) < min(total, VULNERSOSV_MAX_DOCS):
+            r = requests.post(VULNERS_SEARCH_LUCENE_URL, json={
+                "query": f"type:vulnersosv AND cvelist:{cve_id}", "skip": len(docs), "size": 100,
+                "fields": VULNERSOSV_FIELDS}, headers={"X-Api-Key": api_key}, timeout=60)
+            r.raise_for_status()
+            data = r.json()["data"]
+            total = int(data["total"])
+            page = [h["_source"] for h in data["search"] if isinstance(h.get("_source"), dict)]
+            if not page:
+                break
+            docs.extend(page)
+    except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+        print(f"vulnersosv search failed for {cve_id}: {e}")
+        return hit.get("result") if hit else None
+    result = {"docs": docs, "total": total or 0}
+    cache[cve_id] = {"fetched": datetime.now().isoformat(timespec="seconds"), "result": result}
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except OSError as e:
+        print(f"Could not write {path}: {e}")
+    return result
+
+
+def _library_range(lib):
+    """``"1.0.7 – 1.1.0"``, ``"≥ 2.0"``, ``"0.6.0"``: the versions one
+    ``vulnersosv`` library entry covers."""
+    if lib.get("version"):
+        return str(lib["version"])
+    lo, hi = lib.get("versionStartIncluding"), lib.get("versionEndIncluding") or lib.get("versionEndExcluding")
+    if lo and hi:
+        return f"{lo} – {hi}" if lib.get("versionEndIncluding") else f"{lo} – <{hi}"
+    if hi:
+        return f"≤ {hi}" if lib.get("versionEndIncluding") else f"< {hi}"
+    return f"≥ {lo}" if lo else "any"
+
+
+def library_dependents(result):
+    """The second layer, from a ``fetch_vulnersosv`` result: per affected
+    library, the distinct packages that depend on it.
+
+    Returns ``(rows, totals)``: ``rows`` sorted by dependents, each
+    ``{"registry", "name", "ranges": [affected versions], "span": their
+    envelope as text, "dependents": n, "advisories": n}``; ``totals`` = ``{"libraries", "dependents" (distinct
+    across libraries), "registries": {registry: dependents}, "snapshot",
+    "truncated"}``. ``([], None)`` when there are no records."""
+    docs = (result or {}).get("docs") or []
+    per, everyone, snapshots = {}, set(), set()
+    for d in docs:
+        base = d.get("baseAffectedLibrary") or {}
+        if not base.get("name"):
+            continue
+        key = (str(base.get("registry") or "?").lower(), base["name"])
+        row = per.setdefault(key, {"ranges": set(), "versions": set(), "dependents": set(), "advisories": set()})
+        row["ranges"].add(_library_range(base))
+        row["versions"].update(v for v in (base.get("version"), base.get("versionStartIncluding"),
+                                           base.get("versionEndIncluding"), base.get("versionEndExcluding"))
+                               if v and _version_tuple(v) is not None)
+        row["advisories"].add(d.get("href") or d.get("id"))
+        for lib in d.get("transitiveAffectedLibraries") or []:
+            if isinstance(lib, dict) and lib.get("name"):
+                dep = (str(lib.get("registry") or key[0]).lower(), lib["name"])
+                if dep != key:
+                    row["dependents"].add(dep)
+                    everyone.add(dep)
+        if d.get("snapshot_date"):
+            snapshots.add(d["snapshot_date"])
+    if not per:
+        return [], None
+    def span(r):
+        # The advisories' ranges overlap (one per source), so the slide shows
+        # their envelope: lowest to highest version any of them names.
+        vs = sorted(r["versions"], key=_version_tuple)
+        if not vs or len(r["ranges"]) == 1:
+            return next(iter(r["ranges"])) if len(r["ranges"]) == 1 else "any"
+        return vs[0] if vs[0] == vs[-1] else f"{vs[0]} – {vs[-1]}"
+
+    rows = [{"registry": reg, "name": name, "ranges": sorted(r["ranges"]), "span": span(r),
+             "dependents": len(r["dependents"]), "advisories": len(r["advisories"])}
+            for (reg, name), r in per.items()]
+    rows.sort(key=lambda r: (-r["dependents"], r["registry"], r["name"]))
+    registries = collections.Counter(reg for reg, _ in everyone)
+    totals = {"libraries": len(rows), "dependents": len(everyone), "registries": dict(registries),
+              "snapshot": max(snapshots) if snapshots else None,
+              "truncated": (result.get("total") or 0) > len(docs)}
+    return rows, totals
+
+
 def nvd_cpe_matches(doc):
     """NVD's vulnerable ``cpeMatch`` entries (``criteria``, ``versionStartIncluding``,
     ``versionEndExcluding``, …) from a Vulners CVE document's
@@ -787,14 +920,17 @@ def fanout_packages(audit_result):
 
     One update = one package name on one product release; the same package
     listed under two advisories (a vendor's own id and OSV's mirror) is one
-    update. Returns ``(rows, totals)``: ``rows`` sorted by updates, each
+    update. Only entries that name a fixed version count (``_audit_is_fix``):
+    ``affectedPackages`` also carries OSV's enumerated affected builds (``=x``)
+    and releases with no fix yet (``<=x``, a bare ``>=x``), which are not
+    rebuilds. Returns ``(rows, totals)``: ``rows`` sorted by updates, each
     ``{"product", "updates", "releases", "advisories", "packages": [base names by
     frequency]}``; ``totals`` = ``{"updates", "products", "releases", "advisories"}``.
     """
     per = {}
     all_releases, all_advisories, all_updates = set(), set(), set()
     for p in (audit_result or {}).get("affectedPackages") or []:
-        if not isinstance(p, dict) or not p.get("name"):
+        if not isinstance(p, dict) or not p.get("name") or not _audit_is_fix(p.get("range")):
             continue
         distro = p.get("distro") or []
         family = distro[0] if distro else None
@@ -824,6 +960,14 @@ def fanout_packages(audit_result):
     totals = {"updates": len(all_updates), "products": len(rows), "releases": len(all_releases),
               "advisories": len(all_advisories)}
     return rows, totals
+
+
+def _audit_is_fix(rng):
+    """True when an ``affectedPackages`` range names a fixed version: a strict
+    upper bound (``<x``, ``>=a,<b``, FreeBSD's ``<x,epoch``). ``=x`` is one
+    affected build; ``<=x`` and a bare ``>=x`` mean no fixed version yet."""
+    return any(part.strip().startswith("<") and not part.strip().startswith("<=")
+               for part in str(rng or "").split(","))
 
 
 def _fanout_route_advisory(adv_id):
