@@ -2891,17 +2891,19 @@ def slide_exploitation_trends(stats, anchor_date, anchor_month_complete=False, w
     fig = _slide(
         f"Trend a year: CVE publications {p_pct}, CISA KEV {k_pct}, exploited {w_pct}",
         f"{p['first_lbl']} → {p['last_lbl']}, complete months"
+        + (f" + {p['partial']['lbl']} so far (hollow, not fitted)" if p["partial"] else "")
         + (f"  ·  publications above their band since {since.strftime('%b %Y')}" if since else "")
         + "  ·  log axes, same ratio in every panel  ·  dashed: robust trend (Theil–Sen on log counts), "
-        f"shaded ±2σ, ringed: outside it  ·  wildExploited includes all {p['kev_total']:,} KEV CVEs",
+        f"shaded ±2σ, ringed: outside it  ·  wildExploited includes all KEV CVEs",
     )
+    part = p["partial"]
     panels = [
         ("CVE publications", pubs, m.C_RED, p_pct),
         ("CISA KEV additions", kev, m.C_BLUE, k_pct),
         ("Exploited (wildExploited)", wild, m.C_YELLOW, w_pct),
     ]
 
-    limits = m._trend_panel_ylim([srs for _, srs, _c, _p in panels])
+    limits = m._trend_panel_ylim([srs for _, srs, _c, _p in panels], with_partial=True)
     top, bottom, gap = CONTENT_TOP, AXES_BOTTOM, 0.022
     h = (top - bottom - 2 * gap) / 3
     last = p["last_lbl"]
@@ -2913,7 +2915,9 @@ def slide_exploitation_trends(stats, anchor_date, anchor_month_complete=False, w
         if k == 0:
             # The shared x axis is final before any outlier label is placed:
             # placement measures the labels against it.
-            _exploitation_xaxis(ax, p)
+            _exploitation_xaxis(ax, p, with_partial=True)
+            # Thirty-odd months: full "Jan 2024" ticks run into each other.
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
         ax.set_yscale("log")
         ax.set_ylim(*limits[k])
         ax.yaxis.set_major_locator(matplotlib.ticker.LogLocator(base=10, subs=(1, 2, 5)))
@@ -2927,12 +2931,23 @@ def slide_exploitation_trends(stats, anchor_date, anchor_month_complete=False, w
             ax.plot(x, t["fit"], color=color, linewidth=1.8, linestyle=(0, (6, 4)), zorder=2)
         ax.plot(x, srs["values"], color=color, linewidth=2.0, marker="o", markersize=3.5, zorder=3)
 
+        tail = []
+        if part and srs["partial"]:
+            # The running month as a dashed tail to a hollow marker, as on the
+            # web chart; kept out of the trend, its count in the margin label.
+            ax.plot([x[-1], part["x"]], [srs["values"][-1], srs["partial"]], color=color, linewidth=2.0,
+                    linestyle=(0, (4, 3)), marker="o", markersize=6, markevery=[1],
+                    markerfacecolor=BG, markeredgewidth=1.6, zorder=3)
+            tail = [(ax, [x[-1], part["x"]], [srs["values"][-1], srs["partial"]])]
+
         if srs["trend"]:
-            m._label_trend_outliers(ax, p, srs, color, F_SMALL, lambda t: _stroke(t, 2.5))
+            m._label_trend_outliers(ax, p, srs, color, F_SMALL, lambda t: _stroke(t, 2.5), extra_lines=tail)
 
         sub = f"trend {pct} a year  ·  {srs['values'][-1]:,} in {last}"
         n_out = len(srs["trend"]["outliers"])
         sub2 = f"{n_out} month{'s' if n_out != 1 else ''} outside the band" if n_out else "no month outside the band"
+        if part and srs["partial"]:
+            sub2 += f"\n{part['lbl']} so far: {srs['partial']:,}"
         y_lab = srs["trend"]["fit"][-1]
         _end_labels(ax, [{"y": y_lab, "color": color, "main": name, "sub": f"{sub}\n{sub2}"}], min_gap=0.3)
         if k < 2:

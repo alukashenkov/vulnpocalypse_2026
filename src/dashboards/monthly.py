@@ -257,7 +257,10 @@ CHART_CAPTIONS = {
         "published in a month, the CVEs CISA added to its Known Exploited "
         "Vulnerabilities catalog that month, and every CVE Vulners has seen "
         "exploited in the wild, KEV included, dated by the first source to "
-        "report it. Each panel is a log axis spanning the same ratio, so a "
+        "report it. The window is the last three years and rolls forward a "
+        "month at a time; the month still running trails off to a hollow "
+        "marker and stays out of the fit until it closes. Each "
+        "panel is a log axis spanning the same ratio, so a "
         "doubling is the same height in all three and the slopes compare "
         "directly. The dashed line is the series' growth trend, fitted so a few "
         "wild months cannot drag it around, and the title gives each one as a "
@@ -1394,6 +1397,10 @@ EXPLOIT_START_MONTH = "2024-01"
 # definition). Each series gets its own band over the same months. Move this
 # forward by hand only to re-baseline.
 EXPLOIT_CORRIDOR_THROUGH = "2026-08"
+# The growth-trends chart (``_prep_exploitation_trends``) rolls instead: the
+# last this-many complete months, plus the running month as a dashed tail. On
+# the 1st the anchor month has just closed, so it is exactly this many.
+EXPLOIT_TRENDS_MONTHS = 36
 KEV_CATALOG_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 KEV_CATALOG_BASENAME = "known_exploited_vulnerabilities.json"
 
@@ -1483,8 +1490,10 @@ def wild_exploited_by_month(wild_first_seen, anchor_date):
     return dict(counts)
 
 
-def _prep_exploitation(stats, anchor_date, anchor_month_complete=False, exploited=None):
-    """Complete months from ``EXPLOIT_START_MONTH``, their publication counts,
+def _prep_exploitation(stats, anchor_date, anchor_month_complete=False, exploited=None,
+                       months_back=None):
+    """Complete months from ``EXPLOIT_START_MONTH`` (or the last
+    ``months_back`` complete months when given), their publication counts,
     and CISA KEV additions; ``None`` when the catalog is unavailable. Shared by
     ``plot_exploitation_vs_volume`` and the exploitation slides. ``exploited``
     (``{"YYYY-MM": count}``) replaces the KEV series when given — the Vulners
@@ -1494,7 +1503,11 @@ def _prep_exploitation(stats, anchor_date, anchor_month_complete=False, exploite
     last = date(anchor.year, anchor.month, 1)
     if not anchor_month_complete:
         last = (last - timedelta(days=1)).replace(day=1)
-    months = _months_between(EXPLOIT_START_MONTH, last.strftime("%Y-%m"))
+    start = EXPLOIT_START_MONTH
+    if months_back:
+        idx = last.year * 12 + last.month - months_back
+        start = f"{idx // 12}-{idx % 12 + 1:02d}"
+    months = _months_between(start, last.strftime("%Y-%m"))
     if len(months) < 3:
         return None
     keys = [mo.strftime("%Y-%m") for mo in months]
@@ -1615,8 +1628,9 @@ def _place_clear(txt, candidates, lines, pad_px=2, inside=None):
     return False
 
 def _prep_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wild_cve_first_seen=None):
-    """Publications, Vulners wildExploited and CISA KEV per complete month, each
-    as a multiple of its own 2024 monthly average, with a robust trend
+    """Publications, Vulners wildExploited and CISA KEV per complete month over
+    the last ``EXPLOIT_TRENDS_MONTHS``, each as a multiple of its own
+    first-calendar-year monthly average, with a robust trend
     (``robust_log_trend``) for the two exploited series. ``None`` without the
     KEV catalog or the archive's wildExploited dates.
 
@@ -1627,7 +1641,7 @@ def _prep_exploitation_trends(stats, anchor_date, anchor_month_complete=False, w
     as on the KEV slide. The running month is left out: half a month on an
     index axis reads as a collapse.
     """
-    d = _prep_exploitation(stats, anchor_date, anchor_month_complete)
+    d = _prep_exploitation(stats, anchor_date, anchor_month_complete, months_back=EXPLOIT_TRENDS_MONTHS)
     if d is None or not wild_cve_first_seen:
         return None
     path = download_cisa_kev()
