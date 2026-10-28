@@ -1972,8 +1972,10 @@ def _fanout_rows(record):
     reached, else from the archive references (records per issuer)."""
     audit_rows, totals = m.fanout_packages(m.fetch_audit_cve(record["id"]))
     if audit_rows:
-        rows = [{"label": r["product"], "value": r["updates"],
-                 "note": f"{r['releases']} release{'s' if r['releases'] != 1 else ''} · "
+        rows = [{"label": r["product"], "value": r["updates"], "vendor": r["kind"] == "vendor",
+                 "note": (f"vendor advisory · {r['releases']} product line{'s' if r['releases'] != 1 else ''} · "
+                          if r["kind"] == "vendor" else
+                          f"{r['releases']} release{'s' if r['releases'] != 1 else ''} · ")
                          + ", ".join(sorted(r["packages"][:8], key=len)[:3])}
                 for r in audit_rows]
         return rows, totals, "audit"
@@ -2007,7 +2009,8 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
     frame grows by ``_FANOUT_NVD_PANEL_H`` for it; everything above keeps its
     place in inches from the top.
 
-    ``libdeps`` (``monthly.library_dependents``: rows, totals) adds the second
+    ``libdeps`` (``monthly.library_dependents``' rows and totals, plus
+    ``monthly.library_dependents_status``' rows or None) adds the second
     layer below that: the library packages that depend on an affected version,
     from Vulners' ``vulnersosv`` records. It grows the frame by
     ``_FANOUT_LIBDEPS_PANEL_H`` and sits at the bottom, under the NVD panel."""
@@ -2018,16 +2021,34 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
         return
     total = totals["updates"]
     n_products = len(rows)
+    # The registry bar the second layer grows from (PyPI for brotli) shares its
+    # accent colour with that panel, and its note points down to it.
+    if libdeps:
+        linked = {m.FANOUT_REGISTRIES.get(reg, reg) for reg in (libdeps[1].get("registries") or {})}
+        for r in rows:
+            if r["label"] in linked:
+                r["link"] = True
+                r["note"] += f"  ·  {libdeps[1]['dependents']:,} dependents in the second layer ↓"
     if len(rows) > _FANOUT_MAX_BARS:
-        head, tail = rows[:_FANOUT_MAX_BARS - 1], rows[_FANOUT_MAX_BARS - 1:]
+        # Vendor-advisory bars and the second layer's own bar are never
+        # pooled: the x label and the panel below each name them.
+        keep = lambda r: r.get("vendor") or r.get("link")  # noqa: E731
+        cut = _FANOUT_MAX_BARS - 1
+        cut -= sum(1 for r in rows[cut:] if keep(r))
+        head = rows[:cut] + [r for r in rows[cut:] if keep(r)]
+        tail = [r for r in rows[cut:] if not keep(r)]
         rows = head + [{"label": f"{len(tail)} more products", "value": sum(r["value"] for r in tail),
                         "note": ", ".join(r["label"] for r in tail[:4]) + ("…" if len(tail) > 4 else "")}]
     rows = rows[::-1]                                  # biggest at the top
     pooled_idx = 0 if len(rows) < n_products else None
 
     cve = record["id"]
-    software = record["software"][0] if record["software"] else (record["reporter"] or "")
+    software = (record["software"][0] if record["software"]
+                else (record.get("cpe_products") or [None])[0] or record["reporter"] or "")
     software = _FANOUT_SOFTWARE_LABELS.get(software, software.replace("_", " "))
+    # The assigning CNA, when the software's name does not already carry it.
+    reporter = record["reporter"] or ""
+    cna_txt = f"assigned by {reporter}  ·  " if reporter and reporter.lower() not in software.lower() else ""
     # The record's ``kev`` flag is its vulncheck_kev reference; CISA is named only
     # when the CVE is in CISA's own catalog.
     if cve.upper() in m.load_cisa_kev_cves():
@@ -2035,9 +2056,14 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
     else:
         kev_txt = "  ·  VulnCheck KEV" if record["kev"] else ""
     published = datetime.strptime(record["published"], "%Y-%m-%d").strftime("%b %-d, %Y") if record["published"] else ""
-    unit = "rebuilt packages" if source == "audit" else "downstream records"
+    vendor_n = totals.get("vendor_updates") or 0
+    # Vendor advisories fix product versions, not packages: with any on the
+    # slide the count is of fixed builds, and the subtitle says how many.
+    unit = ("fixed builds" if vendor_n else "rebuilt packages") if source == "audit" else "downstream records"
     if source == "audit":
-        scope = f"{n_products} products, {totals['releases']} releases, {total:,} {unit}  ·  Vulners audit/cve"
+        scope = (f"{n_products} products, {totals['releases']} releases, {total:,} {unit}"
+                 + (f" ({total - vendor_n:,} packages, {vendor_n} in vendor advisories)" if vendor_n else "")
+                 + "  ·  Vulners audit/cve")
     else:
         scope = f"{n_products} issuers, {total:,} {unit}  ·  archive references (audit/cve unavailable)"
     print(f"Fan-out ladder for {cve}: one upstream fix → {n_products} "
@@ -2051,8 +2077,8 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
     # Positions below are in the 16:9 frame; Y maps them into a taller one.
     Y = (lambda y: 1 - (1 - y) * k) if height != SLIDE_H else (lambda y: y)
     fig = _slide(
-        f"One {software} fix, and how far it travels before everyone has it",
-        f"{cve}  ·  {software}  ·  published {published}{kev_txt}  ·  {scope}",
+        f"{cve}: one {software} fix, and how far it travels before everyone has it",
+        f"{cna_txt}published {published}{kev_txt}  ·  {scope}",
         height=height, stamp=stamp,
     )
     ax = fig.add_axes([0.225, Y(0.115), 0.51, Y(CONTENT_TOP) - Y(0.115)])
@@ -2062,16 +2088,22 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
 
     values = [r["value"] for r in rows]
     ys = np.arange(len(rows))
-    colors = [m.C_GRAY if i == pooled_idx else m.C_RED for i in ys]
+    colors = [m.C_GRAY if i == pooled_idx else _FANOUT_LINK if r.get("link") else m.C_BLUE if r.get("vendor")
+              else m.C_RED
+              for i, r in zip(ys, rows)]
     ax.barh(ys, values, 0.72, color=colors, alpha=0.95, edgecolor=BG, linewidth=0.6, zorder=3)
     ax.set_yticks(ys)
     ax.set_yticklabels([r["label"] for r in rows], fontsize=F_LABEL - 0.5, fontweight="bold", color="#E0E0E0")
+    for tick, r in zip(ax.get_yticklabels(), rows):
+        if r.get("link"):
+            tick.set_color(_FANOUT_LINK)
     ax.tick_params(axis="y", pad=8)
     x_max = max(values) * 1.02
     ax.set_xlim(0, x_max)
     ax.set_ylim(-0.6, len(rows) - 0.4)
     ax.set_xlabel(
-        "rebuilt packages: distinct package × product release" if source == "audit"
+        ("fixed builds: package × product release (red), product line × fixed version in a vendor advisory (blue)"
+         if vendor_n else "rebuilt packages: distinct package × product release") if source == "audit"
         else "distinct downstream records referencing the CVE",
         fontsize=F_TICK, color=INK2,
     )
@@ -2125,7 +2157,7 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
     if nvd:
         _fanout_nvd_panel(fig, height, nvd, [r["label"] for r in rows[::-1]], base=lib_h)
     if libdeps:
-        _fanout_libdeps_panel(fig, height, *libdeps)
+        _fanout_libdeps_panel(fig, height, *libdeps, link=any(r.get("link") for r in rows))
     _save(fig, output_filename, "fan-out")
 
 
@@ -2208,10 +2240,17 @@ _FANOUT_LIBDEPS_PANEL_H = 3.4   # inches added at the bottom for the library-dep
 _FANOUT_LIBDEPS_MAX_BARS = 6
 
 
-def _fanout_libdeps_panel(fig, height, rows, totals):
+_FANOUT_LINK = "#A55EEA"   # the registry bar and the second layer that grows from it
+
+
+def _fanout_libdeps_panel(fig, height, rows, totals, status=None, link=False):
     """The second layer: library packages whose dependency ranges admit an
-    affected version, per affected library (bars, right) under one headline
-    count (left). Positions are in inches from the frame's bottom edge.
+    affected version. With ``status`` (``monthly.library_dependents_status``
+    rows) it is the library-dependents slide's state bar across the full
+    width — what each dependent's current release does about the fix; without
+    it (a registry PyPI metadata does not cover) one bar per affected library
+    under one headline count. Positions are in inches from the frame's bottom
+    edge.
 
     Exposure as the dependency graph states it, not confirmed use, and the
     panel says so in print; like the rest of the slide it addresses no one."""
@@ -2227,9 +2266,30 @@ def _fanout_libdeps_panel(fig, height, rows, totals):
         if len(names) <= 3 else f"{len(names)} libraries"
     fig.add_artist(plt.Line2D([x_left, 0.955], [yin(3.52)] * 2, transform=fig.transFigure,
                               color=GRID, linewidth=1.0))
-    fig.text(x_left, yin(3.32), f"Second layer: {deps:,} {reg_txt} packages depend on an affected {lib_txt}"
-             if len(names) <= 3 else f"Second layer: {deps:,} {reg_txt} packages depend on one of {lib_txt}",
+    lead = f"Second layer, from the {reg_txt} bar above" if link else "Second layer"
+    fig.text(x_left, yin(3.32), f"{lead}: {deps:,} {reg_txt} packages depend on an affected {lib_txt}"
+             if len(names) <= 3 else f"{lead}: {deps:,} {reg_txt} packages depend on one of {lib_txt}",
              ha="left", va="top", fontsize=F_LABEL + 3, fontweight="bold", color=INK)
+    if link:
+        # The accent stripe down the panel's left edge, in the bar's colour.
+        fig.add_artist(plt.Line2D([x_left - 0.014] * 2, [yin(0.72), yin(3.36)], transform=fig.transFigure,
+                                  color=_FANOUT_LINK, linewidth=4, solid_capstyle="butt"))
+    snap = (datetime.strptime(totals["snapshot"], "%Y-%m-%d").strftime("%b %-d, %Y")
+            if totals.get("snapshot") else "undated")
+    source = (f"Vulners vulnersosv  ·  dependency snapshot {snap}"
+              + ("  ·  first 2,000 records" if totals.get("truncated") else ""))
+
+    if status:
+        counts = collections.Counter(r["state"] for r in status)
+        _libdeps_state_bar(fig, x_left, 0.955, yin(1.92), yin(2.52) - yin(1.92), counts)
+        basis = ("Each package's current PyPI release, read against the fix: \"admit a fixed build\" means a fresh "
+                 "resolve picks one, while installs locked or built earlier keep the old version. Exposure the "
+                 "dependency metadata declares, not confirmed use; counted apart from the fixed builds above.")
+        fig.text(x_left, yin(1.40), textwrap.fill(basis, 150), ha="left", va="top", fontsize=F_SMALL,
+                 color=INK2, linespacing=1.35)
+        fig.text(x_left, yin(0.80), source + "  ·  PyPI package metadata", ha="left", va="top",
+                 fontsize=F_SMALL - 0.5, color=INK3, style="italic")
+        return
 
     # Left: the count, and what it is and is not.
     fig.text(x_left, yin(2.78), f"{deps:,}", ha="left", va="top", fontsize=26, fontweight="bold", color=m.C_RED)
@@ -2239,11 +2299,7 @@ def _fanout_libdeps_panel(fig, height, rows, totals):
              "packages above.")
     fig.text(x_left, yin(1.82), textwrap.fill(basis, 52), ha="left", va="top", fontsize=F_SMALL,
              color=INK2, linespacing=1.35)
-    snap = (datetime.strptime(totals["snapshot"], "%Y-%m-%d").strftime("%b %-d, %Y")
-            if totals.get("snapshot") else "undated")
-    fig.text(x_left, yin(0.95), f"Vulners vulnersosv  ·  dependency snapshot {snap}"
-             + ("  ·  first 2,000 records" if totals.get("truncated") else ""),
-             ha="left", va="top", fontsize=F_SMALL - 0.5, color=INK3, style="italic")
+    fig.text(x_left, yin(0.95), source, ha="left", va="top", fontsize=F_SMALL - 0.5, color=INK3, style="italic")
 
     # Right: one bar per affected library, its affected versions underneath.
     shown = rows[:_FANOUT_LIBDEPS_MAX_BARS]
@@ -2267,6 +2323,201 @@ def _fanout_libdeps_panel(fig, height, rows, totals):
         t = ax.annotate(f"{r['dependents']:,}   affected {r['span']}", xy=(r["dependents"], y), xytext=(5, 0),
                         textcoords="offset points", ha="left", va="center", fontsize=8.5, color=INK, zorder=5)
         _stroke(t, lw=2.5)
+
+
+_LIBDEPS_COLORS = {"pinned": m.C_RED, "held": "#A8323E", "admits": m.C_YELLOW, "left_after": m.C_GREEN,
+                   "left_before": "#4B525C", "unknown": m.C_GRAY}
+_LIBDEPS_SHORT = {"pinned": "pin an affected version themselves", "held": "held by another package's pin",
+                  "admits": "admit a fixed build", "left_after": "left the range after the fix",
+                  "left_before": "left the range before the fix", "unknown": "route not in the metadata"}
+_LIBDEPS_MIN_GROUP = 3   # holding packages drawn as their own bar; smaller groups pool
+# (at 3 a pooled group is one package alone or one holding one dependent; the note says so)
+
+
+def _libdeps_state_bar(fig, x0, x1, y_bar, h_bar, counts):
+    """Every dependent as one bar by state (``monthly.LIBDEPS_STATES``), a
+    bracket over the locked-in part and a legend row under it with each
+    state's count. ``y_bar``/``h_bar`` are figure fractions; the gaps around
+    the bar keep their size in inches in a taller frame."""
+    k = SLIDE_H / fig.get_figheight()
+    n = sum(counts.values())
+    order = [s for s in m.LIBDEPS_STATES if counts[s]]
+    ax = fig.add_axes([x0, y_bar, x1 - x0, h_bar])
+    ax.set_axis_off()
+    ax.set_xlim(0, n)
+    ax.set_ylim(0, 1)
+    left = 0
+    for s in order:
+        ax.barh(0.5, counts[s], 1.0, left=left, color=_LIBDEPS_COLORS[s], edgecolor=BG, linewidth=1.2)
+        if counts[s] / n > 0.06:
+            t = ax.text(left + counts[s] / 2, 0.5, f"{counts[s]}", ha="center", va="center",
+                        fontsize=F_LABEL + 2, fontweight="bold", color=INK)
+            _stroke(t, lw=2.5)
+        left += counts[s]
+    # Bracket over the locked-in part.
+    locked = counts["pinned"] + counts["held"]
+    lock_w = locked / n * (x1 - x0)
+    top = y_bar + h_bar
+    fig.add_artist(plt.Line2D([x0, x0, x0 + lock_w, x0 + lock_w], [top + 0.008 * k, top + 0.02 * k,
+                              top + 0.02 * k, top + 0.008 * k], transform=fig.transFigure,
+                              color=INK2, linewidth=1.2))
+    fig.text(x0 + lock_w / 2, top + 0.026 * k, f"{locked} locked in: a new release of the package "
+             "or of what holds it is the only way out", ha="center", va="bottom", fontsize=F_SMALL, color=INK2)
+    # Legend row: every state with its count, in bar order.
+    lx = x0
+    for s in order:
+        fig.add_artist(plt.Rectangle((lx, y_bar - 0.042 * k), 0.011, 0.02 * k, transform=fig.transFigure,
+                                     color=_LIBDEPS_COLORS[s]))
+        t = fig.text(lx + 0.015, y_bar - 0.032 * k, f"{counts[s]} {_LIBDEPS_SHORT[s]}", ha="left", va="center",
+                     fontsize=F_SMALL, color=INK)
+        lx += t.get_window_extent(fig.canvas.get_renderer()).width / (fig.get_figwidth() * fig.dpi) + 0.03
+
+
+def slide_fanout_libdeps(cve, rows, info, software, output_filename, stamp=None):
+    """The fan-out slides' second layer on its own: every package the
+    vulnersosv graph lists as depending on an affected version, by what its
+    current PyPI release does about it (``monthly.library_dependents_status``).
+
+    Top, the whole set as one bar by state. Bottom left, the packages still
+    locked in, grouped by the package whose pin holds them: a hub that pins the
+    library itself (its dependents inherit the pin), a hub that has since
+    shipped the fix while its dependents pin its older releases, or a package
+    that pins it alone. Bottom right, when the locked-in packages last
+    released: a pin only moves with a new release. Like the fan-out slide it
+    describes the ecosystem and addresses no one."""
+    if not rows:
+        return
+    by_name = {r["name"]: r for r in rows}
+    n = len(rows)
+    counts = collections.Counter(r["state"] for r in rows)
+    locked = [r for r in rows if r["state"] in ("pinned", "held")]
+    base = info["base"]
+    fixes = [f"{b} {i['fixed']}" for b, i in sorted(base.items(), key=lambda kv: kv[0] != software) if i["fixed"]]
+    fix_day = datetime.strptime(info["fix_day"], "%Y-%m-%d") if info.get("fix_day") else None
+    fix_txt = fix_day.strftime("%b %-d, %Y") if fix_day else "no fixed release yet"
+
+    def day(s):
+        return datetime.strptime(s, "%Y-%m-%d").strftime("%b %-d, %Y") if s else "undated"
+
+    print(f"Library dependents for {cve}: " + ", ".join(f"{counts[s]} {s}" for s in m.LIBDEPS_STATES if counts[s]))
+    fig = _slide(
+        f"{len(locked)} of {n} PyPI packages built on {software} still lock in an affected version",
+        f"{cve}  ·  fixed in {' / '.join(fixes) or software} ({fix_txt})  ·  each package's current PyPI release"
+        f"  ·  graph: Vulners vulnersosv, {day(info.get('snapshot'))[:-6]}",
+        stamp=stamp,
+    )
+
+    # ── Top: the whole set, one bar ──────────────────────────────────────────
+    x0, x1 = 0.07, 0.955
+    _libdeps_state_bar(fig, x0, x1, 0.70, 0.065, counts)
+
+    # ── Bottom left: what holds them ─────────────────────────────────────────
+    groups = collections.Counter(r["root"] for r in locked)
+    big = [(g, c) for g, c in groups.most_common() if c >= _LIBDEPS_MIN_GROUP]
+    small = [(g, c) for g, c in groups.items() if c < _LIBDEPS_MIN_GROUP]
+    bars = [{"label": g, "value": c, "hub": by_name.get(g)} for g, c in big]
+    if small:
+        alone = sum(c for _, c in small)
+        ones = sum(1 for _, c in small if c == 1)
+        bars.append({"label": "on their own", "value": alone, "hub": None,
+                     "note": f"{ones} with no dependents in the graph"
+                             + (f", {len(small) - ones} with one" if len(small) > ones
+                                else "")})
+    bars.sort(key=lambda b: -b["value"])
+    bars = bars[::-1]
+    fig.text(x0, 0.585, "What holds them: the package whose pin they inherit", ha="left", va="bottom",
+             fontsize=F_LABEL + 1, fontweight="bold", color=INK)
+    ax = fig.add_axes([0.205, 0.185, 0.355, 0.38])
+    _style_axes(ax)
+    ax.grid(False, axis="y")
+    ax.grid(True, axis="x", color=GRID, linestyle="--", linewidth=0.8, alpha=0.7)
+    ys = np.arange(len(bars))
+    vals = [b["value"] for b in bars]
+    colors = []
+    for b in bars:
+        hub = b["hub"]
+        colors.append(m.C_GRAY if hub is None else _LIBDEPS_COLORS["held"] if hub["state"] != "pinned"
+                      else _LIBDEPS_COLORS["pinned"])
+    ax.barh(ys, vals, 0.68, color=colors, edgecolor=BG, linewidth=0.6, zorder=3)
+    ax.set_yticks(ys)
+    ax.set_yticklabels([b["label"] for b in bars], fontsize=F_SMALL + 1, fontweight="bold", color="#E0E0E0")
+    ax.set_ylim(-0.6, len(bars) - 0.4)
+    ax.set_xlim(0, max(vals) * 1.1)
+    ax.tick_params(axis="x", labelsize=F_SMALL)
+    ax.set_xlabel("packages locked in, the holding package included", fontsize=F_SMALL, color=INK2)
+    for y, b in zip(ys, bars):
+        hub = b["hub"]
+        if hub is None:
+            note = b.get("note", "")
+        elif hub["state"] == "pinned":
+            note = f"{hub['latest']} pins {hub['spec'].replace(' ', '')}, released {day(hub['uploaded'])}"
+        else:
+            note = f"fixed in {hub['latest']} ({day(hub['left_on'])}); these pin older releases"
+        inside = b["value"] > 0.5 * max(vals)
+        # The count always sits just past the bar's end; the note goes inside
+        # a long bar and after the count on a short one.
+        t = ax.annotate(f"{b['value']}", xy=(b["value"], y), xytext=(5, 0),
+                        textcoords="offset points", ha="left", va="center",
+                        fontsize=F_SMALL, fontweight="bold", color=INK, zorder=5)
+        _stroke(t, lw=2.5)
+        t = ax.annotate(note, xy=(0 if inside else b["value"], y),
+                        xytext=(6 if inside else 5 + 7 * (len(str(b["value"])) + 2), 0),
+                        textcoords="offset points", ha="left", va="center", fontsize=8.5, color=INK, zorder=5)
+        _stroke(t, lw=2.5)
+
+    # ── Bottom right: when they last released ────────────────────────────────
+    def bucket(r):
+        up = r["uploaded"] or ""
+        if fix_day and up >= info["fix_day"]:
+            return "since fix"
+        return up[:4]
+    years = sorted({bucket(r)[:4] for r in locked if bucket(r) != "since fix" and bucket(r)})
+    cats = years + (["since fix"] if any(bucket(r) == "since fix" for r in locked) else [])
+    rx0 = 0.70
+    fig.text(rx0 - 0.04, 0.585, "Their current release came out in", ha="left", va="bottom",
+             fontsize=F_LABEL + 1, fontweight="bold", color=INK)
+    ax = fig.add_axes([rx0, 0.225, 0.255, 0.34])
+    _style_axes(ax)
+    ax.grid(False, axis="x")
+    xs = np.arange(len(cats))
+    bottom = np.zeros(len(cats))
+    for s in ("pinned", "held"):
+        v = np.array([sum(1 for r in locked if r["state"] == s and bucket(r) == c) for c in cats])
+        ax.bar(xs, v, 0.72, bottom=bottom, color=_LIBDEPS_COLORS[s], edgecolor=BG, linewidth=0.6, zorder=3)
+        bottom += v
+    for x, tot in zip(xs, bottom):
+        ax.text(x, tot, f"{int(tot)}", ha="center", va="bottom", fontsize=F_SMALL, fontweight="bold", color=INK)
+    ax.set_xticks(xs)
+    labels = [c if c != "since fix" else f"since\n{fix_day.strftime('%b %-d')}" for c in cats]
+    ax.set_xticklabels([("’" + c[2:]) if len(c) == 4 and c.isdigit() and len(cats) > 6 else c for c in labels],
+                       fontsize=F_SMALL)
+    ax.set_ylim(0, bottom.max() * 1.15)
+    ax.tick_params(axis="y", labelsize=F_SMALL)
+    old = sum(1 for r in locked if (r["uploaded"] or "9999")[:4] < (fix_day.strftime("%Y") if fix_day else "0000"))
+    after = sum(1 for r in locked if bucket(r) == "since fix")
+    txt = f"{old} of {len(locked)} last released before {fix_day.year}" if fix_day else ""
+    if after:
+        txt += f"; {after} released since the fix and still lock it in"
+    fig.text(rx0 - 0.04, 0.135, textwrap.fill(txt + ".", 56), ha="left", va="top", fontsize=F_SMALL,
+             color=INK2, linespacing=1.3)
+
+    fig.text(x0, 0.085, textwrap.fill(
+        "Requirements as each package's current PyPI release states them: \"admit a fixed build\" means a fresh "
+        "resolve picks one, while installs locked or built earlier keep the old version. Exposure the "
+        "metadata declares, not confirmed use.", 92),
+        ha="left", va="top", fontsize=F_SMALL - 0.5, color=INK3, style="italic", linespacing=1.3)
+    _save(fig, output_filename, "library dependents")
+
+    if m._WRITE_CSV:
+        path = output_filename.replace("_slide.png", ".csv")
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["package", "current_release", "released", "state", "requirement", "held_via", "root",
+                        "left_range_on"])
+            for r in sorted(rows, key=lambda r: (list(m.LIBDEPS_STATES).index(r["state"]), r["root"] or "", r["name"])):
+                w.writerow([r["name"], r["latest"], r["uploaded"], r["state"], r["spec"], r["via"] or "",
+                            r["root"] or "", r["left_on"] or ""])
+        m.saved_files_log.append(f"Saved library dependents CSV to {os.path.abspath(path)}")
 
 
 def slide_fanout_downstream_extra(records):
@@ -2298,12 +2549,23 @@ def slide_fanout_downstream_extra(records):
         times = [t for t in (m.cache_fetched_at(m.AUDIT_CACHE_BASENAME, cve) if audit else None,
                              m.cache_fetched_at(m.SEARCH_ID_CACHE_BASENAME, cve) if doc else None,
                              m.cache_fetched_at(m.VULNERSOSV_CACHE_BASENAME, cve) if lib_rows else None) if t]
-        stamp = (f"Vulners API as of {min(times).strftime('%b %-d, %Y %H:%M')}"
-                 + (f" {time.strftime('%Z')}" if time.strftime("%Z") else "")) if times else None
+        # The second layer read against PyPI: the fan-out slide's panel draws its
+        # state bar, and it gets a slide of its own (both skipped for the
+        # registries PyPI metadata does not cover).
+        dep_rows, dep_info = m.library_dependents_status(osv) if lib_rows else ([], None)
+        tz = f" {time.strftime('%Z')}" if time.strftime("%Z") else ""
+        stamp = f"Vulners API as of {min(times).strftime('%b %-d, %Y %H:%M')}{tz}" if times else None
+        dep_stamp = None
+        if dep_rows:
+            dep_stamp = (f"Vulners API and PyPI as of "
+                         f"{min(t for t in (dep_info['fetched'], *times) if t).strftime('%b %-d, %Y %H:%M')}{tz}")
         slide_fanout_downstream(record, output_filename=(
             f"cve_monthly_stats_comparison_fanout_downstream_{cve.lower()}_slide.png"),
-            nvd=nvd if nvd and nvd["matched"] else None, stamp=stamp,
-            libdeps=(lib_rows, lib_totals) if lib_rows else None)
+            nvd=nvd if nvd and nvd["matched"] else None, stamp=dep_stamp or stamp,
+            libdeps=(lib_rows, lib_totals, dep_rows or None) if lib_rows else None)
+        if dep_rows:
+            slide_fanout_libdeps(cve, dep_rows, dep_info, lib_rows[0]["name"], output_filename=(
+                f"cve_monthly_stats_comparison_fanout_libdeps_{cve.lower()}_slide.png"), stamp=dep_stamp)
 
 
 def slide_fanout_status(record=None, output_filename=SLIDE_FILES["fanout_status"]):

@@ -830,6 +830,255 @@ def library_dependents(result):
     return rows, totals
 
 
+# What the dependents' *current* releases do about the vulnerable library, for
+# the library-dependents slide. The vulnersosv graph says which versions of
+# each dependent admit an affected version and nothing else — no edge, no
+# depth, no date — so the rest comes from PyPI's own metadata for each
+# package: its latest release, that release's ``requires_dist``, and the
+# release history. PyPI only (the slide is skipped for other registries).
+PYPI_JSON_URL = "https://pypi.org/pypi/{}/json"
+PYPI_CACHE_BASENAME = "pypi_project_cache.json"
+# state -> label on the slide, in the order the bar stacks them
+LIBDEPS_STATES = {
+    "pinned": "current release pins an affected version itself",
+    "held": "current release held by another package's pin",
+    "admits": "current release admits a fixed build",
+    "left_after": "left the affected range after the fix",
+    "left_before": "left the affected range before the fix",
+    "unknown": "current release in range, route not in the metadata",
+}
+
+
+def fetch_pypi_projects(names, max_age_h=AUDIT_CACHE_MAX_AGE_H):
+    """PyPI's JSON for each of ``names``, trimmed to ``{"latest", "requires_dist",
+    "releases": {version: [first upload day, yanked]}}``; one DATA_DIR cache with
+    ``fetch_audit_cve``'s ``max_age_h`` rule per project. A project PyPI does
+    not answer for is left out."""
+    _local_only("PyPI project metadata")
+    import concurrent.futures
+    path = os.path.join(os.path.abspath(os.getenv("DATA_DIR") or os.getcwd()), PYPI_CACHE_BASENAME)
+    cache = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+        except (OSError, ValueError):
+            cache = {}
+
+    def fresh(hit):
+        try:
+            return (datetime.now() - datetime.fromisoformat(hit["fetched"])).total_seconds() / 3600 < max_age_h
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    def get(name):
+        try:
+            r = requests.get(PYPI_JSON_URL.format(name), timeout=30)
+            r.raise_for_status()
+            j = r.json()
+            releases = {v: [min(f["upload_time_iso_8601"] for f in files)[:10], all(f.get("yanked") for f in files)]
+                        for v, files in j["releases"].items() if files}
+            return name, {"latest": j["info"]["version"], "requires_dist": j["info"].get("requires_dist") or [],
+                          "releases": releases}
+        except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+            print(f"PyPI metadata failed for {name}: {e}")
+            return name, None
+
+    todo = [n for n in names if not (isinstance(cache.get(n), dict) and fresh(cache[n]))]
+    if todo:
+        with concurrent.futures.ThreadPoolExecutor(16) as ex:
+            for name, result in ex.map(get, todo):
+                if result is not None:
+                    cache[name] = {"fetched": datetime.now().isoformat(timespec="seconds"), "result": result}
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(cache, f)
+        except OSError as e:
+            print(f"Could not write {path}: {e}")
+    return {n: cache[n]["result"] for n in names if isinstance(cache.get(n), dict) and cache[n].get("result")}
+
+
+def library_dependents_status(result, projects=None):
+    """Each dependent in a ``fetch_vulnersosv`` result, classified by what its
+    current PyPI release does (``LIBDEPS_STATES``).
+
+    A version of a package is *affected* when the graph lists it (the base
+    library's own ranges for the base library). A requirement is judged by the
+    release a fresh resolve picks under it — the highest it admits — so
+    ``Brotli>=1.0,<=1.2.0`` holds even though 1.0.0–1.0.6 sit outside the
+    affected range. The current release ``L`` of a dependent the graph still
+    lists is ``pinned`` when such a pick on a base library is affected,
+    ``held`` when that is true of a requirement on another listed dependent
+    instead (a dependent whose current release is itself ``admits`` does not
+    hold), ``admits`` when every pick is clear (a fresh resolve gets a fixed
+    build; anything locked or built earlier keeps the old one), and
+    ``unknown`` when ``L`` names none of them. A dependent
+    whose current release is outside its listed range ``left_after`` or
+    ``left_before`` the fix, by the day its first release past the range was
+    uploaded against the day the base library's fix was. ``projects`` is
+    ``fetch_pypi_projects``' result (fetched here when omitted).
+
+    Returns ``(rows, info)`` — rows ``{"name", "latest", "uploaded", "state",
+    "spec", "via", "root", "left_on"}`` (``root``: the package whose own pin
+    holds a ``pinned``/``held`` one), info ``{"base": {name: {"fixed",
+    "fixed_on"}}, "snapshot", "fetched"}`` — or ``([], None)`` when the result
+    is not all PyPI or PyPI did not answer."""
+    from packaging.requirements import InvalidRequirement, Requirement
+    from packaging.utils import canonicalize_name
+    from packaging.version import InvalidVersion, Version
+
+    def ver(v):
+        try:
+            return Version(str(v))
+        except InvalidVersion:
+            return None
+
+    def span(lib):
+        if lib.get("version"):
+            v = ver(lib["version"])
+            return (v, v, True)
+        return (ver(lib.get("versionStartIncluding")) if lib.get("versionStartIncluding") else None,
+                ver(lib.get("versionEndIncluding") or lib.get("versionEndExcluding")),
+                bool(lib.get("versionEndIncluding")))
+
+    docs = (result or {}).get("docs") or []
+    ranges, base_names, snapshots = collections.defaultdict(list), set(), set()
+    for d in docs:
+        base = d.get("baseAffectedLibrary") or {}
+        if not base.get("name"):
+            continue
+        if str(base.get("registry") or "").lower() != "pypi":
+            return [], None
+        b = canonicalize_name(base["name"])
+        base_names.add(b)
+        ranges[b].append(span(base))
+        for lib in d.get("transitiveAffectedLibraries") or []:
+            if isinstance(lib, dict) and lib.get("name"):
+                ranges[canonicalize_name(lib["name"])].append(span(lib))
+        if d.get("snapshot_date"):
+            snapshots.add(d["snapshot_date"])
+    if not base_names:
+        return [], None
+    if projects is None:
+        projects = fetch_pypi_projects(sorted(ranges))
+    projects = {canonicalize_name(k): v for k, v in (projects or {}).items()}
+    if not projects:
+        return [], None
+
+    def affected(name, v):
+        for lo, hi, incl in ranges[name]:
+            if v is None or hi is None:
+                continue
+            if (lo is None or v >= lo) and (v <= hi if incl else v < hi):
+                return True
+        return False
+
+    def releases(name):
+        out = []
+        for v, (day, yanked) in (projects.get(name) or {}).get("releases", {}).items():
+            pv = ver(v)
+            if pv is not None and not yanked:
+                out.append((pv, day))
+        return sorted(out)
+
+    def ends(name):
+        return max((hi for _, hi, _ in ranges[name] if hi is not None), default=None)
+
+    # The fix: the base library's first release past every affected range.
+    base_info = {}
+    for b in base_names:
+        top = ends(b)
+        after = [(v, day) for v, day in releases(b) if not v.is_prerelease and top is not None and v > top
+                 and not affected(b, v)]
+        base_info[b] = {"fixed": str(after[0][0]) if after else None, "fixed_on": after[0][1] if after else None}
+    fix_day = min((i["fixed_on"] for i in base_info.values() if i["fixed_on"]), default=None)
+
+    def best(name, spec):
+        """The release a fresh resolve picks under ``spec``: the highest it
+        admits (pre-releases only when it admits nothing else)."""
+        vs = [v for v, _ in releases(name) if spec.contains(v, prereleases=True)]
+        final = [v for v in vs if not v.is_prerelease]
+        return max(final or vs, default=None)
+
+    by_name, busy = {}, set()
+
+    def clear(name, spec):
+        """Does a fresh resolve of ``spec`` get a release of ``name`` that is
+        clear of the base library — one the graph does not list, or (for a
+        dependent) its current release when that one admits a fixed build?"""
+        v = best(name, spec)
+        if v is None or not affected(name, v):
+            return True
+        if name in base_names or name not in projects:
+            return False
+        row = classify(name)
+        return row is not None and row["state"] == "admits" and ver(row["latest"]) == v
+
+    def classify(name):
+        if name in by_name or name in busy:
+            return by_name.get(name)
+        p = projects.get(name)
+        if not p:
+            return None
+        busy.add(name)
+        latest = ver(p["latest"])
+        uploaded = (p["releases"].get(p["latest"]) or [None])[0]
+        row = {"name": name, "latest": p["latest"], "uploaded": uploaded, "state": None, "spec": "",
+               "via": None, "root": None, "left_on": None}
+        if not affected(name, latest):
+            top = ends(name)
+            past = [day for v, day in releases(name) if top is not None and v > top and not affected(name, v)]
+            row["left_on"] = past[0] if past else uploaded
+            row["state"] = "left_after" if fix_day and row["left_on"] and row["left_on"] >= fix_day else "left_before"
+        else:
+            reqs = []
+            for s in p["requires_dist"]:
+                try:
+                    r = Requirement(s)
+                except InvalidRequirement:
+                    continue
+                if canonicalize_name(r.name) in ranges and canonicalize_name(r.name) != name:
+                    reqs.append(r)
+            direct = [r for r in reqs if canonicalize_name(r.name) in base_names]
+            hubs = [r for r in reqs if r not in direct]
+            blocked_direct = [r for r in direct if not clear(canonicalize_name(r.name), r.specifier)]
+            blocked_hub = [r for r in hubs if not clear(canonicalize_name(r.name), r.specifier)]
+            if blocked_direct:
+                row["state"], row["spec"] = "pinned", str(blocked_direct[0]).split(";")[0]
+            elif blocked_hub:
+                row["state"], row["via"] = "held", canonicalize_name(blocked_hub[0].name)
+                row["spec"] = str(blocked_hub[0]).split(";")[0]
+            elif reqs:
+                row["state"], row["spec"] = "admits", str((direct or reqs)[0]).split(";")[0]
+            else:
+                row["state"] = "unknown"
+        busy.discard(name)
+        by_name[name] = row
+        return row
+
+    rows = [r for r in (classify(n) for n in sorted(n for n in ranges if n not in base_names)) if r]
+
+    def root(row, seen=()):
+        # Up the chain of holding packages to the one that pins the base
+        # library itself — or to a hub that has since left the range, when
+        # what holds the row is its pin on an older release of that hub.
+        if row["state"] == "pinned":
+            return row["name"]
+        hub = by_name.get(row["via"])
+        if hub is None or hub["state"] not in ("pinned", "held") or hub["name"] in seen:
+            return row["via"]
+        return root(hub, seen + (row["name"],))
+
+    for row in rows:
+        if row["state"] in ("pinned", "held"):
+            row["root"] = root(row)
+    fetched = [cache_fetched_at(PYPI_CACHE_BASENAME, n) for n in ranges]
+    info = {"base": base_info, "fix_day": fix_day, "snapshot": max(snapshots) if snapshots else None,
+            "fetched": min((t for t in fetched if t), default=None)}
+    return rows, info
+
+
 def nvd_cpe_matches(doc):
     """NVD's vulnerable ``cpeMatch`` entries (``criteria``, ``versionStartIncluding``,
     ``versionEndExcluding``, …) from a Vulners CVE document's
@@ -855,6 +1104,15 @@ def fanout_record(item):
             str(a.get("name") or a.get("cpeName") or "")
             for a in (item.get("affectedSoftware") or []) if isinstance(a, dict)
         }),
+        # Products the CVE's own CPE configurations name (``google:brotli`` ->
+        # ``brotli``), for a record with no ``affectedSoftware``.
+        "cpe_products": list(dict.fromkeys(
+            str(c.get("criteria") or "").split(":")[4].replace("_", " ")
+            for key in ("vulnersCpeConfiguration", "nvdCpeConfiguration")
+            for conf in ((item.get("cpeConfigurations") or {}).get(key) or [])
+            for node in conf.get("nodes") or [] for c in node.get("cpeMatch") or []
+            if isinstance(c, dict) and len(str(c.get("criteria") or "").split(":")) > 4
+        )),
         "kev": any(isinstance(r, dict) and r.get("type") == "vulncheck_kev" for r in refs),
         "references": [
             {"type": r.get("type"), "idList": [str(i) for i in (r.get("idList") or [])]}
@@ -950,16 +1208,79 @@ def fanout_packages(audit_result):
         all_updates.add((product,) + update)
         all_releases.add((product, release))
         all_advisories.add(adv)
+    # Vendor advisories reach audit/cve only as ``affectedCpe`` configurations.
+    # A vendor's own products count one update per product line × fixed
+    # version (``versionEndExcluding``; an entry naming no fixed version is not
+    # a fix, as above). Microsoft's Azure Linux / CBL-Mariner CPEs are distro
+    # packages and join an Azure Linux package row instead — unless
+    # ``affectedPackages`` already gave one, so nothing counts twice.
+    distro_rows = set(per)
+    for adv in (audit_result or {}).get("affectedCpe") or []:
+        vendor = FANOUT_VENDOR_ADVISORIES.get((adv or {}).get("type"))
+        if not vendor:
+            continue
+        configs = (adv.get("cpeConfigurations") or {}).get("vulnersCpeConfiguration") or []
+        for match in (c for conf in configs for node in conf.get("nodes") or [] for c in node.get("cpeMatch") or []):
+            fixed = match.get("versionEndExcluding")
+            parts = str(match.get("criteria") or "").split(":")
+            if not match.get("vulnerable") or not fixed or len(parts) < 5:
+                continue
+            name = parts[4]
+            mdist = re.match(r"(azl3|cbl2)_(.+?)(?:_\d[\w.+~-]*)?$", name) if adv["type"] == "mscve" else None
+            if mdist:
+                family, release = _FANOUT_MS_DISTRO[mdist.group(1)]
+                product = FANOUT_PRODUCTS[family]
+                if product in distro_rows:
+                    continue
+                pkg, update, kind = mdist.group(2), (release, mdist.group(2)), "package"
+            else:
+                line = _fanout_vendor_product(name)
+                product, release, pkg, update, kind = vendor, line, re.sub(r"\s+\d.*$", "", line) or line, \
+                    (line, fixed), "vendor"
+            row = per.setdefault(product, {"updates": set(), "releases": set(), "advisories": set(),
+                                           "packages": collections.Counter(), "kind": kind})
+            row["updates"].add(update)
+            row["releases"].add(release)
+            row["advisories"].add(adv["id"])
+            row["packages"][pkg] += 1
+            all_updates.add((product,) + update)
+            all_releases.add((product, release))
+            all_advisories.add(adv["id"])
     rows = [{
         "product": product, "updates": len(r["updates"]), "releases": len(r["releases"]),
-        "advisories": len(r["advisories"]),
+        "advisories": len(r["advisories"]), "kind": r.get("kind", "package"),
         # Ties broken by name: the API's own order varies call to call.
         "packages": [n for n, _ in sorted(r["packages"].items(), key=lambda kv: (-kv[1], kv[0]))],
     } for product, r in per.items()]
     rows.sort(key=lambda r: (-r["updates"], r["product"]))
     totals = {"updates": len(all_updates), "products": len(rows), "releases": len(all_releases),
-              "advisories": len(all_advisories)}
+              "advisories": len(all_advisories),
+              "vendor_updates": sum(r["updates"] for r in rows if r["kind"] == "vendor")}
     return rows, totals
+
+
+# ``affectedCpe`` document type -> vendor, for the vendors whose advisories
+# list fixed versions of their own products. Upstream projects and
+# aggregators (cve, github, pypa, snyk, mend, veracode, openssl, curl, nginx)
+# restate the upstream fix, and Red Hat is already in ``affectedPackages``.
+FANOUT_VENDOR_ADVISORIES = {
+    "mscve": "Microsoft", "paloalto": "Palo Alto Networks", "f5": "F5", "broadcom": "Broadcom",
+    "ibm": "IBM", "hpe": "HPE", "cisco": "Cisco", "fortinet": "Fortinet", "juniper": "Juniper",
+    "citrix": "Citrix", "vmware": "VMware", "siemens": "Siemens", "sap": "SAP",
+}
+_FANOUT_MS_DISTRO = {"azl3": ("azurelinux", "azurelinux-3.0"), "cbl2": ("azurelinux", "cbl-mariner-2.0")}
+_FANOUT_VENDOR_WORDS = {".net": ".NET", "powershell": "PowerShell", "visual": "Visual", "studio": "Studio",
+                        "pan-os": "PAN-OS", "microsoft": ""}
+
+
+def _fanout_vendor_product(cpe_product):
+    """A product line as a vendor advisory names it in its CPE, readable and
+    with Microsoft's per-OS split folded: ``.net_10.0_installed_on_linux`` ->
+    ``.NET 10.0``, ``microsoft_visual_studio_2026_version_18.11`` -> ``Visual
+    Studio 2026 18.11``."""
+    words = re.sub(r"_installed_on_.*$", "", cpe_product).replace("_version_", "_").split("_")
+    out = [_FANOUT_VENDOR_WORDS.get(w, w) for w in words]
+    return " ".join(w for w in out if w)
 
 
 def _audit_is_fix(rng):
@@ -7060,6 +7381,9 @@ def _prep_candidate_track(candidate_stats):
 
     top_sources = [s for s, _ in overall.most_common(_CAND_TOP_SOURCES)]
     top_set = set(top_sources)
+    # Distinct CVEs touched by at least one source outside the top rows -- not
+    # the sum of the tail sources' cells, which counts a CVE once per tail
+    # source and can exceed the month's total.
     other_per_month = {
         m: sum(v for s, v in candidate_stats[m]["ref_types"].items() if s not in top_set)
         for m in months
