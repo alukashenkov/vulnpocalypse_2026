@@ -2766,10 +2766,13 @@ def count_monthly_cves(file_path, cut_off_date=None):
     daily_counts = collections.defaultdict(collections.Counter)
     # daily_counts_kernel[year_str][month_day_str] = count, kernel CNA only
     daily_counts_kernel = collections.defaultdict(collections.Counter)
-    # candidate_stats["YYYY-MM"] = {"active", "rejected", "ref_types": Counter}
-    # The "hidden" reserved/candidate CVEs, excluded from the main counts.
+    # candidate_stats["YYYY-MM"] = {"active", "rejected", "ref_types": Counter,
+    # "source_sets": Counter of frozenset} -- the "hidden" reserved/candidate
+    # CVEs, excluded from the main counts. source_sets keeps each CVE's own set
+    # of sources so a pooled row can count CVEs rather than CVE x source pairs.
     candidate_stats = collections.defaultdict(
-        lambda: {"active": 0, "rejected": 0, "ref_types": collections.Counter()}
+        lambda: {"active": 0, "rejected": 0, "ref_types": collections.Counter(),
+                 "source_sets": collections.Counter()}
     )
     # status_yearly[year_str][vulnStatus] and status_weekly[monday_iso][vulnStatus]
     # = count, for the NVD status charts. Counted over every record, candidates
@@ -2923,6 +2926,8 @@ def count_monthly_cves(file_path, cut_off_date=None):
                                     }
                                     for t in src_types:
                                         candidate_stats[mkey]["ref_types"][t] += 1
+                                    if src_types:
+                                        candidate_stats[mkey]["source_sets"][frozenset(src_types)] += 1
                         # A Chrome release whose CVEs are still reserved: the
                         # advisory and the Nessus plugin already name them, the
                         # CVE records do not exist yet. Kept, flagged, for the
@@ -7385,7 +7390,7 @@ def _prep_candidate_track(candidate_stats):
     # the sum of the tail sources' cells, which counts a CVE once per tail
     # source and can exceed the month's total.
     other_per_month = {
-        m: sum(v for s, v in candidate_stats[m]["ref_types"].items() if s not in top_set)
+        m: sum(n for srcs, n in candidate_stats[m]["source_sets"].items() if srcs - top_set)
         for m in months
     }
     rows = list(top_sources)
