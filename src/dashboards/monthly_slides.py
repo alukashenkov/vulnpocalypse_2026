@@ -83,6 +83,7 @@ SLIDE_FILES = {
     "exploitation_wild": "cve_monthly_stats_comparison_exploitation_wild_vs_volume_slide.png",
     "exploitation_trends": "cve_monthly_stats_comparison_exploitation_trends_slide.png",
     "exploitation_trends_indexed": "cve_monthly_stats_comparison_exploitation_trends_indexed_slide.png",
+    "exploitation_trends_24m": "cve_monthly_stats_comparison_exploitation_trends_24m_slide.png",
     "kernel_fixes": "cve_monthly_stats_comparison_kernel_fixes_vs_publishing_slide.png",
     "epss_by_year": "cve_monthly_stats_comparison_epss_recency_by_year_slide.png",
     "epss_cohort_age": "cve_monthly_stats_comparison_epss_recency_cohort_age_slide.png",
@@ -2873,14 +2874,16 @@ def _pct(multiple):
 
 
 def slide_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wild_cve_first_seen=None,
-                              output_filename=SLIDE_FILES["exploitation_trends"]):
+                              output_filename=SLIDE_FILES["exploitation_trends"], months_back=None):
     """Publications, wildExploited (which includes every KEV CVE) and CISA KEV,
     one panel each on a shared time axis, real monthly counts on log axes that
     all span the same ratio: a doubling is the same height in every panel, so
     the slopes compare directly without the lines tangling. The two exploited
     panels carry a robust growth trend (``monthly.robust_log_trend``) and its
-    ±2σ band; months outside the band are ringed and labelled."""
-    p = m._prep_exploitation_trends(stats, anchor_date, anchor_month_complete, wild_cve_first_seen)
+    ±2σ band; months outside the band are ringed and labelled. ``months_back``
+    overrides the window (default ``monthly.EXPLOIT_TRENDS_MONTHS``)."""
+    p = m._prep_exploitation_trends(stats, anchor_date, anchor_month_complete, wild_cve_first_seen,
+                                    months_back or m.EXPLOIT_TRENDS_MONTHS)
     if p is None:
         return
     x, pubs, wild, kev = p["x"], p["pubs"], p["wild"], p["kev"]
@@ -2894,21 +2897,23 @@ def slide_exploitation_trends(stats, anchor_date, anchor_month_complete=False, w
         + (f" + {p['partial']['lbl']} so far (hollow, not fitted)" if p["partial"] else "")
         + (f"  ·  publications above their band since {since.strftime('%b %Y')}" if since else "")
         + "  ·  log axes, same ratio in every panel  ·  dashed: robust trend (Theil–Sen on log counts), "
-        f"shaded ±2σ, ringed: outside it  ·  wildExploited includes all KEV CVEs",
+        f"shaded ±2σ, ringed: outside it  ·  exploited = wildExploited ∪ KEV",
     )
     part = p["partial"]
+    # Each series is dated by its own event, never by the CVE's publication:
+    # KEV by dateAdded, the flag by its first source's firstSeen.
     panels = [
-        ("CVE publications", pubs, m.C_RED, p_pct),
-        ("CISA KEV additions", kev, m.C_BLUE, k_pct),
-        ("Exploited (wildExploited)", wild, m.C_YELLOW, w_pct),
+        ("CVE publications", pubs, m.C_RED, p_pct, "by publication date"),
+        ("CISA KEV additions", kev, m.C_BLUE, k_pct, "by date added to KEV"),
+        ("Exploited (wildExploited)", wild, m.C_YELLOW, w_pct, "by first seen exploited (KEV: date added)"),
     ]
 
-    limits = m._trend_panel_ylim([srs for _, srs, _c, _p in panels], with_partial=True)
+    limits = m._trend_panel_ylim([srs for _, srs, _c, _p, _b in panels], with_partial=True)
     top, bottom, gap = CONTENT_TOP, AXES_BOTTOM, 0.022
     h = (top - bottom - 2 * gap) / 3
     last = p["last_lbl"]
     axes = []
-    for k, (name, srs, color, pct) in enumerate(panels):
+    for k, (name, srs, color, pct, basis) in enumerate(panels):
         ax = fig.add_axes([0.085, top - (k + 1) * h - k * gap, 0.665, h], sharex=axes[0] if axes else None)
         axes.append(ax)
         _style_axes(ax)
@@ -2949,7 +2954,8 @@ def slide_exploitation_trends(stats, anchor_date, anchor_month_complete=False, w
         if part and srs["partial"]:
             sub2 += f"\n{part['lbl']} so far: {srs['partial']:,}"
         y_lab = srs["trend"]["fit"][-1]
-        _end_labels(ax, [{"y": y_lab, "color": color, "main": name, "sub": f"{sub}\n{sub2}"}], min_gap=0.3)
+        _end_labels(ax, [{"y": y_lab, "color": color, "main": name, "sub": f"{basis}\n{sub}\n{sub2}"}],
+                    min_gap=0.3)
         if k < 2:
             ax.tick_params(axis="x", labelbottom=False)
         else:
@@ -2961,6 +2967,14 @@ def slide_exploitation_trends(stats, anchor_date, anchor_month_complete=False, w
         print(f"{name}: trend ×{t['annual']:.2f} a year, σ {t['sigma']:.2f}, outliers "
               + (", ".join(f"{p['months'][i].strftime('%b %Y')} ({srs['values'][i]})" for i in t["outliers"])
                  or "none"))
+
+
+def slide_exploitation_trends_24m(stats, anchor_date, anchor_month_complete=False, wild_cve_first_seen=None):
+    """The trends slide over the last ``monthly.EXPLOIT_TRENDS_MONTHS_SHORT``
+    (24) months instead of 36: same panels, trends fitted on the shorter window."""
+    slide_exploitation_trends(stats, anchor_date, anchor_month_complete, wild_cve_first_seen,
+                              output_filename=SLIDE_FILES["exploitation_trends_24m"],
+                              months_back=m.EXPLOIT_TRENDS_MONTHS_SHORT)
 
 
 def slide_exploitation_trends_indexed(stats, anchor_date, anchor_month_complete=False, wild_cve_first_seen=None,
@@ -3667,6 +3681,7 @@ _RENDERERS = [
     ("exploitation_wild", slide_exploitation_wild),
     ("exploitation_trends", slide_exploitation_trends),
     ("exploitation_trends", slide_exploitation_trends_indexed),
+    ("exploitation_trends", slide_exploitation_trends_24m),
     ("kernel_fixes", slide_kernel_fixes),
     ("epss", slide_epss_by_year),
     ("epss", slide_epss_cohort_age),

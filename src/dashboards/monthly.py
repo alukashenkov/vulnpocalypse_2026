@@ -256,8 +256,12 @@ CHART_CAPTIONS = {
         "actually use grow with it? Three counts, one panel each: every CVE "
         "published in a month, the CVEs CISA added to its Known Exploited "
         "Vulnerabilities catalog that month, and every CVE Vulners has seen "
-        "exploited in the wild, KEV included, dated by the first source to "
-        "report it. The window is the last three years and rolls forward a "
+        "exploited in the wild, KEV included. Neither exploited count goes by "
+        "publication date: a KEV entry lands in the month CISA added it, and "
+        "an exploited CVE in the month its first source saw it exploited (or "
+        "CISA added it, if that came first), however old the CVE is. Sources "
+        "sometimes backdate that first sighting, so recent months can still "
+        "grow. The window is the last three years and rolls forward a "
         "month at a time; the month still running trails off to a hollow "
         "marker and stays out of the fit until it closes. Each "
         "panel is a log axis spanning the same ratio, so a "
@@ -1401,6 +1405,9 @@ EXPLOIT_CORRIDOR_THROUGH = "2026-08"
 # last this-many complete months, plus the running month as a dashed tail. On
 # the 1st the anchor month has just closed, so it is exactly this many.
 EXPLOIT_TRENDS_MONTHS = 36
+# A shorter window for the local-only second copy of that chart and its slide
+# (``*_exploitation_trends_24m*``): the same picture over the last two years.
+EXPLOIT_TRENDS_MONTHS_SHORT = 24
 KEV_CATALOG_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 KEV_CATALOG_BASENAME = "known_exploited_vulnerabilities.json"
 
@@ -1627,9 +1634,10 @@ def _place_clear(txt, candidates, lines, pad_px=2, inside=None):
             return True
     return False
 
-def _prep_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wild_cve_first_seen=None):
+def _prep_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wild_cve_first_seen=None,
+                              months_back=EXPLOIT_TRENDS_MONTHS):
     """Publications, Vulners wildExploited and CISA KEV per complete month over
-    the last ``EXPLOIT_TRENDS_MONTHS``, each as a multiple of its own
+    the last ``months_back`` (default ``EXPLOIT_TRENDS_MONTHS``), each as a multiple of its own
     first-calendar-year monthly average, with a robust trend
     (``robust_log_trend``) for the two exploited series. ``None`` without the
     KEV catalog or the archive's wildExploited dates.
@@ -1641,7 +1649,7 @@ def _prep_exploitation_trends(stats, anchor_date, anchor_month_complete=False, w
     as on the KEV slide. The running month is left out: half a month on an
     index axis reads as a collapse.
     """
-    d = _prep_exploitation(stats, anchor_date, anchor_month_complete, months_back=EXPLOIT_TRENDS_MONTHS)
+    d = _prep_exploitation(stats, anchor_date, anchor_month_complete, months_back=months_back)
     if d is None or not wild_cve_first_seen:
         return None
     path = download_cisa_kev()
@@ -1764,13 +1772,14 @@ def _trend_panel_ylim(panels, with_partial=False):
 
 
 def plot_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wild_cve_first_seen=None,
-                             output_filename="cve_monthly_stats_comparison_exploitation_trends.png"):
+                             output_filename="cve_monthly_stats_comparison_exploitation_trends.png",
+                             months_back=EXPLOIT_TRENDS_MONTHS):
     """Web version of the exploitation-trends slide: publications, Vulners
     wildExploited (all of KEV included) and CISA KEV, one panel each on log
     axes spanning the same ratio, the two exploited series with a robust growth
     trend and its ±2σ band. On the page as the exploitation chart
     (``#monthly-exploitation``), in place of ``plot_exploitation_vs_volume``."""
-    p = _prep_exploitation_trends(stats, anchor_date, anchor_month_complete, wild_cve_first_seen)
+    p = _prep_exploitation_trends(stats, anchor_date, anchor_month_complete, wild_cve_first_seen, months_back)
     if p is None or not all(p[k]["trend"] for k in ("pubs", "wild", "kev")):
         return
     x = p["x"]
@@ -1781,8 +1790,8 @@ def plot_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wi
                               if p["pubs"]["above_since"] else "")),
         # KEV straight after publications: their trends are close, and side by
         # side the panels show it.
-        (p["kev"], C_BLUE, f"CISA KEV additions  ·  trend {pct(p['kev'])} a year"),
-        (p["wild"], C_YELLOW, f"Exploited (Vulners wildExploited, every KEV CVE included)  ·  "
+        (p["kev"], C_BLUE, f"CISA KEV additions, by date added  ·  trend {pct(p['kev'])} a year"),
+        (p["wild"], C_YELLOW, f"Exploited (Vulners wildExploited ∪ KEV), by first seen exploited  ·  "
                               f"trend {pct(p['wild'])} a year"),
     ]
     part = p["partial"]
@@ -7871,6 +7880,10 @@ def _run_monthly(results, report_buf):
     if _SLIDES:
         plot_exploitation_trends_indexed(stats, anchor_date, anchor_month_complete=anchor_month_complete,
                                          wild_cve_first_seen=results.get("wild_cve_first_seen", {}))
+        plot_exploitation_trends(stats, anchor_date, anchor_month_complete=anchor_month_complete,
+                                 wild_cve_first_seen=results.get("wild_cve_first_seen", {}),
+                                 output_filename="cve_monthly_stats_comparison_exploitation_trends_24m.png",
+                                 months_back=EXPLOIT_TRENDS_MONTHS_SHORT)
     # One CVE's downstream advisories, for the fan-out slide (local only).
     fanout_records = results.get("fanout_records", {})
     slide_inputs["fanout_downstream"] = dict(record=fanout_records.get(FANOUT_CVE))
