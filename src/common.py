@@ -36,6 +36,11 @@ COLLECTION_URL = "https://vulners.com/api/v4/archive/collection/"
 UPDATE_URL = "https://vulners.com/api/v4/archive/collection-update/"
 STATE_URL = "https://vulners.com/api/v4/archive/collection-state/"
 
+# collection-update states how many documents its payload holds in this response
+# header (undocumented; observed 2026-10-30 to match the payload exactly, ``0``
+# for an empty window, whose body is a gzipped ``[]`` rather than nothing).
+UPDATE_COUNT_HEADER = "x-total-count"
+
 # How much of the published archive's stream is pulled to read its first
 # document. Documents run to a few tens of KB; a megabyte is slack, and the
 # connection is dropped the moment the head parses.
@@ -236,7 +241,7 @@ def _stream_gzip_to(session, url, params, headers, dest, timeout):
     """Stream a gzipped endpoint straight to ``dest``, decompressing as it goes.
 
     The archive is multi-GB, so it never lands in memory whole. Returns the
-    number of decompressed bytes written.
+    number of decompressed bytes written and the response headers.
     """
     with session.get(
         url, params=params, headers=headers, stream=True, timeout=timeout
@@ -248,7 +253,15 @@ def _stream_gzip_to(session, url, params, headers, dest, timeout):
                 if chunk:
                     f.write(decompressor.decompress(chunk))
             f.write(decompressor.flush())
-    return os.path.getsize(dest)
+        return os.path.getsize(dest), r.headers
+
+
+def _update_count(response_headers):
+    """The document count collection-update announces, or ``None`` if absent."""
+    try:
+        return int(response_headers.get(UPDATE_COUNT_HEADER))
+    except (TypeError, ValueError):
+        return None
 
 
 def _published_archive_head(session, headers, collection="cve"):
@@ -261,7 +274,8 @@ def _published_archive_head(session, headers, collection="cve"):
 
     The archive is multi-GB, so the stream is decompressed chunk by chunk and
     dropped the moment one document decodes — a megabyte or so off the front,
-    written nowhere. Like every archive endpoint the call is free.
+    written nowhere. The call still costs 100 wallet credits, the same as a full
+    snapshot (charged on the redirect to the CDN).
     """
     decoder = json.JSONDecoder()
     with session.get(
@@ -299,8 +313,8 @@ def _report_published_archive(session, headers, watermark, now, collection="cve"
     A snapshot is already hours stale when served, and archives are rebuilt
     several times a day, so the two numbers move independently.
 
-    Purely a report, and never fatal: both calls are free, and a failure costs
-    the line and nothing else.
+    Purely a report, and never fatal: a failure costs the line and nothing else.
+    collection-state is free; reading the head costs 100 wallet credits.
     """
     try:
         r = session.get(STATE_URL, params={"type": collection}, headers=headers, timeout=30)
@@ -462,7 +476,7 @@ def _download_snapshot(session, path, headers, collection="cve"):
     """Fetch the full ``archive/collection`` snapshot and return its watermark."""
     print(f"Downloading {collection} collection snapshot to {path} ...")
     start = time.time()
-    size = _stream_gzip_to(
+    size, _ = _stream_gzip_to(
         session, COLLECTION_URL, {"type": collection}, headers, path, timeout=(10, 300)
     )
     if not _is_json_file_complete(path):
@@ -568,7 +582,7 @@ def download_archive_once(collection="cve"):
         update_file = path + ".update.tmp"
         start = time.time()
         try:
-            size = _stream_gzip_to(
+            size, response_headers = _stream_gzip_to(
                 session,
                 UPDATE_URL,
                 {"type": collection, "after": after},
@@ -576,12 +590,25 @@ def download_archive_once(collection="cve"):
                 update_file,
                 timeout=(10, 120),
             )
-            if size == 0:
+            announced = _update_count(response_headers)
+            print(
+                "collection-update: "
+                + (f"{announced:,} documents" if announced is not None
+                   else f"no {UPDATE_COUNT_HEADER} header")
+                + f" after {after} ({size / 1024 ** 2:.1f} MB) "
+                f"in {time.time() - start:.1f}s."
+            )
+            if size == 0 or announced == 0:
                 print("No updates published since the resume point.")
                 _write_watermark(path, watermark, "unchanged")
                 os.remove(update_file)
             else:
                 modified, added, total, max_dt = _apply_updates(path, update_file)
+                if announced is not None and modified + added != announced:
+                    print(
+                        f"Note: {UPDATE_COUNT_HEADER} announced {announced:,} documents; "
+                        f"the payload held {modified + added:,} distinct ids."
+                    )
                 if modified or added:
                     if max_dt and max_dt > watermark:
                         watermark = max_dt
