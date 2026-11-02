@@ -31,6 +31,9 @@ import matplotlib.dates as mdates
 import matplotlib.image as mpimg
 import matplotlib.patheffects as path_effects
 import matplotlib.ticker
+import matplotlib.lines
+import matplotlib.colors
+import matplotlib.patches
 
 from ..base import Dashboard, DashboardResult
 
@@ -1370,6 +1373,122 @@ FIXSTATUS_NOT_AFFECTED = "RHEL 6–9, SLES 12 / 15, openSUSE Leap 15, Ubuntu 14.
 FIXSTATUS_UPSTREAM_FIXED = ["6.12.111", "6.18.53", "7.1.10", "7.2"]
 FIXSTATUS_UPSTREAM_OPEN = ["6.1 (≥ 6.1.141)", "6.6 (≥ 6.6.93)"]
 
+# Further CVEs for the fix-status TIMELINE slide only, one picture each
+# (``…_fanout_status_timeline_<cve-id lower>_slide.png``). Same rules as the
+# table above: HAND-ASSEMBLED from each vendor's tracker on ``checked``, a
+# release counted as its vendor lists it, "fixed" = a fixed package published.
+# Keys mirror the FIXSTATUS_* constants; ``what`` names the bug in the
+# subtitle, ``fix_labels`` shortens the label of several releases fixed by one
+# vendor on one day, ``open_names`` shortens a vendor's open list in the right
+# margin, ``note`` is the italic line under it, ``sources`` the footer.
+#
+# CVE-2026-98432 (ipv4 SYN-ACK inet_opt use-after-free, CVSS 9.8), checked
+# 2026-11-02 against: Debian security tracker + tracker.debian.org news
+# (DSA-6568-1 Oct 16, DLA-4841-1 Oct 17, forky by 7.2.11-1's testing migration
+# Oct 18 — 7.2.10-1, the first fixed upload, never migrated itself);
+# ubuntu.com CVE JSON (main ``linux`` package: "pending" = fixed kernel built,
+# not yet released, so vulnerable; ESM releases listed as Ubuntu lists them;
+# 14.04 not affected); Red Hat hydra (RHSA-2026:93412–93415, Nov 1; RHEL 9's
+# kernel-rt still "Affected"; RHEL 6/7 not affected); suse.com CVE page +
+# announcement release dates (products under general or LTSS support, Server /
+# SAP / Micro / Leap only — modules and extensions on the same kernel left
+# out, as are EOL products such as Leap 15.x); OSV BELL-CVE-2026-98432 with
+# APKINDEX build times (Alpaquita); OSV AZL-108246 + packages.microsoft.com
+# file dates (Azure Linux, kernel-6.6.159.1-1); Amazon ALAS (AL2 4.14/5.4/
+# 5.10/5.15 and AL2023 6.1/6.12/6.18, all streams fixed by Oct 30).
+FIXSTATUS_EXTRA = [dict(
+    cve="CVE-2026-98432",
+    what="Linux kernel ipv4 SYN-ACK use-after-free, CVSS 9.8",
+    checked="2026-11-02",
+    events=[
+        ("2026-10-01", "fixed upstream"),
+        ("2026-10-15", "CVE published"),
+        ("2026-10-29", "public exploits on GitHub"),
+    ],
+    releases=[
+        ("Ubuntu", "16.04 ESM", "vulnerable", "needed"),
+        ("Ubuntu", "18.04 ESM", "vulnerable", "needed"),
+        ("Ubuntu", "20.04 ESM", "vulnerable", "needed"),
+        ("Ubuntu", "22.04 LTS", "vulnerable", "5.15.0-203.213 pending"),
+        ("Ubuntu", "24.04 LTS", "vulnerable", "6.8.0-149.149 pending"),
+        ("Ubuntu", "26.04 LTS", "vulnerable", "7.0.0-43.43 pending"),
+        ("Ubuntu", "26.10", "vulnerable", "7.3.0-10.10 pending"),
+        ("SUSE", "SLES 16.0", "fixed", "SUSE-SU-2026:24437-1"),
+        ("SUSE", "SLES for SAP 16.0", "fixed", "SUSE-SU-2026:24446-1"),
+        ("SUSE", "SL Micro 6.2", "fixed", "SUSE-SU-2026:24386-1"),
+        ("SUSE", "Leap 16.0", "fixed", "openSUSE-SU-2026:22167-1"),
+        ("SUSE", "SLES 15 SP4-LTSS", "fixed", "SUSE-SU-2026:4937-1"),
+        ("SUSE", "SLES 15 SP5-LTSS", "fixed", "SUSE-SU-2026:4936-1"),
+        ("SUSE", "SLES 15 SP6-LTSS", "fixed", "SUSE-SU-2026:4934-1"),
+        ("SUSE", "SLES for SAP 15 SP4", "fixed", "SUSE-SU-2026:4937-1"),
+        ("SUSE", "SLES for SAP 15 SP5", "fixed", "SUSE-SU-2026:4936-1"),
+        ("SUSE", "SLES for SAP 15 SP6", "fixed", "SUSE-SU-2026:4934-1"),
+        ("SUSE", "SLE Micro 5.4", "fixed", "SUSE-SU-2026:4939-1"),
+        ("SUSE", "SLE Micro 5.5", "fixed", "SUSE-SU-2026:4938-1"),
+        ("SUSE", "SLES 15 SP7", "vulnerable", "In progress"),
+        ("SUSE", "SLES for SAP 15 SP7", "vulnerable", "In progress"),
+        ("SUSE", "SL Micro 6.0", "vulnerable", "Affected"),
+        ("SUSE", "SL Micro 6.1", "vulnerable", "Affected"),
+        ("SUSE", "SLES 12 SP5-LTSS", "vulnerable", "Affected"),
+        ("Debian", "12 bookworm", "fixed", "6.1.190-1, DLA-4841-1"),
+        ("Debian", "13 trixie", "fixed", "6.12.113-1, DSA-6568-1"),
+        ("Debian", "14 forky", "fixed", "7.2.11-1"),
+        ("Red Hat", "RHEL 8", "fixed", "RHSA-2026:93414"),
+        ("Red Hat", "RHEL 9", "fixed", "RHSA-2026:93412 (kernel-rt open)"),
+        ("Red Hat", "RHEL 10", "fixed", "RHSA-2026:93413"),
+        ("Amazon Linux", "2", "fixed", "ALAS2-2026-4065, ALAS2KERNEL-*"),
+        ("Amazon Linux", "2023", "fixed", "ALAS2023-2026-3365"),
+        ("Azure Linux", "3.0", "fixed", "6.6.159.1-1"),
+        ("BellSoft Alpaquita", "23", "vulnerable", "6.1, no fixed build"),
+        ("BellSoft Alpaquita", "25", "vulnerable", "6.12, no fixed build"),
+        ("BellSoft Alpaquita", "stream", "fixed", "6.18.58-r0"),
+    ],
+    fixed_on={
+        ("Debian", "13 trixie"): "2026-10-16",
+        ("Debian", "12 bookworm"): "2026-10-17",
+        ("Debian", "14 forky"): "2026-10-18",
+        ("Azure Linux", "3.0"): "2026-10-20",
+        ("BellSoft Alpaquita", "stream"): "2026-10-23",
+        ("SUSE", "SLES 16.0"): "2026-10-24",
+        ("SUSE", "SLES for SAP 16.0"): "2026-10-24",
+        ("SUSE", "SL Micro 6.2"): "2026-10-24",
+        ("SUSE", "Leap 16.0"): "2026-10-24",
+        ("SUSE", "SLES 15 SP4-LTSS"): "2026-10-29",
+        ("SUSE", "SLES 15 SP5-LTSS"): "2026-10-29",
+        ("SUSE", "SLES 15 SP6-LTSS"): "2026-10-29",
+        ("SUSE", "SLES for SAP 15 SP4"): "2026-10-29",
+        ("SUSE", "SLES for SAP 15 SP5"): "2026-10-29",
+        ("SUSE", "SLES for SAP 15 SP6"): "2026-10-29",
+        ("SUSE", "SLE Micro 5.4"): "2026-10-29",
+        ("SUSE", "SLE Micro 5.5"): "2026-10-29",
+        ("Amazon Linux", "2"): "2026-10-30",
+        ("Amazon Linux", "2023"): "2026-10-30",
+        ("Red Hat", "RHEL 8"): "2026-11-01",
+        ("Red Hat", "RHEL 9"): "2026-11-01",
+        ("Red Hat", "RHEL 10"): "2026-11-01",
+    },
+    fix_labels={
+        ("SUSE", "2026-10-24"): "16.0: SLES, SAP, Micro 6.2, Leap",
+        ("SUSE", "2026-10-29"): "15 SP4–SP6 LTSS, SAP, Micro 5.4/5.5",
+        ("Amazon Linux", "2026-10-30"): "2, 2023",
+        ("Red Hat", "2026-11-01"): "RHEL 8, 9, 10",
+    },
+    open_names={
+        "Ubuntu": ["16.04, 18.04, 20.04 (ESM)", "22.04, 24.04, 26.04 LTS", "26.10"],
+        "SUSE": ["SLES / SAP 15 SP7", "SL Micro 6.0, 6.1", "SLES 12 SP5-LTSS"],
+    },
+    note="Upstream stable is fixed on every branch (5.10.272 … 7.2.10). Ubuntu 22.04–26.10 "
+         "have fixed kernels built but not yet released. SUSE: products under general or LTSS "
+         "support; modules and EOL releases left out.",
+    sources="Status: Debian, Ubuntu, Red Hat and SUSE trackers, OSV, Amazon ALAS · fix dates: advisory "
+            "release dates, Debian package tracker, Azure Linux and Alpaquita package repositories",
+    sources_wrap=100,
+    cve_in_title=True,
+    label_gap=2.2,
+    label_at={("Amazon Linux", "2026-10-30"): ("2026-10-27", 28.6),
+              ("Red Hat", "2026-11-01"): ("2026-10-27", 34.7)},
+)]
+
 
 def fanout_breakdown(references):
     """Distinct downstream records per issuer for one CVE's
@@ -1635,7 +1754,7 @@ def _place_clear(txt, candidates, lines, pad_px=2, inside=None):
     return False
 
 def _prep_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wild_cve_first_seen=None,
-                              months_back=EXPLOIT_TRENDS_MONTHS):
+                              months_back=EXPLOIT_TRENDS_MONTHS, cve_published=None):
     """Publications, Vulners wildExploited and CISA KEV per complete month over
     the last ``months_back`` (default ``EXPLOIT_TRENDS_MONTHS``), each as a multiple of its own
     first-calendar-year monthly average, with a robust trend
@@ -1648,6 +1767,11 @@ def _prep_exploitation_trends(stats, anchor_date, anchor_month_complete=False, w
     if the flag ever misses a KEV entry. KEV itself is counted by ``dateAdded``,
     as on the KEV slide. The running month is left out: half a month on an
     index axis reads as a collapse.
+
+    ``cve_published`` (CVE id → publication day, the archive pass's
+    ``exploited_cve_published``) adds ``by_published`` to the KEV and wild
+    series: the same CVEs counted by the month they were published, months
+    with none as ``None`` (a log axis has no zero).
     """
     d = _prep_exploitation(stats, anchor_date, anchor_month_complete, months_back=months_back)
     if d is None or not wild_cve_first_seen:
@@ -1708,6 +1832,24 @@ def _prep_exploitation_trends(stats, anchor_date, anchor_month_complete=False, w
             "above_since": d["months"][len(vals) - above] if above >= 2 else None,
             "partial": part_vals.get(name),
         }
+    if cve_published:
+        # The same CVEs the solid lines count — dated (added / first seen) in a
+        # window month or the running month — by their own publication month.
+        # Those published before the window are kept per year for the lead-in.
+        first_key = keys[0]
+        last_key = part["key"] if part else keys[-1]
+        for name, ids in (("kev", kev_added), ("wild", union)):
+            same = [c for c, day in ids.items() if first_key <= day[:7] <= last_key and day <= anchor_date[:10]]
+            by_pub = collections.Counter(cve_published[c][:7] for c in same if c in cve_published)
+            out[name]["by_published"] = [by_pub.get(k) or None for k in keys]
+            out[name]["by_published_partial"] = by_pub.get(part["key"]) if part else None
+            years = collections.Counter()
+            for k, n in by_pub.items():
+                if k < first_key:
+                    years[k[:4]] += n
+            out[name]["by_published_years"] = dict(sorted(years.items()))
+            out[name]["by_published_total"] = len(same)
+            out[name]["by_published_missing"] = sum(1 for c in same if c not in cve_published)
     return out
 
 def _label_trend_outliers(ax, p, srs, color, fontsize, stroke, ring=11, extra_lines=()):
@@ -1755,7 +1897,54 @@ def _label_trend_outliers(ax, p, srs, color, fontsize, stroke, ring=11, extra_li
         lines.append((ax, xs, [y0, y0, y1, y1, y0, y1]))
 
 
-def _trend_panel_ylim(panels, with_partial=False):
+def _draw_published_lead_in(ax, srs, color, p, first_year_shown):
+    """The lead-in of a published-date panel: the CVEs the panel counts that
+    were published before the window, one point per publication year (that
+    year's count, as is), on the panel's own y axis (shared), so the two read
+    as one chart. Empty years are gaps."""
+    years = srs.get("by_published_years") or {}
+    first_year = p["months"][0].year
+    ys = list(range(first_year_shown, first_year + 1))
+    vals = [years.get(str(y_)) or np.nan for y_ in ys]
+    light = _blend_white(color, 0.45)
+    ax.plot(ys, vals, color=light, linewidth=2.2, linestyle=(0, (2.5, 2)), marker="s", markersize=5, zorder=3)
+    if years:
+        before = sum(srs["by_published_years"].values())
+        t = ax.text(0.05, 0.95, f"{before:,} of {srs['by_published_total']:,} CVEs\npublished before", transform=ax.transAxes,
+                    ha="left", va="top", fontsize=12.5, fontweight="bold", color=light, zorder=7)
+        t.set_path_effects([path_effects.Stroke(linewidth=4, foreground="#262626"), path_effects.Normal()])
+
+
+def _style_lead_in(ax, p, first_year_shown, show_x):
+    """Shared look of the lead-in column: a darker ground, year ticks, no
+    y labels of its own beyond the far-left ones."""
+    first_year = p["months"][0].year
+    ax.set_facecolor("#262626")
+    # A tight right edge: the last year meets the window's first month at the seam.
+    ax.set_xlim(first_year_shown - 0.8, first_year + 0.25)
+    ys = range(first_year_shown, first_year + 1)
+    # The window's own year sits at the seam, next to its first month's
+    # label, so it is left unlabelled; the caption names the cut.
+    ax.set_xticks([y_ for y_ in ys if y_ % 5 == 0 and first_year - y_ >= 4])
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{int(v)}"))
+    ax.tick_params(colors="#CCCCCC", labelsize=13, labelbottom=show_x)
+    for label in ax.get_yticklabels() + ax.get_xticklabels():
+        label.set_fontweight("bold")
+    ax.grid(True, color="#444444", linestyle="--", alpha=0.6, linewidth=0.9)
+    ax.set_axisbelow(True)
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+    for spine in ["left", "bottom"]:
+        ax.spines[spine].set_color("#555555")
+
+
+def _blend_white(color, t):
+    """``color`` mixed ``t`` of the way to white."""
+    r, g, b = matplotlib.colors.to_rgb(color)
+    return (r + (1 - r) * t, g + (1 - g) * t, b + (1 - b) * t)
+
+
+def _trend_panel_ylim(panels, with_partial=False, with_published=False):
     """One log span for every panel — the widest panel's ratio plus room — and
     each panel's limits centred on its own data, so a doubling is the same
     height in all of them. ``with_partial`` keeps the running month in view."""
@@ -1765,6 +1954,11 @@ def _trend_panel_ylim(panels, with_partial=False):
             vals.append(srs["partial"])
         if srs["trend"]:
             vals += srs["trend"]["lo"] + srs["trend"]["hi"]
+        if with_published:
+            vals += [v for v in srs.get("by_published") or () if v]
+            if with_partial and srs.get("by_published_partial"):
+                vals.append(srs["by_published_partial"])
+            vals += list((srs.get("by_published_years") or {}).values())
         return min(vals), max(vals)
     ext = [extent(srs) for srs in panels]
     span = max(hi / lo for lo, hi in ext) * 1.35
@@ -1773,13 +1967,19 @@ def _trend_panel_ylim(panels, with_partial=False):
 
 def plot_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wild_cve_first_seen=None,
                              output_filename="cve_monthly_stats_comparison_exploitation_trends.png",
-                             months_back=EXPLOIT_TRENDS_MONTHS):
+                             months_back=EXPLOIT_TRENDS_MONTHS, cve_published=None):
     """Web version of the exploitation-trends slide: publications, Vulners
     wildExploited (all of KEV included) and CISA KEV, one panel each on log
     axes spanning the same ratio, the two exploited series with a robust growth
     trend and its ±2σ band. On the page as the exploitation chart
-    (``#monthly-exploitation``), in place of ``plot_exploitation_vs_volume``."""
-    p = _prep_exploitation_trends(stats, anchor_date, anchor_month_complete, wild_cve_first_seen, months_back)
+    (``#monthly-exploitation``), in place of ``plot_exploitation_vs_volume``.
+
+    ``cve_published`` (local-only copy, ``…_exploitation_trends_published.png``)
+    adds to the KEV and exploited panels a short-dashed line of the same CVEs
+    counted by their publication month instead; without it the chart is the
+    page's, unchanged."""
+    p = _prep_exploitation_trends(stats, anchor_date, anchor_month_complete, wild_cve_first_seen, months_back,
+                                  cve_published=cve_published)
     if p is None or not all(p[k]["trend"] for k in ("pubs", "wild", "kev")):
         return
     x = p["x"]
@@ -1795,10 +1995,31 @@ def plot_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wi
                               f"trend {pct(p['wild'])} a year"),
     ]
     part = p["partial"]
-    limits = _trend_panel_ylim([srs for srs, _, _ in panels], with_partial=True)
+    show_pub = bool(cve_published)
+    limits = _trend_panel_ylim([srs for srs, _, _ in panels], with_partial=True, with_published=show_pub)
+    if show_pub:
+        # The years before the window reach averages far under one a month; one
+        # span for every panel would flatten them all, so each panel (window
+        # and lead-in together, on one axis) gets its own range here.
+        limits = [_trend_panel_ylim([srs], with_partial=True, with_published=True)[0] for srs, _, _ in panels]
+        limits = [(lo / 1.3, hi * 4.5) for lo, hi in limits]
 
     plt.style.use("dark_background")
-    fig, axes = plt.subplots(3, 1, figsize=(16, 14), sharex=True, facecolor="#1E1E1E")
+    if show_pub:
+        # The window keeps its width; a narrow column on the left holds the
+        # same CVEs published before it, per year, on its own log axis.
+        fig = plt.figure(figsize=(20, 14), facecolor="#1E1E1E")
+        gs = fig.add_gridspec(3, 2, width_ratios=[1, 4], wspace=0)
+        axes = [fig.add_subplot(gs[0, 1])]
+        axes += [fig.add_subplot(gs[i, 1], sharex=axes[0]) for i in (1, 2)]
+        for ax in axes[:-1]:
+            ax.tick_params(labelbottom=False)
+        lead_axes = [fig.add_subplot(gs[0, 0], sharey=axes[0])]
+        lead_axes += [fig.add_subplot(gs[i, 0], sharex=lead_axes[0], sharey=axes[i]) for i in (1, 2)]
+        lead_from = min([int(y_) for k in ("kev", "wild") for y_ in p[k].get("by_published_years") or {}]
+                        or [p["months"][0].year])
+    else:
+        fig, axes = plt.subplots(3, 1, figsize=(16, 14), sharex=True, facecolor="#1E1E1E")
     stroke = lambda t: t.set_path_effects(   # noqa: E731
         [path_effects.Stroke(linewidth=3, foreground="#1E1E1E"), path_effects.Normal()])
     for ax, (srs, color, name), (lo, hi) in zip(axes, panels, limits):
@@ -1807,7 +2028,7 @@ def plot_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wi
         ax.set_ylim(lo, hi)
         ax.yaxis.set_major_locator(matplotlib.ticker.LogLocator(base=10, subs=(1, 2, 5)))
         ax.yaxis.set_minor_locator(matplotlib.ticker.NullLocator())
-        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:,.0f}"))
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:,.0f}" if v >= 1 else f"{v:g}"))
         if srs["trend"]:
             tr = srs["trend"]
             ax.fill_between(x, tr["lo"], tr["hi"], color=color, alpha=0.13, linewidth=0, zorder=1)
@@ -1820,7 +2041,36 @@ def plot_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wi
             ax.plot([x[-1], part["x"]], [srs["values"][-1], srs["partial"]], color=color, linewidth=2.4,
                     linestyle=(0, (4, 3)), marker="o", markersize=8, markevery=[1],
                     markerfacecolor="#1E1E1E", markeredgewidth=2, zorder=3)
-        ax.text(0.01, 0.95, name, transform=ax.transAxes, ha="left", va="top", fontsize=15,
+        if show_pub and srs.get("by_published"):
+            # The same CVEs, by the month they were published: short dashes,
+            # lighter, gaps where a month has none.
+            bp = [np.nan if v is None else v for v in srs["by_published"]]
+            ax.plot(x, bp, color=_blend_white(color, 0.45), linewidth=2.2, linestyle=(0, (2.5, 2)),
+                    marker="s", markersize=3.5, alpha=0.95, zorder=2.5)
+            if part and srs.get("by_published_partial") and srs["by_published"][-1]:
+                ax.plot([x[-1], part["x"]], [srs["by_published"][-1], srs["by_published_partial"]],
+                        color=_blend_white(color, 0.45), linewidth=2.2, linestyle=(0, (2.5, 2)),
+                        marker="s", markersize=7, markevery=[1], markerfacecolor="#1E1E1E",
+                        markeredgewidth=2, zorder=2.5)
+            lax = lead_axes[[s_ for s_, _, _ in panels].index(srs)]
+            _draw_published_lead_in(lax, srs, color, p, lead_from)
+            # Join the two halves across the seam: the last year on the left
+            # to the window's first month, in the same dashes.
+            last_year = srs["by_published_years"].get(str(p["months"][0].year))
+            if last_year and srs["by_published"][0]:
+                fig.add_artist(matplotlib.patches.ConnectionPatch(
+                    xyA=(p["months"][0].year, last_year), coordsA=lax.transData,
+                    xyB=(mdates.date2num(x[0]), srs["by_published"][0]), coordsB=ax.transData,
+                    color=_blend_white(color, 0.45), linewidth=2.2, linestyle=(0, (2.5, 2)), zorder=2.5))
+            ax.legend(handles=[
+                matplotlib.lines.Line2D([], [], color=color, linewidth=2.4, marker="o", markersize=5,
+                                        label="by date added" if srs is p["kev"] else "by first seen exploited"),
+                matplotlib.lines.Line2D([], [], color=_blend_white(color, 0.45), linewidth=2.2,
+                                        linestyle=(0, (2.5, 2)), marker="s", markersize=3.5,
+                                        label="same CVEs, by CVE publication month"),
+            ], loc="lower right", fontsize=12, frameon=True,
+                facecolor="#1E1E1E", edgecolor="#555555", framealpha=0.85)
+        ax._trend_title = ax.text(0.01, 0.95, name, transform=ax.transAxes, ha="left", va="top", fontsize=15,
                 fontweight="bold", color=color, zorder=7,
                 path_effects=[path_effects.Stroke(linewidth=4, foreground="#1E1E1E"), path_effects.Normal()])
         ax.tick_params(colors="#CCCCCC", labelsize=13)
@@ -1832,7 +2082,22 @@ def plot_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wi
             ax.spines[spine].set_visible(False)
         for spine in ["left", "bottom"]:
             ax.spines[spine].set_color("#555555")
-    axes[1].set_ylabel("Per month (log scale)", fontsize=16, fontweight="bold", color="#FFFFFF", labelpad=12)
+    if show_pub:
+        # One chart: the lead-in carries the y labels, the window its own
+        # left spine as the seam between the two.
+        for i, lax in enumerate(lead_axes):
+            _style_lead_in(lax, p, lead_from, show_x=(i == 2))
+            axes[i].tick_params(labelleft=False)
+            axes[i].spines["left"].set_color("#888888")
+        t = lead_axes[0].text(
+            0.5, 0.5, f"Before {p['first_lbl']}:\nthe same CVEs,\ncounted per\npublication year",
+            transform=lead_axes[0].transAxes, ha="center", va="center", fontsize=13, fontweight="bold",
+            color="#A4B0BE", linespacing=1.35)
+        lead_axes[0].tick_params(labelbottom=False)
+        lead_axes[1].set_ylabel("CVEs (log scale)", fontsize=16, fontweight="bold", color="#FFFFFF",
+                                labelpad=12)
+    else:
+        axes[1].set_ylabel("Per month (log scale)", fontsize=16, fontweight="bold", color="#FFFFFF", labelpad=12)
     axes[-1].xaxis.set_major_locator(mdates.MonthLocator(bymonth=(1, 4, 7, 10)))
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
     if part:
@@ -1848,7 +2113,7 @@ def plot_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wi
         fontsize=21, fontweight="bold", color="#FFFFFF", y=0.985,
     )
     # Laid out before the outliers are placed: placement measures the final boxes.
-    plt.tight_layout(rect=[0.01, 0.085, 0.99, 0.95], h_pad=1.6)
+    plt.tight_layout(rect=[0.01, 0.105 if show_pub else 0.085, 0.99, 0.95], h_pad=1.6)
     for ax, (srs, color, _) in zip(axes, panels):
         tail = []
         if part and srs["partial"]:
@@ -1859,6 +2124,11 @@ def plot_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wi
                             color="#CCCCCC", style="italic", linespacing=1.2, zorder=6)
             stroke(t)
             lines = tail + [(ax, list(x), srs["values"])]
+            if show_pub and srs.get("by_published"):
+                bp = [np.nan if v is None else v for v in srs["by_published"]]
+                lines.append((ax, list(x), bp))
+                if srs.get("by_published_partial") and bp[-1] == bp[-1]:
+                    lines.append((ax, [x[-1], part["x"]], [bp[-1], srs["by_published_partial"]]))
             if srs["trend"]:
                 lines += [(ax, list(x), srs["trend"][k]) for k in ("fit", "lo", "hi")]
             _place_clear(t, [(xy, (0, -12), "center", "top", None), (xy, (0, 12), "center", "bottom", None),
@@ -1870,12 +2140,22 @@ def plot_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wi
             xs = [mdates.num2date(v_).replace(tzinfo=None) for v_ in (x0, x1, x1, x0, x0, x1)]
             tail.append((ax, xs, [y0, y0, y1, y1, y0, y1]))
         if srs["trend"]:
+            if show_pub:
+                # Keep the outlier labels off the panel title as well.
+                bb = ax._trend_title.get_window_extent(fig.canvas.get_renderer()).padded(4)
+                (x0, y0), (x1, y1) = ax.transData.inverted().transform([(bb.x0, bb.y0), (bb.x1, bb.y1)])
+                xs = [mdates.num2date(v_).replace(tzinfo=None) for v_ in (x0, x1, x1, x0, x0, x1)]
+                tail = tail + [(ax, xs, [y0, y0, y1, y1, y0, y1])]
             _label_trend_outliers(ax, p, srs, color, 13, stroke, ring=14, extra_lines=tail)
     plt.figtext(
         0.5, 0.032,
-        "Log axes spanning the same ratio: a doubling is the same height in every panel.\n"
-        "Dashed: growth trend fitted robustly (Theil–Sen on log counts); shaded: ±2σ; ringed: months outside it."
-        + ("\nHollow marker on a dashed tail: the running month so far, left out of the trend." if part else ""),
+        ("Log axes, each panel scaled to its own range. Right of the seam: per month; left: per year.\n"
+         if show_pub else
+         "Log axes spanning the same ratio: a doubling is the same height in every panel.\n")
+        + "Dashed: growth trend fitted robustly (Theil–Sen on log counts); shaded: ±2σ; ringed: months outside it."
+        + ("\nHollow marker on a dashed tail: the running month so far, left out of the trend." if part else "")
+        + (f"\nShort dashes (KEV and exploited panels): the same CVEs counted by the month they were published; "
+           f"left of the seam, those published before {p['first_lbl']}, counted per year." if show_pub else ""),
         ha="center", fontsize=12.5, color="#A4B0BE", style="italic", linespacing=1.4,
     )
     plt.figtext(
@@ -2828,6 +3108,11 @@ def count_monthly_cves(file_path, cut_off_date=None):
     # wild_cve_first_seen[CVE id] = that same earliest firstSeen, per CVE, so
     # the flagged set can be merged with the CISA KEV catalog by id.
     wild_cve_first_seen = {}
+    # exploited_cve_published[CVE id] = the record's own publication day, for
+    # every flagged CVE and every CISA KEV entry, so the trends chart can count
+    # the same CVEs by when they were published (local-only copy of the chart).
+    exploited_cve_published = {}
+    kev_ids = load_cisa_kev_cves() if _SLIDES else set()
 
     if cut_off_date:
         now = datetime.strptime(cut_off_date, "%Y-%m-%d")
@@ -2899,6 +3184,11 @@ def count_monthly_cves(file_path, cut_off_date=None):
                         for s in srcs:
                             if s.get("type"):
                                 wild_sources[s["type"]] += 1
+                    cve_id = str(item.get("id") or "").upper()
+                    if (cve_id in kev_ids or (_SLIDES and isinstance(expl, dict)
+                                              and expl.get("wildExploited") is True)) \
+                            and published_date and len(published_date) >= 10:
+                        exploited_cve_published[cve_id] = published_date[:10]
 
                 if item.get("id") in fanout_wanted:
                     fanout_records[item["id"]] = fanout_record(item)
@@ -3046,6 +3336,7 @@ def count_monthly_cves(file_path, cut_off_date=None):
         "epss_rows": epss_rows,
         "wild_first_seen": wild_first_seen,
         "wild_cve_first_seen": wild_cve_first_seen,
+        "exploited_cve_published": exploited_cve_published,
         "wild_sources": wild_sources,
     }
 
@@ -7884,6 +8175,12 @@ def _run_monthly(results, report_buf):
                                  wild_cve_first_seen=results.get("wild_cve_first_seen", {}),
                                  output_filename="cve_monthly_stats_comparison_exploitation_trends_24m.png",
                                  months_back=EXPLOIT_TRENDS_MONTHS_SHORT)
+        # The same chart with the KEV and exploited CVEs also counted by their
+        # own publication month (local only).
+        plot_exploitation_trends(stats, anchor_date, anchor_month_complete=anchor_month_complete,
+                                 wild_cve_first_seen=results.get("wild_cve_first_seen", {}),
+                                 output_filename="cve_monthly_stats_comparison_exploitation_trends_published.png",
+                                 cve_published=results.get("exploited_cve_published", {}))
     # One CVE's downstream advisories, for the fan-out slide (local only).
     fanout_records = results.get("fanout_records", {})
     slide_inputs["fanout_downstream"] = dict(record=fanout_records.get(FANOUT_CVE))

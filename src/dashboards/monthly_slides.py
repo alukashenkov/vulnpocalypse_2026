@@ -1977,7 +1977,8 @@ def _fanout_rows(record):
                  "note": (f"vendor advisory · {r['releases']} product line{'s' if r['releases'] != 1 else ''} · "
                           if r["kind"] == "vendor" else
                           f"{r['releases']} release{'s' if r['releases'] != 1 else ''} · ")
-                         + ", ".join(sorted(r["packages"][:8], key=len)[:3])}
+                         + ", ".join(sorted(r["packages"][:8], key=len)[:3]),
+                 "packages": sorted(r["packages"][:8], key=len)[:3]}
                 for r in audit_rows]
         return rows, totals, "audit"
     groups = m.fanout_breakdown(record["references"])
@@ -1985,6 +1986,40 @@ def _fanout_rows(record):
                   key=lambda r: (-r["value"], r["label"]))
     totals = {"updates": sum(r["value"] for r in rows), "products": len(rows), "releases": None, "advisories": None}
     return rows, totals, "references"
+
+
+def _fit_fanout_note(fig, ax, note, row, inside, right):
+    """Keep one bar's note in its lane: inside the bar it must not run past the
+    axis' left edge (over the product name), outside it must stop short of the
+    right margin (``right``, figure fraction). Package names are dropped from
+    the end, then the last one is shortened, each time marked with "…"."""
+    pkgs = row.get("packages") or []
+    if not pkgs:
+        return
+    head = row["note"][:row["note"].index(pkgs[0])] if pkgs[0] in row["note"] else None
+    if head is None:
+        return
+    tail = row["note"][row["note"].index(", ".join(pkgs)) + len(", ".join(pkgs)):]
+    renderer = fig.canvas.get_renderer()
+    fig_w = fig.get_figwidth() * fig.dpi
+    ax_x0 = ax.get_window_extent(renderer).x0 / fig_w
+
+    def fits():
+        bb = note.get_window_extent(renderer)
+        return bb.x0 / fig_w >= ax_x0 + 0.004 if inside else bb.x1 / fig_w <= right - 0.012
+
+    if fits():
+        return
+    for n in range(len(pkgs) - 1, 0, -1):
+        note.set_text(head + ", ".join(pkgs[:n]) + ", …" + tail)
+        if fits():
+            return
+    name = pkgs[0]
+    while len(name) > 8:
+        name = name[:-2]
+        note.set_text(head + name + "…" + tail)
+        if fits():
+            return
 
 
 def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstream"], nvd=None, stamp=None,
@@ -2108,6 +2143,7 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
         else "distinct downstream records referencing the CVE",
         fontsize=F_TICK, color=INK2,
     )
+    x_rule_fig = 0.772          # the ladder's rule in the right margin; notes stop short of it
     # Count at the bar's end; what it consists of just after — or inside the bar
     # when it already reaches the margin. Both in white over a dark stroke, so
     # the note reads the same on the red bar and on the black background.
@@ -2116,13 +2152,15 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
                     ha="left", va="center", fontsize=F_SMALL, fontweight="bold", color=INK, zorder=5)
         if not r["note"]:
             continue
-        if r["value"] > 0.55 * x_max:
+        inside = r["value"] > 0.55 * x_max
+        if inside:
             note = ax.annotate(r["note"], xy=(r["value"], y), xytext=(-8, 0), textcoords="offset points",
                                ha="right", va="center", fontsize=8.5, color=INK, fontweight="bold", zorder=5)
         else:
             note = ax.annotate(r["note"], xy=(r["value"], y), xytext=(5 + 7.5 * len(f"{r['value']:,}") + 8, 0),
                                textcoords="offset points", ha="left", va="center", fontsize=8.5, color=INK, zorder=5)
         _stroke(note, lw=2.5)
+        _fit_fanout_note(fig, ax, note, r, inside, right=x_rule_fig)
 
     # The right margin is the ladder: how far the one fix travels. Each rung is a
     # count in the title ink with what it counts underneath, on one vertical
@@ -2677,7 +2715,24 @@ def slide_fanout_status(record=None, output_filename=SLIDE_FILES["fanout_status"
     _save(fig, output_filename, "fix status")
 
 
-def slide_fanout_status_timeline(record=None, output_filename=SLIDE_FILES["fanout_status_timeline"]):
+def _fixstatus_default_spec():
+    """``m.FIXSTATUS_*`` as the spec ``slide_fanout_status_timeline`` draws."""
+    return dict(
+        cve=m.FIXSTATUS_CVE,
+        what="Linux kernel af_unix GC use-after-free",
+        checked=m.FIXSTATUS_CHECKED,
+        events=m.FIXSTATUS_EVENTS,
+        releases=m.FIXSTATUS_RELEASES,
+        fixed_on=m.FIXSTATUS_FIXED_ON,
+        fix_labels={},
+        open_names={"SUSE": ["SLES / SAP / HA 16.0 & 16.1", "SL Micro 6.2", "Leap 16.0"]},
+        note=f"No upstream stable fix yet for {' or '.join(m.FIXSTATUS_UPSTREAM_OPEN)}.",
+        sources="Status: vendor security trackers via Vulners and OSV · fix dates: Debian package "
+                "tracker, Alpaquita APKINDEX build times",
+    )
+
+
+def slide_fanout_status_timeline(record=None, output_filename=SLIDE_FILES["fanout_status_timeline"], spec=None):
     """The fix-status slide on a calendar: from the upstream fix (0 releases
     fixed, every affected release vulnerable) to the snapshot day, the fixed
     count steps up on the day each release got its fix
@@ -2685,27 +2740,46 @@ def slide_fanout_status_timeline(record=None, output_filename=SLIDE_FILES["fanou
     whatever is still open is named at the snapshot day.
 
     The affected set is the one the trackers list on FIXSTATUS_CHECKED, applied
-    back to the upstream fix — vendors listed it later — and the slide says so."""
-    cve = m.FIXSTATUS_CVE
-    checked = datetime.strptime(m.FIXSTATUS_CHECKED, "%Y-%m-%d")
-    events = [(datetime.strptime(d, "%Y-%m-%d"), what) for d, what in m.FIXSTATUS_EVENTS]
+    back to the upstream fix — vendors listed it later — and the slide says so.
+
+    ``spec`` (an ``m.FIXSTATUS_EXTRA`` entry) draws another CVE the same way;
+    without it the slide is FIXSTATUS_CVE's. Releases one vendor fixed on one
+    day share a single label (``fix_labels`` shortens it)."""
+    spec = spec or _fixstatus_default_spec()
+    cve = spec["cve"]
+    checked = datetime.strptime(spec["checked"], "%Y-%m-%d")
+    events = [(datetime.strptime(d, "%Y-%m-%d"), what) for d, what in spec["events"]]
     start = next((d for d, what in events if what == "fixed upstream"), events[0][0])
-    fixes = sorted((datetime.strptime(m.FIXSTATUS_FIXED_ON[(v, r)], "%Y-%m-%d"), v, r)
-                   for v, r, state, _ in m.FIXSTATUS_RELEASES if state == "fixed")
-    open_rel = [(v, r) for v, r, state, _ in m.FIXSTATUS_RELEASES if state != "fixed"]
-    n_all = len(m.FIXSTATUS_RELEASES)
+    releases = spec["releases"]
+    fixes = sorted((datetime.strptime(spec["fixed_on"][(v, r)], "%Y-%m-%d"), v, r)
+                   for v, r, state, _ in releases if state == "fixed")
+    open_rel = [(v, r) for v, r, state, _ in releases if state != "fixed"]
+    n_all = len(releases)
     n_fixed, n_open = len(fixes), len(open_rel)
     days = (checked - start).days
     first_fix = (fixes[0][0] - start).days if fixes else None
     print(f"Fix timeline for {cve}: first release fixed after {first_fix} days; "
           f"{n_fixed} fixed / {n_open} vulnerable after {days} days")
 
-    fig = _slide(
-        f"{days} days after the upstream fix: {n_fixed} releases fixed, {n_open} still vulnerable",
-        f"{cve}  ·  Linux kernel af_unix GC use-after-free  ·  affected releases as vendor trackers list them on "
-        f"{checked.strftime('%b %-d, %Y')}, counted from the upstream fix on {start.strftime('%b %-d')}",
-    )
-    ax = fig.add_axes([0.075, 0.13, 0.66, CONTENT_TOP - 0.13])
+    headline = f"{days} days after the upstream fix: {n_fixed} releases fixed, {n_open} still vulnerable"
+    scope = (f"affected releases as vendor trackers list them on {checked.strftime('%b %-d, %Y')}, "
+             f"counted from the upstream fix on {start.strftime('%b %-d')}")
+    content_top = CONTENT_TOP
+    if spec.get("cve_in_title"):
+        # CVE and bug on the title's first line, the finding on its second;
+        # the subtitle keeps only the scope, under the title's real bottom.
+        fig = _slide(f"{cve}  ·  {spec['what']}\n{headline}")
+        title = fig.texts[0]
+        title.set_linespacing(1.25)
+        fig_h = fig.get_figheight() * fig.dpi
+        bottom = title.get_window_extent(fig.canvas.get_renderer()).y0 / fig_h
+        sub = fig.text(TEXT_LEFT, bottom - 0.018, scope, ha="left", va="top", fontsize=F_SUB, color=INK2,
+                       style="italic")
+        _fit_text(fig, sub, min_size=10.5)
+        content_top = sub.get_window_extent(fig.canvas.get_renderer()).y0 / fig_h - 0.075
+    else:
+        fig = _slide(headline, f"{cve}  ·  {spec['what']}  ·  {scope}")
+    ax = fig.add_axes([0.075, 0.13, 0.66, content_top - 0.13])
     _style_axes(ax)
 
     # Step series: one point at the start, one per fix day, one at the snapshot.
@@ -2723,14 +2797,40 @@ def slide_fanout_status_timeline(record=None, output_filename=SLIDE_FILES["fanou
 
     # The start: CVE fixed upstream, nothing shipped.
     ax.plot([start, start], [0, n_all], "o", color=INK, markersize=7, zorder=5)
-    # Each fix on its day, named; stacked labels climb so same-week fixes stay apart.
+    # Each fix on its day, named — one label per vendor and day, at the top of
+    # that day's step; stacked labels climb so same-week fixes stay apart.
+    groups = []
     for i, (d, v, r) in enumerate(fixes, 1):
+        if groups and groups[-1][0] == d and groups[-1][1] == v:
+            groups[-1][2].append(r)
+            groups[-1][3] = i
+        else:
+            groups.append([d, v, [r], i])
+    label_y = 0
+    for k, (d, v, rels, i) in enumerate(groups, 1):
         ax.plot(d, i, "o", color=m.C_GREEN, markersize=8, markeredgecolor=BG, zorder=6)
         vendor = "Alpaquita" if v.startswith("BellSoft") else v
-        t = ax.annotate(f"{vendor} {r}  ·  {d.strftime('%b %-d')}", xy=(d, i),
-                        xytext=(-10, 16 + 16 * (i - 1) if i > 1 else 14), textcoords="offset points",
-                        ha="right", va="bottom", fontsize=F_SMALL, color=m.C_GREEN, fontweight="bold", zorder=6,
-                        arrowprops=dict(arrowstyle="-", color=m.C_GREEN, lw=0.8, alpha=0.7))
+        names = spec["fix_labels"].get((v, d.strftime("%Y-%m-%d"))) or ", ".join(rels)
+        if names.startswith(vendor):
+            vendor = ""
+        text = f"{vendor} {names}".strip() + f"  ·  {d.strftime('%b %-d')}"
+        style = dict(ha="right", va="bottom", fontsize=F_SMALL, color=m.C_GREEN, fontweight="bold", zorder=6,
+                     arrowprops=dict(arrowstyle="-", color=m.C_GREEN, lw=0.8, alpha=0.7))
+        if "label_gap" in spec:
+            # Many fixes: each label just above-left of its own point, at
+            # least ``label_gap`` above the previous one (``label_at`` pins a
+            # label at (day, y) where that would cross the red line).
+            pinned = spec.get("label_at", {}).get((v, d.strftime("%Y-%m-%d")))
+            if pinned:
+                xy_text = (datetime.strptime(pinned[0], "%Y-%m-%d") + timedelta(hours=12), pinned[1])
+            else:
+                label_y = max(i + 0.9, label_y + spec["label_gap"]) if k > 1 else i + 0.9
+                xy_text = (d - timedelta(hours=12), label_y)
+            style["arrowprops"]["relpos"] = (1, 0)     # leader from the label's bottom-right corner
+            t = ax.annotate(text, xy=(d, i), xytext=xy_text, textcoords="data", **style)
+        else:
+            t = ax.annotate(text, xy=(d, i), xytext=(-10, 16 + 16 * (k - 1) if k > 1 else 14),
+                            textcoords="offset points", **style)
         _stroke(t, lw=3)
     # The snapshot day: every open release sits here.
     ax.plot(checked, n_open, "o", color=m.C_RED, markersize=10, markeredgecolor=BG, zorder=6)
@@ -2769,20 +2869,29 @@ def slide_fanout_status_timeline(record=None, output_filename=SLIDE_FILES["fanou
              fontsize=F_LABEL + 1, fontweight="bold", color=m.C_RED)
     y -= 0.05
     for v, rels in sorted(by_vendor.items(), key=lambda kv: (-len(kv[1]), kv[0])):
-        if v == "SUSE":
-            rels = ["SLES / SAP / HA 16.0 & 16.1", "SL Micro 6.2", "Leap 16.0"]
+        rels = spec["open_names"].get(v, rels)
         body = textwrap.fill(", ".join(rels), 34)
         fig.text(x_txt, y, f"{v} ({len(by_vendor[v])})", ha="left", va="top", fontsize=F_SMALL + 0.5,
                  fontweight="bold", color=INK)
         fig.text(x_txt, y - 0.027, body, ha="left", va="top", fontsize=F_SMALL - 0.5, color=INK2, linespacing=1.3)
         y -= 0.027 + 0.026 * (body.count("\n") + 1) + 0.022
-    fig.text(x_txt, y - 0.01, textwrap.fill(
-        f"No upstream stable fix yet for {' or '.join(m.FIXSTATUS_UPSTREAM_OPEN)}.", 38),
-        ha="left", va="top", fontsize=F_SMALL - 0.5, color=INK, style="italic", linespacing=1.3)
-    fig.text(0.075, FOOT_Y, "Status: vendor security trackers via Vulners and OSV · fix dates: Debian package "
-             "tracker, Alpaquita APKINDEX build times", ha="left", va="bottom", fontsize=F_FOOT, color=INK3,
-             style="italic")
+    fig.text(x_txt, y - 0.01, textwrap.fill(spec["note"], 38),
+             ha="left", va="top", fontsize=F_SMALL - 0.5, color=INK, style="italic", linespacing=1.3)
+    if "sources_wrap" in spec:
+        fig.text(0.075, FOOT_Y, textwrap.fill(spec["sources"], spec["sources_wrap"]), ha="left",
+                 va="bottom", fontsize=F_FOOT, color=INK3, style="italic", linespacing=1.3)
+    else:
+        fig.text(0.075, FOOT_Y, spec["sources"], ha="left", va="bottom", fontsize=F_FOOT, color=INK3,
+                 style="italic")
     _save(fig, output_filename, "fix status timeline")
+
+
+def slide_fanout_status_timeline_extra(record=None):
+    """``slide_fanout_status_timeline`` for each ``m.FIXSTATUS_EXTRA`` CVE,
+    one file each (``…_fanout_status_timeline_<cve-id lower>_slide.png``)."""
+    base = SLIDE_FILES["fanout_status_timeline"].replace("_slide.png", "")
+    for spec in m.FIXSTATUS_EXTRA:
+        slide_fanout_status_timeline(output_filename=f"{base}_{spec['cve'].lower()}_slide.png", spec=spec)
 
 
 # ── 12. Exploitation signals vs publication volume ──────────────────────────
@@ -3676,6 +3785,7 @@ _RENDERERS = [
     ("fanout_downstream_extra", slide_fanout_downstream_extra),
     ("fanout_status", slide_fanout_status),
     ("fanout_status", slide_fanout_status_timeline),
+    ("fanout_status", slide_fanout_status_timeline_extra),
     ("exploitation_vs_volume", slide_exploitation_vs_volume),
     ("exploitation_vs_volume", slide_exploitation_share),
     ("exploitation_wild", slide_exploitation_wild),
