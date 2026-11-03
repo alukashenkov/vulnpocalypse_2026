@@ -1861,6 +1861,9 @@ def _prep_exploitation_trends(stats, anchor_date, anchor_month_complete=False, w
             # own trend, named from the first of them.
             "above_since": d["months"][len(vals) - above] if above >= 2 else None,
             "partial": part_vals.get(name),
+            # The running month so far on the indexed charts' scale (None when
+            # there is none, or nothing yet — a log axis has no zero).
+            "pct_partial": part_vals[name] / start * 100 if part_vals.get(name) else None,
         }
     if cve_published:
         # The same CVEs the solid lines count — dated (added / first seen) in a
@@ -2227,6 +2230,7 @@ def plot_exploitation_trends_indexed(stats, anchor_date, anchor_month_complete=F
     if p is None or not all(p[k]["trend"] for k, _, _ in _TREND_SERIES):
         return
     x = p["x"]
+    part = p["partial"]
     pct = lambda srs: f"{(srs['trend']['annual'] - 1) * 100:+.0f}%"   # noqa: E731
 
     plt.style.use("dark_background")
@@ -2237,8 +2241,19 @@ def plot_exploitation_trends_indexed(stats, anchor_date, anchor_month_complete=F
         srs = p[key]
         allv += srs["pct"] + srs["trend_pct"]["fit"]
         ax.plot(x, srs["pct"], color=color, linewidth=1.6, marker="o", markersize=4, alpha=0.5, zorder=2)
+        so_far = ""
+        if part and srs["partial"] == 0:
+            so_far = f"  ·  {part['lbl']} so far: 0 (no point on a log axis)"
+        if part and srs["pct_partial"]:
+            # The running month as a dashed tail to a hollow marker: its count
+            # so far, never fitted. Early in a month it sits well below the line.
+            allv.append(srs["pct_partial"])
+            ax.plot([x[-1], part["x"]], [srs["pct"][-1], srs["pct_partial"]], color=color, linewidth=1.8,
+                    linestyle=(0, (4, 3)), alpha=0.8, marker="o", markersize=7, markevery=[1],
+                    markerfacecolor="#1E1E1E", markeredgewidth=1.8, zorder=4)
+            so_far = f"  ·  {part['lbl']} so far: {srs['partial']:,} = {srs['pct_partial']:.0f}%"
         ax.plot(x, srs["trend_pct"]["fit"], color=color, linewidth=4.0, zorder=3,
-                label=f"{name}: trend {pct(srs)} a year")
+                label=f"{name}: trend {pct(srs)} a year{so_far}")
         end = srs["trend_pct"]["fit"][-1]
         t = ax.annotate(f"{end:.0f}%", xy=(x[-1], end), xytext=(8, 0), textcoords="offset points",
                         ha="left", va="center", fontsize=15, fontweight="bold", color=color, zorder=6)
@@ -2277,9 +2292,14 @@ def plot_exploitation_trends_indexed(stats, anchor_date, anchor_month_complete=F
                borderpad=0.6, framealpha=0.95)
     plt.figtext(
         0.5, 0.03,
-        "Bold: growth trend fitted robustly (Theil–Sen on log counts); thin: the months themselves. "
-        "Complete months only."
-        + (f" Publications above their trend band since {since.strftime('%b %Y')}." if since else ""),
+        ("Bold: robust trend (Theil–Sen, log counts) · thin: the months · "
+         "dashed to hollow: the running month so far, not fitted"
+         if part else
+         "Bold: growth trend fitted robustly (Theil–Sen on log counts); thin: the months themselves. "
+         "Complete months only.")
+        + ((f" · publications above their band since {since.strftime('%b %Y')}." if part else
+            f" Publications above their trend band since {since.strftime('%b %Y')}.") if since
+           else ("." if part else "")),
         ha="center", fontsize=12.5, color="#A4B0BE", style="italic",
     )
     plt.figtext(

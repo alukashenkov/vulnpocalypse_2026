@@ -3351,12 +3351,14 @@ def slide_exploitation_trends_indexed(stats, anchor_date, anchor_month_complete=
     p = m._prep_exploitation_trends(stats, anchor_date, anchor_month_complete, wild_cve_first_seen)
     if p is None or not all(p[k]["trend"] for k, _, _ in m._TREND_SERIES):
         return
-    x, pubs = p["x"], p["pubs"]
+    x, pubs, part = p["x"], p["pubs"], p["partial"]
     rate = {k: _pct(p[k]["trend"]["annual"]) for k, _, _ in m._TREND_SERIES}
     since = pubs["above_since"]
     fig = _slide(
         f"From one start: publications {rate['pubs']} a year, CISA KEV {rate['kev']}, exploited {rate['wild']}",
-        f"{p['first_lbl']} → {p['last_lbl']}, complete months  ·  100% = each series' own trend level in "
+        f"{p['first_lbl']} → {p['last_lbl']}, complete months"
+        + (f" + {part['lbl']} so far (dashed, hollow, not fitted)" if part else "")
+        + f"  ·  100% = each series' own trend level in "
         f"{p['first_lbl']}, log scale  ·  bold: growth trend fitted robustly (Theil–Sen on log counts), "
         f"thin: the months themselves"
         + (f"  ·  publications above their trend band since {since.strftime('%b %Y')}" if since else ""),
@@ -3369,10 +3371,16 @@ def slide_exploitation_trends_indexed(stats, anchor_date, anchor_month_complete=
         allv += srs["pct"] + srs["trend_pct"]["fit"]
         ax.plot(x, srs["pct"], color=color, linewidth=1.3, marker="o", markersize=3, alpha=0.45, zorder=2)
         ax.plot(x, srs["trend_pct"]["fit"], color=color, linewidth=3.2, zorder=3)
+        if part and srs["pct_partial"]:
+            # The running month so far, as a dashed tail to a hollow marker.
+            allv.append(srs["pct_partial"])
+            ax.plot([x[-1], part["x"]], [srs["pct"][-1], srs["pct_partial"]], color=color, linewidth=1.5,
+                    linestyle=(0, (4, 3)), alpha=0.8, marker="o", markersize=5.5, markevery=[1],
+                    markerfacecolor=BG, markeredgewidth=1.5, zorder=4)
     ax.axhline(100, color=INK2, linewidth=1.0, linestyle=(0, (2, 3)), zorder=1)
     m._percent_axis(ax, allv)
     ax.set_ylabel(f"% of the {p['first_lbl']} trend level (log)", fontsize=F_TICK, color=INK2)
-    _exploitation_xaxis(ax, p)
+    _exploitation_xaxis(ax, p, with_partial=True)
     t = ax.annotate(f"{p['last_lbl']}: {pubs['pct'][-1]:.0f}%", xy=(x[-1], pubs["pct"][-1]), xytext=(-9, 3),
                     textcoords="offset points", ha="right", va="bottom", fontsize=F_SMALL, fontweight="bold",
                     color=m.C_RED, zorder=6)
@@ -3382,9 +3390,11 @@ def slide_exploitation_trends_indexed(stats, anchor_date, anchor_month_complete=
     _end_labels(ax, [
         {"y": p[k]["trend_pct"]["fit"][-1], "color": color, "main": names[k],
          "sub": f"trend {rate[k]} a year → {p[k]['trend_pct']['fit'][-1]:.0f}%\n"
-                f"{p[k]['values'][-1]:,} in {last} = {p[k]['pct'][-1]:.0f}%"}
+                f"{p[k]['values'][-1]:,} in {last} = {p[k]['pct'][-1]:.0f}%"
+                + ((f"\n{part['lbl']} so far: {p[k]['partial']:,} = {p[k]['pct_partial']:.0f}%"
+                    if p[k]["pct_partial"] else f"\n{part['lbl']} so far: 0 (off the log axis)") if part else "")}
         for k, color, _ in m._TREND_SERIES
-    ], min_gap=0.13)
+    ], min_gap=0.13 if not part else 0.175)
     _save(fig, output_filename, "exploitation trends, indexed")
 
 
