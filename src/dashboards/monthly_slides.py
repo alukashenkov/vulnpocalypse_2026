@@ -75,6 +75,7 @@ SLIDE_FILES = {
     "fanin_chrome": "cve_monthly_stats_comparison_fanin_chrome_slide.png",
     "fanin_chrome_estate": "cve_monthly_stats_comparison_fanin_chrome_estate_slide.png",
     "cwe_chrome": "cve_monthly_stats_comparison_cwe_chrome_slide.png",
+    "cwe_android": "cve_monthly_stats_comparison_cwe_android_slide.png",
     "fanout_downstream": "cve_monthly_stats_comparison_fanout_downstream_slide.png",
     "fanout_status": "cve_monthly_stats_comparison_fanout_status_slide.png",
     "fanout_status_timeline": "cve_monthly_stats_comparison_fanout_status_timeline_slide.png",
@@ -1961,6 +1962,260 @@ def slide_cwe_chrome(chrome_cves, anchor_date, output_filename=SLIDE_FILES["cwe_
     _save(fig, output_filename, "Chrome releases by CWE")
 
 
+# ── 10b. Android bulletins by CWE ───────────────────────────────────────────
+# The Chrome CWE slide's picture for the Android CNA: one column per security
+# bulletin instead of per release, the rows picked the same way (each
+# bulletin's leading CWE first, ringed). Every Android record links its own
+# bulletin on the day it is published, so there is no reserved/enrichment
+# chase as with Chrome. What does lag is the CWE itself — a fresh bulletin's
+# records mostly arrive without one and gain it from enrichment days later —
+# so CVEs without a CWE get a row of their own at the bottom instead of
+# silently shrinking the newest column. Columns are coloured by the product
+# the bulletin covers.
+ANDROID_CWE_NAMES = {
+    **CHROME_CWE_NAMES,
+    "CWE-22": "Path Traversal",
+    "CWE-89": "SQL Injection",
+    "CWE-120": "Classic Buffer Overflow",
+    "CWE-285": "Improper Authorization",
+    "CWE-400": "Uncontrolled Resource Consumption",
+    "CWE-441": "Confused Deputy",
+    "CWE-601": "Open Redirect",
+    "CWE-704": "Incorrect Type Conversion",
+    "CWE-303": "Incorrect Auth Algorithm",
+    "CWE-1021": "Tapjacking (UI Layers)",
+}
+# Bulletin product (the path's first segment) → label, colour, order in a month.
+_ANDROID_PRODUCTS = {
+    "android": ("Android", m.C_BLUE),
+    "release": ("Android release", m.C_RED),
+    "aaos": ("Automotive", m.C_GREEN),
+    "wear": ("Wear OS", m.C_YELLOW),
+    "xr": ("XR", "#A55EEA"),
+    "pixel": ("Pixel", "#FF9F43"),
+    "other": ("other", m.C_GRAY),
+}
+_ANDROID_NO_CWE = "No CWE assigned"
+
+
+def _android_bulletins(android_cves, anchor_date):
+    """Group the year's Android-CNA CVEs by the bulletin they link.
+
+    A dated bulletin (``2026/2026-11-01``, ``aaos/2026/2026-11-01``) is dated
+    by its own month; a platform release bulletin (``android-17``) by its
+    CVEs' earliest publication day; a CVE linking none forms a group of its
+    publication day. Returns bulletins sorted by date, then product.
+    """
+    groups = {}
+    for r in android_cves:
+        if r["day"] > anchor_date[:10]:
+            continue
+        key = r.get("bulletin") or f"published {r['day']}"
+        g = groups.setdefault(key, {"key": key, "ids": [], "first_day": r["day"]})
+        g["ids"].append(r["id"])
+        g["first_day"] = min(g["first_day"], r["day"])
+    order = list(_ANDROID_PRODUCTS)
+    out = []
+    for key, g in groups.items():
+        md = re.search(r"(\d{4})-(\d{2})-01$", key)
+        first = key.split("/")[0]
+        if md:
+            when = date(int(md.group(1)), int(md.group(2)), 1)
+            product = "android" if first.isdigit() else first
+        else:
+            when = date.fromisoformat(g["first_day"])
+            product = "release" if re.fullmatch(r"android-\d+", key) else "other"
+        product = product if product in _ANDROID_PRODUCTS else "other"
+        label = key.replace("android-", "Android ") if product == "release" else _ANDROID_PRODUCTS[product][0]
+        out.append({"key": key, "date": when, "product": product, "label": label, "ids": g["ids"]})
+    out.sort(key=lambda b: (b["date"].year, b["date"].month, order.index(b["product"]), b["key"]))
+    return out
+
+
+def slide_cwe_android(android_cves, anchor_date, output_filename=SLIDE_FILES["cwe_android"]):
+    """Every Android security bulletin of the year against the CWEs of its CVEs.
+
+    A CVE with several CWEs counts once in each of their rows, so the count on
+    top (distinct CVEs) is the only per-bulletin total.
+    """
+    bulletins = _android_bulletins(android_cves, anchor_date)
+    if not bulletins:
+        return
+    cwe_of = {r["id"]: r.get("cwe") or [] for r in android_cves}
+    year = anchor_date[:4]
+    n = len(bulletins)
+    totals = [len(b["ids"]) for b in bulletins]
+    per_b = [collections.Counter(w for cid in b["ids"] for w in cwe_of.get(cid, ())) for b in bulletins]
+    no_cwe = [sum(1 for cid in b["ids"] if not cwe_of.get(cid)) for b in bulletins]
+    cwe_totals = sum(per_b, collections.Counter())
+    by_total = sorted(cwe_totals, key=lambda w: (-cwe_totals[w], w))
+    leaders = [{w for w, v in c.items() if v == max(c.values())} if c else set() for c in per_b]
+    picks = [max(ld, key=lambda w: (cwe_totals[w], w)) for ld in leaders if ld]
+    chosen = []
+    for w in picks + [w for w in by_total if any(w in ld for ld in leaders)] + by_total:
+        if w not in chosen and len(chosen) < CHROME_CWE_MAX_ROWS:
+            chosen.append(w)
+    top = sorted(chosen, key=by_total.index)
+    missing = sorted({w for w in picks if w not in chosen})
+    if missing:
+        print(f"[cwe_android] more bulletin leaders than {CHROME_CWE_MAX_ROWS} rows; not drawn: {', '.join(missing)}")
+    rows = top + (["Other CWEs"] if len(cwe_totals) > len(top) else []) + ([_ANDROID_NO_CWE] if any(no_cwe) else [])
+    top_set = set(top)
+    cell = {}
+    for i, b in enumerate(bulletins):
+        for w in top:
+            if per_b[i][w]:
+                cell[(i, w)] = per_b[i][w]
+        # "Other" counts CVEs, not pairs: a CVE with two rare CWEs is one CVE there.
+        other = sum(1 for cid in b["ids"] if any(w not in top_set for w in cwe_of.get(cid, ())))
+        if other:
+            cell[(i, "Other CWEs")] = other
+        if no_cwe[i]:
+            cell[(i, _ANDROID_NO_CWE)] = no_cwe[i]
+    row_totals = {w: cwe_totals[w] for w in top}
+    for w in ("Other CWEs", _ANDROID_NO_CWE):
+        row_totals[w] = sum(v for (i, r), v in cell.items() if r == w)
+    grand = sum(totals)
+    with_cwe = grand - sum(no_cwe)
+    colors = [_ANDROID_PRODUCTS[b["product"]][1] for b in bulletins]
+
+    csv_path = os.path.splitext(output_filename)[0].replace("_slide", "") + ".csv"
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["bulletin", "bulletin_date", "product", "cwe", "cves"])
+        writer.writeheader()
+        for i, b in enumerate(bulletins):
+            base = {"bulletin": b["key"], "bulletin_date": b["date"].isoformat(), "product": b["label"]}
+            for w, v in sorted(per_b[i].items(), key=lambda wv: (-wv[1], wv[0])):
+                writer.writerow({**base, "cwe": w, "cves": v})
+            if no_cwe[i]:
+                writer.writerow({**base, "cwe": "(none)", "cves": no_cwe[i]})
+    m.saved_files_log.append(f"Saved Android bulletin × CWE CSV to {os.path.abspath(csv_path)}")
+    lead = ", ".join(f"{w} {cwe_totals[w]:,} ({cwe_totals[w] / grand:.0%})" for w in top[:3])
+    print(f"\n[cwe_android] {year}: {n} bulletins, {grand:,} CVEs, {with_cwe:,} with a CWE; top: {lead}; "
+          f"no CWE: {sum(no_cwe)}")
+    lead_count = collections.Counter(picks)
+    print("[cwe_android] bulletin leaders: " + ", ".join(f"{w} {c}" for w, c in lead_count.most_common()))
+
+    def name(w):
+        return f"{w}  {ANDROID_CWE_NAMES[w]}" if w in ANDROID_CWE_NAMES else w
+
+    top_in = (1 - CONTENT_TOP) * SLIDE_H
+    strip_in, gap_in, bottom_in = 1.05, 0.11, 1.55
+    grid_in = (len(rows) + 0.2) * CHROME_CWE_ROW_IN
+    fig_h = max(SLIDE_H, top_in + strip_in + gap_in + grid_in + bottom_in)
+    lead_txt = ""
+    if lead_count:
+        lead_w, lead_n = lead_count.most_common(1)[0]
+        lead_txt = f"ringed: each bulletin's most common CWE; {name(lead_w)} leads {lead_n} of {len(picks)}  ·  "
+    fig = _slide(
+        f"Android {year}: what each security bulletin fixed, by weakness",
+        f"{n} bulletins, {grand:,} CVEs from the Android CNA, {with_cwe:,} with a CWE  ·  {lead_txt}"
+        f"bubble area ∝ CVEs; two CWEs count in both rows",
+        height=fig_h,
+    )
+    left, right = 0.235, 0.925
+    content_top = 1 - top_in / fig_h
+    strip_bottom = content_top - strip_in / fig_h
+    grid_top = strip_bottom - gap_in / fig_h
+    ax_bottom = bottom_in / fig_h
+
+    # Top strip: CVEs per bulletin.
+    axc = fig.add_axes([left, strip_bottom, right - left, content_top - strip_bottom])
+    _style_axes(axc)
+    axc.grid(False)
+    axc.spines["left"].set_visible(False)
+    axc.set_yticks([])
+    xs = np.arange(n)
+    axc.bar(xs, totals, 0.72, color=colors, alpha=0.95, edgecolor=BG, linewidth=0.6, zorder=3)
+    axc.set_ylim(0, max(totals) * 1.3)
+    axc.set_xlim(-0.7, n - 0.3)
+    axc.set_xticks([])
+    for i, tot in enumerate(totals):
+        axc.annotate(f"{tot:,}", xy=(i, tot), xytext=(0, 2), textcoords="offset points", ha="center", va="bottom",
+                     fontsize=8, fontweight="bold", color=INK, zorder=5)
+    fig.text(left - 0.012, strip_bottom + 0.09 / fig_h, "CVEs per bulletin", ha="right", va="bottom",
+             fontsize=F_SMALL, fontweight="bold", color=INK2)
+
+    # The grid: bulletins across, CWEs down, the most common on top; CVEs
+    # without a CWE in the last row, drawn hollow — a count, not a weakness.
+    ax = fig.add_axes([left, ax_bottom, right - left, grid_top - ax_bottom])
+    _style_axes(ax)
+    ax.grid(False)
+    ax.set_xlim(-0.7, n - 0.3)
+    ax.set_ylim(len(rows) - 0.4, -0.6)
+    for y in range(len(rows)):
+        ax.axhline(y, color=GRID, linewidth=0.5, alpha=0.6, zorder=1)
+    if _ANDROID_NO_CWE in rows:
+        ax.axhline(rows.index(_ANDROID_NO_CWE) - 0.5, color=SPINE, linewidth=0.9, zorder=1)
+    col_in = (right - left) * SLIDE_W / (n + 0.4)
+    row_in = grid_in / (len(rows) + 0.2)
+    d_max_pt = min(1.35 * col_in, 0.98 * row_in) * 72
+    # Scaled by the CWE cells: the no-CWE count (a whole fresh bulletin) would
+    # otherwise shrink every weakness to a dot; its bubble is capped at full size.
+    v_max = max([v for (i, w), v in cell.items() if w != _ANDROID_NO_CWE] or [1])
+    for hollow in (False, True):
+        pts = [(i, rows.index(w), v) for (i, w), v in cell.items() if (w == _ANDROID_NO_CWE) == hollow]
+        if not pts:
+            continue
+        bx, by, bv = zip(*pts)
+        bs = [(d_max_pt * np.sqrt(min(v, v_max) / v_max)) ** 2 for v in bv]
+        bc = [colors[i] for i in bx]
+        if hollow:
+            ax.scatter(bx, by, s=bs, facecolors=[matplotlib.colors.to_rgba(c, 0.18) for c in bc], edgecolors=bc,
+                       linewidths=1.0, linestyle=(0, (2, 1.5)), zorder=3)
+        else:
+            ax.scatter(bx, by, s=bs, c=bc, alpha=0.85, edgecolors=INK, linewidths=0.35, zorder=3)
+            ring = [(x, y, (np.sqrt(s_) + 4.5) ** 2) for x, y, s_ in zip(bx, by, bs) if rows[y] in leaders[x]]
+            if ring:
+                rx, ry, rs = zip(*ring)
+                ax.scatter(rx, ry, s=rs, facecolors="none", edgecolors=m.C_YELLOW, linewidths=1.3, zorder=4)
+        for x, y, s_, v in zip(bx, by, bs, bv):
+            if np.sqrt(s_) >= 10.5:
+                t = ax.text(x, y, f"{v}", ha="center", va="center", fontsize=6 if v < 100 else 5.3,
+                            fontweight="bold", color=INK, zorder=4)
+                _stroke(t, 1.2)
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([name(w) for w in rows], fontsize=8.5, color="#CCCCCC")
+    if _ANDROID_NO_CWE in rows:
+        ax.get_yticklabels()[rows.index(_ANDROID_NO_CWE)].set_style("italic")
+    for y, w in enumerate(rows):
+        ax.text(n - 0.3, y, f" {row_totals[w]:,}", ha="left", va="center", fontsize=8, fontweight="bold",
+                color=INK2, clip_on=False)
+    ax.text(n - 0.3, -0.95, " total", ha="left", va="bottom", fontsize=7.5, color=INK3, clip_on=False,
+            style="italic")
+
+    # Product under each column, the bulletin's month under those.
+    ax.set_xticks(xs)
+    ax.set_xticklabels([b["label"] for b in bulletins], rotation=90, fontsize=8)
+    for i, lbl in enumerate(ax.get_xticklabels()):
+        lbl.set_color(colors[i])
+    ax.tick_params(axis="x", pad=3)
+    month_y = -0.95 / grid_in
+    month_start = 0
+    for i in range(1, n + 1):
+        if i == n or bulletins[i]["date"].month != bulletins[month_start]["date"].month:
+            ax.text((month_start + i - 1) / 2.0, month_y, bulletins[month_start]["date"].strftime("%B"),
+                    transform=ax.get_xaxis_transform(), ha="center", va="top",
+                    fontsize=F_SMALL, fontweight="bold", color=INK2)
+            if i < n:
+                for a in (ax, axc):
+                    a.axvline(i - 0.5, color=GRID, linewidth=0.8, alpha=0.8, zorder=1)
+            month_start = i
+
+    from matplotlib.patches import Patch
+    present = [p for p in _ANDROID_PRODUCTS if any(b["product"] == p for b in bulletins)]
+    handles = [Patch(facecolor=_ANDROID_PRODUCTS[p][1], alpha=0.9,
+                     label=_ANDROID_PRODUCTS[p][0])
+               for p in present]
+    handles.append(matplotlib.lines.Line2D([], [], linestyle="none", marker="o", markersize=8,
+                                           markerfacecolor="none", markeredgecolor=m.C_YELLOW,
+                                           markeredgewidth=1.3, label="most common CWE"))
+    fig.legend(handles=handles, loc="upper right", bbox_to_anchor=(left - 0.008, content_top + 0.075 / fig_h),
+               facecolor="#262626", edgecolor="#444444", fontsize=7.5, framealpha=0.95, ncol=2,
+               columnspacing=1.0, handlelength=1.4)
+    _save(fig, output_filename, "Android bulletins by CWE")
+
+
 # ── 11. Fan-out: one CVE, N downstream package updates ─────────────────────
 
 _FANOUT_MAX_BARS = 15   # products drawn individually; the rest pool into one bar
@@ -3781,6 +4036,7 @@ _RENDERERS = [
     ("fanin_chrome", slide_fanin_chrome),
     ("fanin_chrome", slide_fanin_chrome_estate),      # reads the CSV the line above writes
     ("fanin_chrome", slide_cwe_chrome),
+    ("cwe_android", slide_cwe_android),
     ("fanout_downstream", slide_fanout_downstream),
     ("fanout_downstream_extra", slide_fanout_downstream_extra),
     ("fanout_status", slide_fanout_status),

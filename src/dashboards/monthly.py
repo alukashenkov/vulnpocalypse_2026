@@ -424,6 +424,36 @@ def _chrome_row(item, day, candidate=False):
         "candidate": candidate,
     }
 
+
+# ── Android security bulletins ───────────────────────────────────────────────
+# The Android CNA (``reporter == "google_android"``; Pixel publishes as the
+# separate Google_Devices CNA) releases its CVEs in security bulletins, and
+# every record links its own bulletin in ``references`` from the day it is
+# published: ``source.android.com/docs/security/bulletin/2026/2026-11-01`` for
+# the monthly Android bulletin, ``…/aaos/2026/…``, ``…/wear/…``, ``…/xr/…``,
+# ``…/pixel/…`` for the other products, ``…/android-17`` for a platform
+# release. That path is the bulletin key the CWE slide groups by.
+ANDROID_CNA = "google_android"
+_ANDROID_BULLETIN_URL = re.compile(r"source\.android\.com/(?:docs/)?security/bulletin/([^\s\"'#?]+)")
+
+
+def _android_row(item, day):
+    """One Android-CNA CVE for the bulletin × CWE slide: the bulletin path its
+    references name (the first one, ``None`` without one) and its CWEs."""
+    bulletin = None
+    for url in item.get("references") or ():
+        mb = _ANDROID_BULLETIN_URL.search(str(url))
+        if mb:
+            bulletin = mb.group(1).rstrip("/")
+            break
+    cwes = item.get("cwe") or []
+    return {
+        "id": item.get("id"),
+        "day": day,
+        "bulletin": bulletin,
+        "cwe": sorted({str(c) for c in (cwes if isinstance(cwes, list) else [cwes]) if c}),
+    }
+
 # ── Fan-out: one CVE, many downstream advisories ─────────────────────────────
 # The fan-out slide takes one CVE and counts the distinct downstream records
 # that reference it — a distribution's advisory, a vendor's bulletin, an
@@ -3092,6 +3122,9 @@ def count_monthly_cves(file_path, cut_off_date=None):
     # "candidate": still reserved}. Reserved CVEs are kept only when they carry
     # a Chrome advisory, release post or Chrome Nessus plugin.
     chrome_cves = []
+    # android_cves: one row per Android-CNA CVE of the anchor year — {"id",
+    # "day", "bulletin": bulletin path or None, "cwe": [CWE ids]}.
+    android_cves = []
     # fanout_records[cve_id] = the archive record's facts the fan-out slide and
     # its shortlist CSV need, for FANOUT_CVE and every FANOUT_SHORTLIST entry.
     fanout_records = {}
@@ -3279,6 +3312,8 @@ def count_monthly_cves(file_path, cut_off_date=None):
                     if year in ["2022", "2023", "2024", "2025", "2026"]:
                         if cna_name == CHROME_CNA and year == anchor_year:
                             chrome_cves.append(_chrome_row(item, record_date_str))
+                        if cna_name == ANDROID_CNA and year == anchor_year:
+                            android_cves.append(_android_row(item, record_date_str))
 
                         # Store in full monthly stats
                         stats[month][year][cna_name] += 1
@@ -3332,6 +3367,7 @@ def count_monthly_cves(file_path, cut_off_date=None):
         "status_weekly": status_weekly,
         "status_cna": status_cna,
         "chrome_cves": chrome_cves,
+        "android_cves": android_cves,
         "fanout_records": fanout_records,
         "epss_rows": epss_rows,
         "wild_first_seen": wild_first_seen,
@@ -8143,6 +8179,8 @@ def _run_monthly(results, report_buf):
 
     # Every Chrome release of the year with its CVE count, for the fan-in slide (local only).
     slide_inputs["fanin_chrome"] = dict(chrome_cves=results.get("chrome_cves", []), anchor_date=anchor_date)
+    # Every Android security bulletin of the year by CWE (local only).
+    slide_inputs["cwe_android"] = dict(android_cves=results.get("android_cves", []), anchor_date=anchor_date)
     # EPSS recency penalty and recall (local only).
     slide_inputs["epss"] = dict(epss_rows=results.get("epss_rows", []), anchor_date=anchor_date)
     # Kernel bug-fix discovery against CVE publishing (local only).
