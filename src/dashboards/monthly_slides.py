@@ -2350,14 +2350,18 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
         return
     total = totals["updates"]
     n_products = len(rows)
-    # The registry bar the second layer grows from (PyPI for brotli) shares its
-    # accent colour with that panel, and its note points down to it.
+    # Each registry bar the second layer grows from (Maven, PyPI, npm for
+    # brotli) takes that registry's colour, the same one its libraries wear in
+    # the panel below, and its note carries that registry's own dependents —
+    # not the panel's total, which is the sum over the registries.
     if libdeps:
-        linked = {m.FANOUT_REGISTRIES.get(reg, reg) for reg in (libdeps[1].get("registries") or {})}
+        by_label = {m.FANOUT_REGISTRIES.get(reg, reg): (reg, n)
+                    for reg, n in (libdeps[1].get("registries") or {}).items()}
         for r in rows:
-            if r["label"] in linked:
-                r["link"] = True
-                r["note"] += f"  ·  {libdeps[1]['dependents']:,} dependents in the second layer ↓"
+            if r["label"] in by_label:
+                reg, n = by_label[r["label"]]
+                r["link"] = _fanout_registry_color(reg)
+                r["note"] += f"  ·  {n:,} dependents in the second layer ↓"
     if len(rows) > _FANOUT_MAX_BARS:
         # Vendor-advisory bars and the second layer's own bar are never
         # pooled: the x label and the panel below each name them.
@@ -2417,7 +2421,7 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
 
     values = [r["value"] for r in rows]
     ys = np.arange(len(rows))
-    colors = [m.C_GRAY if i == pooled_idx else _FANOUT_LINK if r.get("link") else m.C_BLUE if r.get("vendor")
+    colors = [m.C_GRAY if i == pooled_idx else r["link"] if r.get("link") else m.C_BLUE if r.get("vendor")
               else m.C_RED
               for i, r in zip(ys, rows)]
     ax.barh(ys, values, 0.72, color=colors, alpha=0.95, edgecolor=BG, linewidth=0.6, zorder=3)
@@ -2425,7 +2429,7 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
     ax.set_yticklabels([r["label"] for r in rows], fontsize=F_LABEL - 0.5, fontweight="bold", color="#E0E0E0")
     for tick, r in zip(ax.get_yticklabels(), rows):
         if r.get("link"):
-            tick.set_color(_FANOUT_LINK)
+            tick.set_color(r["link"])
     ax.tick_params(axis="y", pad=8)
     x_max = max(values) * 1.02
     ax.set_xlim(0, x_max)
@@ -2573,6 +2577,14 @@ _FANOUT_LIBDEPS_MAX_BARS = 6
 
 
 _FANOUT_LINK = "#A55EEA"   # the registry bar and the second layer that grows from it
+# One colour per registry, worn by its bar in the fan-out chart and by its
+# libraries in the second-layer panel, so the two can be matched by eye. Kept
+# clear of the chart's red (packages), blue (vendor advisories) and gray.
+_FANOUT_REGISTRY_COLORS = {"maven": _FANOUT_LINK, "pypi": "#1ABC9C", "npm": "#F39C12", "cargo": "#E056FD"}
+
+
+def _fanout_registry_color(registry):
+    return _FANOUT_REGISTRY_COLORS.get(registry, _FANOUT_LINK)
 
 
 def _fanout_libdeps_panel(fig, height, rows, totals, status=None, link=False):
@@ -2600,16 +2612,29 @@ def _fanout_libdeps_panel(fig, height, rows, totals, status=None, link=False):
                               color=GRID, linewidth=1.0))
     # With the link the registries are already named in the lead; naming them
     # twice ran the headline off the frame (brotli: Maven, PyPI and npm).
-    lead = (f"Second layer, from the {reg_txt} bar{'s' if len(regs) > 1 else ''} above" if link
-            else "Second layer")
+    # Every registry is named here, since each has its own coloured bar above.
+    if link:
+        names_all = [m.VULNERSOSV_REGISTRIES.get(r, r) for r, _ in regs]
+        all_txt = names_all[0] if len(names_all) == 1 else ", ".join(names_all[:-1]) + " and " + names_all[-1]
+        lead = f"Second layer, from the {all_txt} bar{'s' if len(regs) > 1 else ''} above"
+    else:
+        lead = "Second layer"
     pkgs = "packages" if link else f"{reg_txt} packages"
     fig.text(x_left, yin(3.32), f"{lead}: {deps:,} {pkgs} depend on an affected {lib_txt}"
              if len(names) <= 3 else f"{lead}: {deps:,} {pkgs} depend on one of {lib_txt}",
              ha="left", va="top", fontsize=F_LABEL + 3, fontweight="bold", color=INK)
     if link:
-        # The accent stripe down the panel's left edge, in the bar's colour.
-        fig.add_artist(plt.Line2D([x_left - 0.014] * 2, [yin(0.72), yin(3.36)], transform=fig.transFigure,
-                                  color=_FANOUT_LINK, linewidth=4, solid_capstyle="butt"))
+        # The accent stripe down the panel's left edge, one segment per
+        # registry in its bar's colour, each as long as its share of the
+        # dependents (the biggest on top, as in the chart above).
+        lo, hi = yin(0.72), yin(3.36)
+        n_all = sum(n for _, n in regs) or 1
+        y = hi
+        for reg, n in regs:
+            seg = (hi - lo) * n / n_all
+            fig.add_artist(plt.Line2D([x_left - 0.014] * 2, [y, y - seg], transform=fig.transFigure,
+                                      color=_fanout_registry_color(reg), linewidth=4, solid_capstyle="butt"))
+            y -= seg
     snap = (datetime.strptime(totals["snapshot"], "%Y-%m-%d").strftime("%b %-d, %Y")
             if totals.get("snapshot") else "undated")
     source = (f"Vulners vulnersosv  ·  dependency snapshot {snap}"
@@ -2628,8 +2653,21 @@ def _fanout_libdeps_panel(fig, height, rows, totals, status=None, link=False):
         return
 
     # Left: the count, and what it is and is not.
-    fig.text(x_left, yin(2.78), f"{deps:,}", ha="left", va="top", fontsize=26, fontweight="bold", color=m.C_RED)
+    big = fig.text(x_left, yin(2.78), f"{deps:,}", ha="left", va="top", fontsize=26, fontweight="bold",
+                   color=INK)   # neutral: not one of the bar colours
     fig.text(x_left, yin(2.18), "library packages", ha="left", va="top", fontsize=F_LABEL, color=INK2)
+    if link and len(regs) > 1:
+        # The count split by registry beside it, each part in its bar's
+        # colour, each piece anchored to the right edge of the one before.
+        prev = fig.add_artist(matplotlib.text.Annotation(
+            "  =  ", xy=(1, 0.08), xycoords=big, ha="left", va="bottom", fontsize=F_LABEL - 1, color=INK2))
+        for i, (reg, n) in enumerate(regs):
+            if i:
+                prev = fig.add_artist(matplotlib.text.Annotation(
+                    " + ", xy=(1, 0), xycoords=prev, ha="left", va="bottom", fontsize=F_LABEL - 1, color=INK2))
+            prev = fig.add_artist(matplotlib.text.Annotation(
+                f"{n:,} {m.VULNERSOSV_REGISTRIES.get(reg, reg)}", xy=(1, 0), xycoords=prev,
+                ha="left", va="bottom", fontsize=F_LABEL - 1, fontweight="bold", color=_fanout_registry_color(reg)))
     basis = ("Packages whose published dependency ranges admit an affected version, directly or transitively: "
              "exposure the dependency graph states, not confirmed use. Counted apart from the rebuilt "
              "packages above.")
@@ -2638,8 +2676,16 @@ def _fanout_libdeps_panel(fig, height, rows, totals, status=None, link=False):
     fig.text(x_left, yin(0.95), source, ha="left", va="top", fontsize=F_SMALL - 0.5, color=INK3, style="italic")
 
     # Right: one bar per affected library, its affected versions underneath.
-    shown = rows[:_FANOUT_LIBDEPS_MAX_BARS]
-    rest = rows[_FANOUT_LIBDEPS_MAX_BARS:]
+    # Every registry keeps its biggest library on the chart (npm's one
+    # library would otherwise rank below a row of Maven native builds); the
+    # remaining places go by size, and the bars stay sorted by size.
+    leaders = {}
+    for r in rows:
+        leaders.setdefault(r["registry"], r)
+    picked = list(leaders.values())[:_FANOUT_LIBDEPS_MAX_BARS]
+    picked += [r for r in rows if r not in picked][:_FANOUT_LIBDEPS_MAX_BARS - len(picked)]
+    shown = [r for r in rows if r in picked]
+    rest = [r for r in rows if r not in picked]
     # Pushed right so long library names (Maven coordinates) clear the text on
     # the left; the x range leaves room for the value labels inside the frame.
     ax = fig.add_axes([0.70, yin(0.95), 0.17, yin(2.85) - yin(0.95)])
@@ -2648,10 +2694,14 @@ def _fanout_libdeps_panel(fig, height, rows, totals, status=None, link=False):
     ax.grid(True, axis="x", color=GRID, linestyle="--", linewidth=0.8, alpha=0.7)
     ys = np.arange(len(shown))[::-1]
     vals = [r["dependents"] for r in shown]
-    ax.barh(ys, vals, 0.62, color=m.C_RED, alpha=0.95, edgecolor=BG, linewidth=0.6, zorder=3)
+    ax.barh(ys, vals, 0.62, color=[_fanout_registry_color(r["registry"]) if link else m.C_RED for r in shown],
+            alpha=0.95, edgecolor=BG, linewidth=0.6, zorder=3)
     ax.set_yticks(ys)
     ax.set_yticklabels([f"{r['name']} ({m.VULNERSOSV_REGISTRIES.get(r['registry'], r['registry'])})" for r in shown],
                        fontsize=F_SMALL + 0.5, fontweight="bold", color="#E0E0E0")
+    if link:
+        for tick, r in zip(ax.get_yticklabels(), shown):
+            tick.set_color(_fanout_registry_color(r["registry"]))
     ax.set_ylim(-0.6, len(shown) - 0.4)
     ax.set_xlim(0, max(vals) * 1.6)
     ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(4))
