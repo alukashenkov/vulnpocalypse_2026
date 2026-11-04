@@ -108,6 +108,12 @@ _BASELINE_PROJ_IDX = min(int(m) for m in REFERENCE_PREDICTIONS) - 1
 FIRST_FORECAST_TOTAL = 66_000
 FIRST_FORECAST_LABEL = "FIRST Mid-Year Vulnerability Forecast Update, June 15th"
 
+# A round-number level on the same chart, dashed like the forecast and the
+# earlier years' totals and kept in view like the forecast, with a star and a
+# dated callout on the day the current year's curve reaches it.
+CUMULATIVE_MARK_TOTAL = 100_000
+CUMULATIVE_MARK_STAR = "#FFBB33"
+
 
 def clamp_growth(g_m):
     """Bound a projected YoY growth factor.
@@ -2887,12 +2893,15 @@ def sankey_lane_colors(stack_order, rank_colors=None):
 # floor — the whole point of the chart is that the gap between the years is
 # legible, and an autoscaled axis erases exactly that as the top curve runs away.
 #
-# Growth cannot go on forever, so it stops once the saved PNG is square. From
+# Growth cannot go on forever, so it stops at _CUM_FIG_H_MAX (90% of square). From
 # there the figure is frozen and the axis compresses the way an autoscaled one
 # always would.
 _CUM_FIG_W = 14.0            # inches; the chart's width never changes
 _CUM_FIG_H_MIN = 9.0         # the shape the chart had before it started growing
-_CUM_FIG_H_MAX = 14.151      # tallest figure whose tight-cropped PNG is square
+# Tallest figure: 90% of the 14.151in at which the tight-cropped PNG was square.
+# With the 100,000 line always on the axis (axis_peak) the chart sits at this
+# cap every day, so in practice it is the chart's fixed height.
+_CUM_FIG_H_MAX = 14.151 * 0.9
 _CUM_AXES_TOP_IN = 0.909     # inches reserved above the axes for the title
 _CUM_AXES_BOTTOM_IN = 0.701  # inches below it: month ticks + the footer stamp
 # 50,571 CVEs — 2025's full-year total plus the headroom below — over 7.3905in of
@@ -5874,9 +5883,32 @@ def _prep_yearly_cumulative(daily_counts, anchor_date_str):
     # axis / the label margin.
     guide_xmax = datetime(ref_dates[-1].year + 1, 1, 1)
 
-    # The forecast finish line must stay in view, so the axis peaks at whichever
-    # is taller: the tallest curve or the forecast.
-    axis_peak = max(max(totals.values()) if totals else 0, FIRST_FORECAST_TOTAL)
+    # The day the current year reaches the forecast and the 100k mark,
+    # interpolated onto each line like the crossings above; None until it has.
+    def _reached(level):
+        cur_series = cumulative_series["2026"]
+        for idx, val in enumerate(cur_series):
+            if val >= level:
+                hit_dt = dates_series["2026"][idx]
+                cross_x = hit_dt
+                if idx > 0 and val != cur_series[idx - 1]:
+                    v0 = cur_series[idx - 1]
+                    frac = min(max((level - v0) / (val - v0), 0.0), 1.0)
+                    cross_x = dates_series["2026"][idx - 1] + (hit_dt - dates_series["2026"][idx - 1]) * frac
+                hit_date = datetime(anchor_date_2026.year, hit_dt.month, hit_dt.day)
+                return {
+                    "cross_x": cross_x,
+                    "cross_y": level,
+                    "date_str": hit_date.strftime("%B %d, %Y"),
+                    "short_date_str": hit_date.strftime("%b %d"),
+                }
+        return None
+    forecast_info = _reached(FIRST_FORECAST_TOTAL)
+    goal_info = _reached(CUMULATIVE_MARK_TOTAL)
+
+    # The forecast finish line and the 100k line must stay in view, so the axis
+    # peaks at whichever is tallest: the tallest curve, the forecast or 100k.
+    axis_peak = max(max(totals.values()) if totals else 0, FIRST_FORECAST_TOTAL, CUMULATIVE_MARK_TOTAL)
 
     return {
         "ref_dates": ref_dates,
@@ -5892,6 +5924,9 @@ def _prep_yearly_cumulative(daily_counts, anchor_date_str):
         "guide_xmax": guide_xmax,
         "forecast_total": FIRST_FORECAST_TOTAL,
         "forecast_label": FIRST_FORECAST_LABEL,
+        "goal_total": CUMULATIVE_MARK_TOTAL,
+        "goal_info": goal_info,
+        "forecast_info": forecast_info,
         "axis_peak": axis_peak,
     }
 
@@ -5978,14 +6013,38 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
         xmin=ref_dates[0],
         xmax=guide_xmax,
         color="#FFFFFF",
-        linestyle=(0, (6, 4)),
-        linewidth=2.0,
-        alpha=0.85,
+        linestyle="--",
+        linewidth=1.5,
+        alpha=0.6,
         zorder=1
     )
     ax.annotate(
         f"{forecast_total:,}  {p['forecast_label']}",
         xy=(guide_xmax, forecast_total),
+        xytext=(0, 6),
+        textcoords="offset points",
+        ha="right",
+        va="bottom",
+        fontsize=12,
+        fontweight="bold",
+        color="#FFFFFF",
+        zorder=2
+    )
+    # The 100k level, labelled the same way.
+    goal_total = p["goal_total"]
+    ax.hlines(
+        y=goal_total,
+        xmin=ref_dates[0],
+        xmax=guide_xmax,
+        color="#FFFFFF",
+        linestyle="--",
+        linewidth=1.5,
+        alpha=0.6,
+        zorder=1
+    )
+    ax.annotate(
+        f"{goal_total:,}",
+        xy=(guide_xmax, goal_total),
         xytext=(0, 6),
         textcoords="offset points",
         ha="right",
@@ -6019,7 +6078,8 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
     ax.tick_params(colors="#CCCCCC", labelsize=13)
 
     # Add legend
-    legend = ax.legend(loc="upper left", facecolor="#262626", edgecolor="#444444", fontsize=13)
+    # Opaque, so the 100k line running under it does not show through.
+    legend = ax.legend(loc="upper left", facecolor="#262626", edgecolor="#444444", fontsize=13, framealpha=1.0)
 
     # Crossover stars + annotations for years 2026 has actually surpassed. These
     # come last: the callouts are measured against the legend and the axes
@@ -6062,6 +6122,69 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
             ann.xyann = (50, 35)
             ann.set_horizontalalignment("left")
             ann.arrow_patch.set_connectionstyle("arc3,rad=-0.2")
+
+    # The forecast passed: a star on its line and the date in a callout below
+    # and to the right, clear of the line's label (above it) and of the
+    # earlier years' callouts (above-left of their stars).
+    forecast_info = p["forecast_info"]
+    if forecast_info:
+        ax.plot(
+            forecast_info["cross_x"],
+            forecast_info["cross_y"],
+            marker="*",
+            color=CUMULATIVE_MARK_STAR,
+            markersize=18,
+            markeredgecolor="#FFFFFF",
+            zorder=6
+        )
+        ann = ax.annotate(
+            f"Passed {forecast_total:,} forecast on {forecast_info['short_date_str']}",
+            xy=(forecast_info["cross_x"], forecast_info["cross_y"]),
+            xytext=(40, -45),
+            textcoords="offset points",
+            ha="left",
+            va="top",
+            fontsize=12,
+            fontweight="bold",
+            color="#FFFFFF",
+            bbox=dict(boxstyle="round,pad=0.4", fc="#262626", ec="#FFFFFF", alpha=0.9, lw=1.5),
+            arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=0.2", color="#FFFFFF", lw=1.5),
+            zorder=6
+        )
+        # A late crossing would push the box past the right edge (and widen the
+        # saved figure); it then goes below-left instead.
+        if ann.get_window_extent(renderer).x1 > ax.get_window_extent(renderer).x1:
+            ann.xyann = (-40, -45)
+            ann.set_horizontalalignment("right")
+            ann.arrow_patch.set_connectionstyle("arc3,rad=-0.2")
+
+    # 100k reached: a bigger star on the line and its date in a callout,
+    # below the line so it never meets the line's own label above it.
+    goal_info = p["goal_info"]
+    if goal_info:
+        ax.plot(
+            goal_info["cross_x"],
+            goal_info["cross_y"],
+            marker="*",
+            color=CUMULATIVE_MARK_STAR,
+            markersize=22,
+            markeredgecolor="#FFFFFF",
+            zorder=6
+        )
+        ann = ax.annotate(
+            f"Reached {goal_total:,} on {goal_info['short_date_str']}",
+            xy=(goal_info["cross_x"], goal_info["cross_y"]),
+            xytext=(-50, -45),
+            textcoords="offset points",
+            ha="right",
+            va="top",
+            fontsize=12,
+            fontweight="bold",
+            color="#FFFFFF",
+            bbox=dict(boxstyle="round,pad=0.4", fc="#262626", ec=CUMULATIVE_MARK_STAR, alpha=0.9, lw=1.5),
+            arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=-0.2", color=CUMULATIVE_MARK_STAR, lw=1.5),
+            zorder=6
+        )
 
     plt.figtext(
         0.5,

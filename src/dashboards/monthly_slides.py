@@ -297,7 +297,7 @@ def slide_yearly_cumulative(daily_counts, anchor_date_str, output_filename=SLIDE
     forecast_total = p["forecast_total"]
     ax.hlines(
         forecast_total, ref_dates[0], p["guide_xmax"],
-        color=INK, linestyle=(0, (6, 4)), linewidth=1.6, alpha=0.85, zorder=1,
+        color=INK, linestyle="--", linewidth=1.2, alpha=0.5, zorder=1,
     )
     t = ax.annotate(
         f"{forecast_total:,}  {p['forecast_label']}",
@@ -305,6 +305,44 @@ def slide_yearly_cumulative(daily_counts, anchor_date_str, output_filename=SLIDE
         ha="right", va="bottom", fontsize=F_SMALL, fontweight="bold", color=INK, zorder=6,
     )
     _stroke(t, 2.5)
+    # The 100k level, drawn and labelled the same way; once the current year
+    # reaches it, a bigger star and the date on the line.
+    goal_total, goal_color = p["goal_total"], m.CUMULATIVE_MARK_STAR
+    ax.hlines(
+        goal_total, ref_dates[0], p["guide_xmax"],
+        color=INK, linestyle="--", linewidth=1.2, alpha=0.5, zorder=1,
+    )
+    t = ax.annotate(
+        f"{goal_total:,}",
+        xy=(p["guide_xmax"], goal_total), xytext=(0, 5), textcoords="offset points",
+        ha="right", va="bottom", fontsize=F_SMALL, fontweight="bold", color=INK, zorder=6,
+    )
+    _stroke(t, 2.5)
+    # The forecast passed: a star on its line, the date below and to the right.
+    if p["forecast_info"]:
+        fi = p["forecast_info"]
+        ax.plot(
+            fi["cross_x"], fi["cross_y"], marker="*", markersize=17,
+            color=goal_color, markeredgecolor=INK, markeredgewidth=0.8, zorder=7,
+        )
+        t = ax.annotate(
+            f"passed {fi['short_date_str']}", xy=(fi["cross_x"], fi["cross_y"]),
+            xytext=(10, -8), textcoords="offset points", ha="left", va="top",
+            fontsize=F_SMALL, fontweight="bold", color=INK, zorder=7,
+        )
+        _stroke(t, 2.5)
+    if p["goal_info"]:
+        gi = p["goal_info"]
+        ax.plot(
+            gi["cross_x"], gi["cross_y"], marker="*", markersize=20,
+            color=goal_color, markeredgecolor=INK, markeredgewidth=0.8, zorder=7,
+        )
+        t = ax.annotate(
+            f"reached {gi['short_date_str']}", xy=(gi["cross_x"], gi["cross_y"]),
+            xytext=(-10, -8), textcoords="offset points", ha="right", va="top",
+            fontsize=F_SMALL, fontweight="bold", color=goal_color, zorder=7,
+        )
+        _stroke(t, 2.5)
     for info in p["surpassed_info"]:
         ax.plot(
             info["cross_x"], info["cross_y"], marker="*", markersize=14,
@@ -2560,9 +2598,13 @@ def _fanout_libdeps_panel(fig, height, rows, totals, status=None, link=False):
         if len(names) <= 3 else f"{len(names)} libraries"
     fig.add_artist(plt.Line2D([x_left, 0.955], [yin(3.52)] * 2, transform=fig.transFigure,
                               color=GRID, linewidth=1.0))
-    lead = f"Second layer, from the {reg_txt} bar above" if link else "Second layer"
-    fig.text(x_left, yin(3.32), f"{lead}: {deps:,} {reg_txt} packages depend on an affected {lib_txt}"
-             if len(names) <= 3 else f"{lead}: {deps:,} {reg_txt} packages depend on one of {lib_txt}",
+    # With the link the registries are already named in the lead; naming them
+    # twice ran the headline off the frame (brotli: Maven, PyPI and npm).
+    lead = (f"Second layer, from the {reg_txt} bar{'s' if len(regs) > 1 else ''} above" if link
+            else "Second layer")
+    pkgs = "packages" if link else f"{reg_txt} packages"
+    fig.text(x_left, yin(3.32), f"{lead}: {deps:,} {pkgs} depend on an affected {lib_txt}"
+             if len(names) <= 3 else f"{lead}: {deps:,} {pkgs} depend on one of {lib_txt}",
              ha="left", va="top", fontsize=F_LABEL + 3, fontweight="bold", color=INK)
     if link:
         # The accent stripe down the panel's left edge, in the bar's colour.
@@ -2598,7 +2640,9 @@ def _fanout_libdeps_panel(fig, height, rows, totals, status=None, link=False):
     # Right: one bar per affected library, its affected versions underneath.
     shown = rows[:_FANOUT_LIBDEPS_MAX_BARS]
     rest = rows[_FANOUT_LIBDEPS_MAX_BARS:]
-    ax = fig.add_axes([x_right + 0.17, yin(0.95), 0.955 - x_right - 0.27, yin(2.85) - yin(0.95)])
+    # Pushed right so long library names (Maven coordinates) clear the text on
+    # the left; the x range leaves room for the value labels inside the frame.
+    ax = fig.add_axes([0.70, yin(0.95), 0.17, yin(2.85) - yin(0.95)])
     _style_axes(ax)
     ax.grid(False, axis="y")
     ax.grid(True, axis="x", color=GRID, linestyle="--", linewidth=0.8, alpha=0.7)
@@ -2609,7 +2653,8 @@ def _fanout_libdeps_panel(fig, height, rows, totals, status=None, link=False):
     ax.set_yticklabels([f"{r['name']} ({m.VULNERSOSV_REGISTRIES.get(r['registry'], r['registry'])})" for r in shown],
                        fontsize=F_SMALL + 0.5, fontweight="bold", color="#E0E0E0")
     ax.set_ylim(-0.6, len(shown) - 0.4)
-    ax.set_xlim(0, max(vals) * 1.35)
+    ax.set_xlim(0, max(vals) * 1.6)
+    ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(4))
     ax.tick_params(axis="x", labelsize=F_SMALL)
     ax.set_xlabel("dependent packages, distinct by name" + (f"  ·  {len(rest)} more libraries not drawn" if rest else ""),
                   fontsize=F_SMALL, color=INK2)
