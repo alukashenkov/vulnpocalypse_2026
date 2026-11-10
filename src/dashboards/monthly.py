@@ -494,6 +494,7 @@ FANOUT_SHORTLIST = [
 FANOUT_EXTRA_CVES = [
     "CVE-2026-109618",  # PHP, VulnCheck KEV
     "CVE-2026-111497",  # brotli (Google)
+    "CVE-2026-123158",  # OpenSSH sshd, musl without PAM password bypass
 ]
 # Reference types that are not downstream changes: scanners and detection
 # content, CVE mirrors and aggregators, exploit and news feeds, KEV lists.
@@ -2418,6 +2419,113 @@ def cna_roster(data_dir=None):
     return roster
 
 
+# A record Vulners has not finished processing can carry the assigner's raw
+# address (NVD's sourceIdentifier, e.g. "disclosure@vulncheck.com") as its
+# ``cna``/``reporter`` instead of the CNA's short name ("VulnCheck"). It is
+# transient — the same record reads "VulnCheck" a few hours later — so a run
+# just after a CNA's batch counts that CNA twice, once under an address that
+# looks like a CNA nobody has seen this year. Seen 2026-11-10: the 02:26 UTC
+# page build had 24 such addresses in November (active CNAs 152 vs 133 locally
+# six hours later; VulnCheck split 609 + 132). Huntr's "@huntrdev" labels are
+# handles, not addresses, and do not match.
+_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+# The address is never mapped by inference — not by contact address, not by
+# domain (one domain is shared by up to five distinct CNAs: google.com is
+# Google, GoogleCloud, Google_Devices, Mandiant and google_android), and not by
+# case-blind spelling (Snow and SNOW are two CNAs). Each such record's CNA is
+# read from its own official CVE record, ``cveMetadata.assignerShortName`` on
+# the CVE Program's public record API, and cached in DATA_DIR. A record the API
+# cannot answer for keeps its address label and is listed in the run's output.
+CVE_RECORD_API = "https://cveawg.mitre.org/api/cve/{}"
+CVE_ASSIGNER_CACHE_BASENAME = "cve_assigner_cache.json"
+
+
+class CveAssignerLookup:
+    """CVE id -> ``assignerShortName`` from the official CVE record, cached on
+    disk (an assigner does not change once a record is published). After the
+    first network failure the rest of the run uses the cache only."""
+
+    def __init__(self, data_dir=None):
+        data_dir = os.path.abspath(data_dir or os.getenv("DATA_DIR") or os.getcwd())
+        self.path = os.path.join(data_dir, CVE_ASSIGNER_CACHE_BASENAME)
+        self.cache = {}
+        self.dirty = False
+        self.offline = False
+        self.session = None
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                self.cache = {k: v for k, v in loaded.items() if isinstance(v, str) and v}
+        except (OSError, ValueError):
+            pass
+
+    def __call__(self, cve_id):
+        cve_id = str(cve_id or "").upper()
+        if not cve_id.startswith("CVE-"):
+            return None
+        if cve_id in self.cache:
+            return self.cache[cve_id]
+        if self.offline:
+            return None
+        if self.session is None:
+            self.session = requests.Session()
+            self.session.headers["User-Agent"] = "vuln-stats-dashboard"
+        try:
+            resp = self.session.get(CVE_RECORD_API.format(cve_id), timeout=15)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            meta = resp.json().get("cveMetadata") or {}
+        except (requests.RequestException, ValueError) as e:
+            print(f"CVE record API unavailable ({e}); assigner addresses stay unresolved.")
+            self.offline = True
+            return None
+        short = meta.get("assignerShortName")
+        if not short or str(meta.get("state", "")).upper() != "PUBLISHED":
+            return None
+        self.cache[cve_id] = short
+        self.dirty = True
+        return short
+
+    def save(self):
+        if not self.dirty:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.cache, f, separators=(",", ":"), sort_keys=True)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            print(f"Could not save {self.path}: {e}")
+
+
+def cna_label_folds(short_names, labels, roster):
+    """``{official short name: archive label}`` for short names the archive
+    spells differently (``Samsung_Mobile`` → ``SamsungMobile``). A fold happens
+    only when it cannot merge two CNAs: the archive label differs from the
+    short name in case and punctuation alone, is the only archive label that
+    does, is not itself a short name on the cve.org roster, and no other roster
+    short name normalises to the same key (Snow / SNOW). Without the roster,
+    nothing is folded."""
+    if not roster:
+        return {}
+    key = lambda x: re.sub(r"[^a-z0-9]", "", x.lower())
+    roster_keys = collections.Counter(key(s) for s in roster["shortnames"])
+    by_key = collections.defaultdict(set)
+    for label in labels:
+        by_key[key(label)].add(label)
+    folds = {}
+    for short in short_names:
+        k = key(short)
+        twins = by_key.get(k, set()) - {short}
+        if (len(twins) == 1 and roster_keys[k] <= 1
+                and not (twins & roster["shortnames"]) and short not in labels):
+            folds[short] = next(iter(twins))
+    return folds
+
+
 # ── Kernel bug-fix discovery vs CVE publishing ───────────────────────────────
 # HAND-TRANSCRIBED DATA. The top panel of the kernel-fixes slide is not in the
 # archive: it comes from LWN's chart "Bugs introduced and fixed by release",
@@ -3175,6 +3283,14 @@ def count_monthly_cves(file_path, cut_off_date=None):
     # the same CVEs by when they were published (local-only copy of the chart).
     exploited_cve_published = {}
     kev_ids = load_cisa_kev_cves() if _SLIDES else set()
+    # Address-shaped CNA labels on records Vulners has not finished processing
+    # take the assigner of the record's own official CVE record (see
+    # ``CveAssignerLookup``); the archive's own labels are kept apart so a
+    # resolved short name is only ever folded into a spelling the archive uses.
+    assigner_of = CveAssignerLookup()
+    native_labels = set()
+    resolved_labels = collections.Counter()   # (address, short name) -> records
+    unresolved_labels = collections.Counter()  # address -> records
 
     if cut_off_date:
         now = datetime.strptime(cut_off_date, "%Y-%m-%d")
@@ -3228,6 +3344,15 @@ def count_monthly_cves(file_path, cut_off_date=None):
                 vuln_status = item.get("vulnStatus")
                 reporter = item.get("reporter")
                 cna_name = item.get("cna") or reporter or "Unknown"
+                if "@" in cna_name and _EMAIL_RE.fullmatch(cna_name):
+                    resolved = assigner_of(item.get("id"))
+                    if resolved:
+                        resolved_labels[(cna_name, resolved)] += 1
+                        cna_name = resolved
+                    else:
+                        unresolved_labels[cna_name] += 1
+                else:
+                    native_labels.add(cna_name)
 
                 is_rejected = bool(vuln_status) and vuln_status.lower() == "rejected"
                 is_candidate = bool(reporter) and reporter.lower() == "candidate"
@@ -3378,6 +3503,37 @@ def count_monthly_cves(file_path, cut_off_date=None):
     print(f"Scan completed in {duration:.2f} seconds.")
     print(f"Total records processed: {total_processed:,}")
     print(f"Total 2022-2026 CVEs found: {relevant_found:,}")
+
+    # The official short name and the archive's own label for a CNA can differ
+    # in spelling ("Samsung_Mobile" vs "SamsungMobile"); ``cna_label_folds``
+    # moves a resolved short name onto the archive's spelling only where that
+    # cannot merge two CNAs.
+    assigner_of.save()
+    if resolved_labels:
+        renames = cna_label_folds({short for _, short in resolved_labels},
+                                  native_labels, cna_roster())
+
+        def _fold(counter):
+            for old, new in renames.items():
+                if old in counter:
+                    counter[new] += counter.pop(old)
+
+        for months in (stats, partial_stats):
+            for by_year in months.values():
+                for counter in by_year.values():
+                    _fold(counter)
+        _fold(status_cna)             # label -> Counter; Counter += Counter merges
+        _fold(daily_cna_counts_2026)
+        n = sum(resolved_labels.values())
+        print(f"Resolved {n:,} records labelled with an assigner address from their "
+              f"official CVE records ({len(resolved_labels)} address/CNA pairs; "
+              f"not yet processed by Vulners):")
+        for (addr, short), count in resolved_labels.most_common():
+            print(f"  {addr} -> {renames.get(short, short)}: {count:,}")
+    if unresolved_labels:
+        print(f"Note: {sum(unresolved_labels.values()):,} records keep an assigner address "
+              f"as their CNA label (no published CVE record to read the assigner from): "
+              + ", ".join(f"{a} ({c})" for a, c in unresolved_labels.most_common(10)))
 
     return {
         "stats": stats,
