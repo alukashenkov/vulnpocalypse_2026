@@ -108,10 +108,11 @@ _BASELINE_PROJ_IDX = min(int(m) for m in REFERENCE_PREDICTIONS) - 1
 FIRST_FORECAST_TOTAL = 66_000
 FIRST_FORECAST_LABEL = "FIRST Mid-Year Vulnerability Forecast Update, June 15th"
 
-# A round-number level on the same chart, dashed like the forecast and the
-# earlier years' totals and kept in view like the forecast, with a star and a
-# dated callout on the day the current year's curve reaches it.
-CUMULATIVE_MARK_TOTAL = 100_000
+# A second level on the same chart: this multiple of the previous year's
+# full-year total ("2× 2025"). Dashed like the forecast and the earlier years'
+# totals and kept in view like the forecast, with a star and a dated callout on
+# the day the current year's curve crosses it.
+CUMULATIVE_MARK_MULTIPLE = 2
 CUMULATIVE_MARK_STAR = "#FFBB33"
 
 
@@ -3007,7 +3008,7 @@ def sankey_lane_colors(stack_order, rank_colors=None):
 _CUM_FIG_W = 14.0            # inches; the chart's width never changes
 _CUM_FIG_H_MIN = 9.0         # the shape the chart had before it started growing
 # Tallest figure: 90% of the 14.151in at which the tight-cropped PNG was square.
-# With the 100,000 line always on the axis (axis_peak) the chart sits at this
+# With the 2× previous-year line always on the axis (axis_peak) the chart sits at this
 # cap every day, so in practice it is the chart's fixed height.
 _CUM_FIG_H_MAX = 14.151 * 0.9
 _CUM_AXES_TOP_IN = 0.909     # inches reserved above the axes for the title
@@ -6039,7 +6040,7 @@ def _prep_yearly_cumulative(daily_counts, anchor_date_str):
     # axis / the label margin.
     guide_xmax = datetime(ref_dates[-1].year + 1, 1, 1)
 
-    # The day the current year reaches the forecast and the 100k mark,
+    # The day the current year reaches the forecast and the 2× previous-year mark,
     # interpolated onto each line like the crossings above; None until it has.
     def _reached(level):
         cur_series = cumulative_series["2026"]
@@ -6060,11 +6061,13 @@ def _prep_yearly_cumulative(daily_counts, anchor_date_str):
                 }
         return None
     forecast_info = _reached(FIRST_FORECAST_TOTAL)
-    goal_info = _reached(CUMULATIVE_MARK_TOTAL)
+    goal_total = CUMULATIVE_MARK_MULTIPLE * totals["2025"]
+    goal_label = f"{CUMULATIVE_MARK_MULTIPLE}× 2025 total"
+    goal_info = _reached(goal_total) if goal_total > 0 else None
 
-    # The forecast finish line and the 100k line must stay in view, so the axis
-    # peaks at whichever is tallest: the tallest curve, the forecast or 100k.
-    axis_peak = max(max(totals.values()) if totals else 0, FIRST_FORECAST_TOTAL, CUMULATIVE_MARK_TOTAL)
+    # The forecast finish line and the 2× line must stay in view, so the axis
+    # peaks at whichever is tallest: the tallest curve, the forecast or 2×.
+    axis_peak = max(max(totals.values()) if totals else 0, FIRST_FORECAST_TOTAL, goal_total)
 
     return {
         "ref_dates": ref_dates,
@@ -6080,7 +6083,8 @@ def _prep_yearly_cumulative(daily_counts, anchor_date_str):
         "guide_xmax": guide_xmax,
         "forecast_total": FIRST_FORECAST_TOTAL,
         "forecast_label": FIRST_FORECAST_LABEL,
-        "goal_total": CUMULATIVE_MARK_TOTAL,
+        "goal_total": goal_total,
+        "goal_label": goal_label,
         "goal_info": goal_info,
         "forecast_info": forecast_info,
         "axis_peak": axis_peak,
@@ -6186,7 +6190,7 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
         color="#FFFFFF",
         zorder=2
     )
-    # The 100k level, labelled the same way.
+    # Twice the previous year's total, labelled the same way.
     goal_total = p["goal_total"]
     ax.hlines(
         y=goal_total,
@@ -6198,10 +6202,14 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
         alpha=0.6,
         zorder=1
     )
+    # Once the curve has crossed, it runs on through the label's place at the
+    # right end, so the label moves to just left of the crossing star, above
+    # the line, where the curve is still below it.
+    goal_hit = p["goal_info"]
     ax.annotate(
-        f"{goal_total:,}",
-        xy=(guide_xmax, goal_total),
-        xytext=(0, 6),
+        f"{goal_total:,}  {p['goal_label']}",
+        xy=(goal_hit["cross_x"] if goal_hit else guide_xmax, goal_total),
+        xytext=(-18 if goal_hit else 0, 6),
         textcoords="offset points",
         ha="right",
         va="bottom",
@@ -6234,7 +6242,7 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
     ax.tick_params(colors="#CCCCCC", labelsize=13)
 
     # Add legend
-    # Opaque, so the 100k line running under it does not show through.
+    # Opaque, so the 2× line running under it does not show through.
     legend = ax.legend(loc="upper left", facecolor="#262626", edgecolor="#444444", fontsize=13, framealpha=1.0)
 
     # Crossover stars + annotations for years 2026 has actually surpassed. These
@@ -6314,7 +6322,7 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
             ann.set_horizontalalignment("right")
             ann.arrow_patch.set_connectionstyle("arc3,rad=-0.2")
 
-    # 100k reached: a bigger star on the line and its date in a callout,
+    # 2× the previous year reached: a bigger star on the line and its date in a callout,
     # below the line so it never meets the line's own label above it.
     goal_info = p["goal_info"]
     if goal_info:
@@ -6328,7 +6336,7 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
             zorder=6
         )
         ann = ax.annotate(
-            f"Reached {goal_total:,} on {goal_info['short_date_str']}",
+            f"Reached {p['goal_label']} on {goal_info['short_date_str']}",
             xy=(goal_info["cross_x"], goal_info["cross_y"]),
             xytext=(-50, -45),
             textcoords="offset points",

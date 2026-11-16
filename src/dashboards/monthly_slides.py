@@ -305,7 +305,7 @@ def slide_yearly_cumulative(daily_counts, anchor_date_str, output_filename=SLIDE
         ha="right", va="bottom", fontsize=F_SMALL, fontweight="bold", color=INK, zorder=6,
     )
     _stroke(t, 2.5)
-    # The 100k level, drawn and labelled the same way; once the current year
+    # Twice the previous year's total, drawn and labelled the same way; once the current year
     # reaches it, a bigger star and the date on the line.
     goal_total, goal_color = p["goal_total"], m.CUMULATIVE_MARK_STAR
     ax.hlines(
@@ -313,8 +313,11 @@ def slide_yearly_cumulative(daily_counts, anchor_date_str, output_filename=SLIDE
         color=INK, linestyle="--", linewidth=1.2, alpha=0.5, zorder=1,
     )
     t = ax.annotate(
-        f"{goal_total:,}",
-        xy=(p["guide_xmax"], goal_total), xytext=(0, 5), textcoords="offset points",
+        f"{goal_total:,}  {p['goal_label']}",
+        # Once crossed, just left of the star: the curve runs on through the
+        # label's place at the right end.
+        xy=(p["goal_info"]["cross_x"] if p["goal_info"] else p["guide_xmax"], goal_total),
+        xytext=(-14 if p["goal_info"] else 0, 5), textcoords="offset points",
         ha="right", va="bottom", fontsize=F_SMALL, fontweight="bold", color=INK, zorder=6,
     )
     _stroke(t, 2.5)
@@ -339,7 +342,7 @@ def slide_yearly_cumulative(daily_counts, anchor_date_str, output_filename=SLIDE
         )
         t = ax.annotate(
             f"reached {gi['short_date_str']}", xy=(gi["cross_x"], gi["cross_y"]),
-            xytext=(-10, -8), textcoords="offset points", ha="right", va="top",
+            xytext=(12, -8), textcoords="offset points", ha="left", va="top",
             fontsize=F_SMALL, fontweight="bold", color=goal_color, zorder=7,
         )
         _stroke(t, 2.5)
