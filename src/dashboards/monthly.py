@@ -113,6 +113,8 @@ FIRST_FORECAST_LABEL = "FIRST Mid-Year Vulnerability Forecast Update, June 15th"
 # totals and kept in view like the forecast, with a star and a dated callout on
 # the day the current year's curve crosses it.
 CUMULATIVE_MARK_MULTIPLE = 2
+# A round-number tier above it, drawn and starred the same way.
+CUMULATIVE_ROUND_TOTAL = 100_000
 CUMULATIVE_MARK_STAR = "#FFBB33"
 
 
@@ -6064,10 +6066,12 @@ def _prep_yearly_cumulative(daily_counts, anchor_date_str):
     goal_total = CUMULATIVE_MARK_MULTIPLE * totals["2025"]
     goal_label = f"{CUMULATIVE_MARK_MULTIPLE}× 2025 total"
     goal_info = _reached(goal_total) if goal_total > 0 else None
+    round_info = _reached(CUMULATIVE_ROUND_TOTAL)
 
-    # The forecast finish line and the 2× line must stay in view, so the axis
-    # peaks at whichever is tallest: the tallest curve, the forecast or 2×.
-    axis_peak = max(max(totals.values()) if totals else 0, FIRST_FORECAST_TOTAL, goal_total)
+    # The forecast finish line and the 2× and round-number lines must stay in
+    # view, so the axis peaks at whichever is tallest.
+    axis_peak = max(max(totals.values()) if totals else 0, FIRST_FORECAST_TOTAL, goal_total,
+                    CUMULATIVE_ROUND_TOTAL)
 
     return {
         "ref_dates": ref_dates,
@@ -6086,6 +6090,8 @@ def _prep_yearly_cumulative(daily_counts, anchor_date_str):
         "goal_total": goal_total,
         "goal_label": goal_label,
         "goal_info": goal_info,
+        "round_total": CUMULATIVE_ROUND_TOTAL,
+        "round_info": round_info,
         "forecast_info": forecast_info,
         "axis_peak": axis_peak,
     }
@@ -6218,6 +6224,31 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
         color="#FFFFFF",
         zorder=2
     )
+    # The 100,000 tier, drawn and labelled the same way. The label is short
+    # enough to stay at the right end: by December the curve is past it.
+    round_total = p["round_total"]
+    ax.hlines(
+        y=round_total,
+        xmin=ref_dates[0],
+        xmax=guide_xmax,
+        color="#FFFFFF",
+        linestyle="--",
+        linewidth=1.5,
+        alpha=0.6,
+        zorder=1
+    )
+    ax.annotate(
+        f"{round_total:,}",
+        xy=(guide_xmax, round_total),
+        xytext=(0, 6),
+        textcoords="offset points",
+        ha="right",
+        va="bottom",
+        fontsize=12,
+        fontweight="bold",
+        color="#FFFFFF",
+        zorder=2
+    )
 
     ax.grid(True, color="#444444", linestyle="--", alpha=0.5)
     ax.set_ylabel("Cumulative CVE Count", fontsize=16, fontweight="bold", color="#FFFFFF")
@@ -6342,6 +6373,34 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
             textcoords="offset points",
             ha="right",
             va="top",
+            fontsize=12,
+            fontweight="bold",
+            color="#FFFFFF",
+            bbox=dict(boxstyle="round,pad=0.4", fc="#262626", ec=CUMULATIVE_MARK_STAR, alpha=0.9, lw=1.5),
+            arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=-0.2", color=CUMULATIVE_MARK_STAR, lw=1.5),
+            zorder=6
+        )
+
+    # 100,000 reached: the same star, its callout above-left, in the space
+    # between the line and the top of the axes, clear of the 2× callout below.
+    round_info = p["round_info"]
+    if round_info:
+        ax.plot(
+            round_info["cross_x"],
+            round_info["cross_y"],
+            marker="*",
+            color=CUMULATIVE_MARK_STAR,
+            markersize=22,
+            markeredgecolor="#FFFFFF",
+            zorder=6
+        )
+        ax.annotate(
+            f"Reached {round_total:,} on {round_info['short_date_str']}",
+            xy=(round_info["cross_x"], round_info["cross_y"]),
+            xytext=(-60, 10),
+            textcoords="offset points",
+            ha="right",
+            va="bottom",
             fontsize=12,
             fontweight="bold",
             color="#FFFFFF",

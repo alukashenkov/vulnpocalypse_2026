@@ -321,6 +321,19 @@ def slide_yearly_cumulative(daily_counts, anchor_date_str, output_filename=SLIDE
         ha="right", va="bottom", fontsize=F_SMALL, fontweight="bold", color=INK, zorder=6,
     )
     _stroke(t, 2.5)
+    # The 100,000 tier, the same again; its short label stays at the right
+    # end, which the curve has passed by December.
+    round_total, ri = p["round_total"], p["round_info"]
+    ax.hlines(
+        round_total, ref_dates[0], p["guide_xmax"],
+        color=INK, linestyle="--", linewidth=1.2, alpha=0.5, zorder=1,
+    )
+    t = ax.annotate(
+        f"{round_total:,}",
+        xy=(p["guide_xmax"], round_total), xytext=(0, 5), textcoords="offset points",
+        ha="right", va="bottom", fontsize=F_SMALL, fontweight="bold", color=INK, zorder=6,
+    )
+    _stroke(t, 2.5)
     # The forecast passed: a star on its line, the date below and to the right.
     if p["forecast_info"]:
         fi = p["forecast_info"]
@@ -343,6 +356,18 @@ def slide_yearly_cumulative(daily_counts, anchor_date_str, output_filename=SLIDE
         t = ax.annotate(
             f"reached {gi['short_date_str']}", xy=(gi["cross_x"], gi["cross_y"]),
             xytext=(12, -8), textcoords="offset points", ha="left", va="top",
+            fontsize=F_SMALL, fontweight="bold", color=goal_color, zorder=7,
+        )
+        _stroke(t, 2.5)
+    if ri:
+        ax.plot(
+            ri["cross_x"], ri["cross_y"], marker="*", markersize=20,
+            color=goal_color, markeredgecolor=INK, markeredgewidth=0.8, zorder=7,
+        )
+        t = ax.annotate(
+            # Above-left: below the line is the 2× star and its date.
+            f"reached {ri['short_date_str']}", xy=(ri["cross_x"], ri["cross_y"]),
+            xytext=(-14, 5), textcoords="offset points", ha="right", va="bottom",
             fontsize=F_SMALL, fontweight="bold", color=goal_color, zorder=7,
         )
         _stroke(t, 2.5)
