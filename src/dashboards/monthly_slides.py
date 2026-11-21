@@ -963,21 +963,23 @@ def slide_candidate_track(candidate_stats, output_filename=SLIDE_FILES["candidat
     fig = _slide(
         f"Hidden volume: who feeds the reserved CVE backlog in {year}",
         f"{p['grand_total']:,} CVE IDs reserved but not yet published in {year}, none of them counted "
-        "in the other charts  ·  cell = reserved CVEs a source touched that month  ·  brighter = more",
+        "in the other charts  ·  cell = reserved CVEs a source touched that month  ·  brighter = more"
+        + (f"  ·  rows ranked by {datetime.strptime(months[-1], '%Y-%m').strftime('%b')}"
+           if p["ranked_by"] == "last_month" else ""),
     )
-    ax = fig.add_axes([0.115, 0.10, 0.84, 0.655])
+    ax = fig.add_axes([0.125, 0.09, 0.83, 0.67])
     ax.set_facecolor(BG)
     ax.imshow(mat, aspect="auto", cmap="inferno", vmin=0, vmax=vmax)
 
     ax.set_xticks(range(len(months)))
     ax.set_xticklabels(
         [f"{datetime.strptime(mo, '%Y-%m').strftime('%b')}\n{totals[mo]:,} CVEs" for mo in months],
-        fontsize=11, fontweight="bold", color=INK,
+        fontsize=9.5, fontweight="bold", color=INK, linespacing=1.15,
     )
     ax.xaxis.set_ticks_position("top")
     ax.tick_params(axis="x", labeltop=True, labelbottom=False, length=0, pad=6)
     ax.set_yticks(range(len(rows)))
-    ax.set_yticklabels(rows, fontsize=11, fontweight="bold", color=INK)
+    ax.set_yticklabels(rows, fontsize=10, fontweight="bold", color=INK)
     ax.tick_params(axis="y", length=0, pad=8)
 
     for i in range(len(rows)):
@@ -985,14 +987,14 @@ def slide_candidate_track(candidate_stats, output_filename=SLIDE_FILES["candidat
             v = int(mat[i, j])
             if v > 0:
                 ax.text(
-                    j, i, f"{v}", ha="center", va="center", fontsize=10.5, fontweight="bold",
+                    j, i, f"{v}", ha="center", va="center", fontsize=9.5, fontweight="bold",
                     color="#111111" if mat[i, j] > vmax * 0.5 else "#EAEAEA",
                 )
     for s in ("top", "right", "left", "bottom"):
         ax.spines[s].set_visible(False)
     ax.set_xticks(np.arange(-0.5, len(months), 1), minor=True)
     ax.set_yticks(np.arange(-0.5, len(rows), 1), minor=True)
-    ax.grid(which="minor", color=BG, linewidth=2.5)
+    ax.grid(which="minor", color=BG, linewidth=2)
     ax.tick_params(which="minor", length=0)
     _save(fig, output_filename, "candidate track")
 

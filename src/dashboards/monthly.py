@@ -8081,9 +8081,10 @@ def plot_exploitation_vs_volume(stats, anchor_date, anchor_month_complete=False,
     saved_files_log.append(f"Saved exploitation-vs-volume chart to {os.path.abspath(output_filename)}")
 
 
-# Top sources (by overall reach) shown as rows in the candidate heatmap; the
+# Top sources (by overall reach, or by the last month's reach when the pooled
+# tail outweighs every one of them) shown as rows in the candidate heatmap; the
 # long tail is aggregated into an "other sources" row so nothing is dropped.
-_CAND_TOP_SOURCES = 12
+_CAND_TOP_SOURCES = 15
 
 
 def _prep_candidate_track(candidate_stats):
@@ -8100,15 +8101,26 @@ def _prep_candidate_track(candidate_stats):
     for m in months:
         overall.update(candidate_stats[m]["ref_types"])
 
+    def tail_per_month(top_set):
+        # Distinct CVEs touched by at least one source outside the top rows --
+        # not the sum of the tail sources' cells, which counts a CVE once per
+        # tail source and can exceed the month's total.
+        return {
+            m: sum(n for srcs, n in candidate_stats[m]["source_sets"].items() if srcs - top_set)
+            for m in months
+        }
+
     top_sources = [s for s, _ in overall.most_common(_CAND_TOP_SOURCES)]
-    top_set = set(top_sources)
-    # Distinct CVEs touched by at least one source outside the top rows -- not
-    # the sum of the tail sources' cells, which counts a CVE once per tail
-    # source and can exceed the month's total.
-    other_per_month = {
-        m: sum(n for srcs, n in candidate_stats[m]["source_sets"].items() if srcs - top_set)
-        for m in months
-    }
+    other_per_month = tail_per_month(set(top_sources))
+    # When the pooled tail outweighs every source shown by yearly total, the
+    # yearly ranking is hiding where the backlog comes from now: rank the rows
+    # by the last month's cells instead (yearly total breaks ties).
+    ranked_by = "year"
+    if top_sources and sum(other_per_month.values()) > max(overall[s] for s in top_sources):
+        last = candidate_stats[months[-1]]["ref_types"]
+        top_sources = sorted(overall, key=lambda s: (-last.get(s, 0), -overall[s], s))[:_CAND_TOP_SOURCES]
+        other_per_month = tail_per_month(set(top_sources))
+        ranked_by = "last_month"
     rows = list(top_sources)
     if any(other_per_month.values()):
         rows.append("other sources")
@@ -8130,6 +8142,7 @@ def _prep_candidate_track(candidate_stats):
         "mat": mat,
         "vmax": vmax,
         "year": months[0][:4],
+        "ranked_by": ranked_by,
     }
 
 
@@ -8151,7 +8164,7 @@ def plot_candidate_track(candidate_stats, output_filename="cve_monthly_stats_com
 
     plt.style.use("dark_background")
     fig, ax = plt.subplots(
-        figsize=(max(13, len(months) * 1.35 + 3.5), len(rows) * 0.62 + 3.2),
+        figsize=(max(13, len(months) * 1.35 + 3.5), len(rows) * 0.52 + 3.2),
         facecolor="#1E1E1E",
     )
     ax.set_facecolor("#1E1E1E")
@@ -8159,9 +8172,9 @@ def plot_candidate_track(candidate_stats, output_filename="cve_monthly_stats_com
 
     mlabels = [f"{datetime.strptime(m, '%Y-%m').strftime('%b')}\n{totals[m]:,} CVEs" for m in months]
     ax.set_xticks(range(len(months)))
-    ax.set_xticklabels(mlabels, fontsize=19.5, fontweight="bold", color="#FFFFFF")
+    ax.set_xticklabels(mlabels, fontsize=14, fontweight="bold", color="#FFFFFF")
     ax.set_yticks(range(len(rows)))
-    ax.set_yticklabels(rows, fontsize=12.5, fontweight="bold", color="#FFFFFF")
+    ax.set_yticklabels(rows, fontsize=12, fontweight="bold", color="#FFFFFF")
     # Months and monthly totals across the top of the chart.
     ax.xaxis.set_ticks_position("top")
     ax.tick_params(axis="x", labeltop=True, labelbottom=False, length=0)
@@ -8172,14 +8185,16 @@ def plot_candidate_track(candidate_stats, output_filename="cve_monthly_stats_com
             v = int(mat[i, j])
             if v > 0:
                 ax.text(
-                    j, i, f"{v}", ha="center", va="center", fontsize=16, fontweight="bold",
+                    j, i, f"{v}", ha="center", va="center", fontsize=14, fontweight="bold",
                     color="#111111" if mat[i, j] > vmax * 0.5 else "#EAEAEA",
                 )
 
     year = p["year"]
     ax.set_title(
         f"Hidden Volume: Who Feeds the Reserved (Candidate) Backlog  ·  {grand_total:,} CVEs in {year}\n"
-        "cell = reserved CVEs each source touches that month",
+        "cell = reserved CVEs each source touches that month"
+        + (f"  ·  rows ranked by {datetime.strptime(months[-1], '%Y-%m').strftime('%b')}"
+           if p["ranked_by"] == "last_month" else ""),
         color="#FFFFFF", fontsize=18, fontweight="bold", pad=64,
     )
     for s in ("top", "right", "left", "bottom"):
@@ -8194,7 +8209,7 @@ def plot_candidate_track(candidate_stats, output_filename="cve_monthly_stats_com
         f"{_stamp()} | Data Source: Vulners CVE Archive",
         ha="center", fontsize=12, color="#747D8C", style="italic", fontweight="bold",
     )
-    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    plt.tight_layout(rect=[0, 0.07, 1, 1])
     _add_logo(fig)
     plt.savefig(output_filename, dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor(), edgecolor="none")
     plt.close()
