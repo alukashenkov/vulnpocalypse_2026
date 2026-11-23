@@ -34,6 +34,7 @@ import matplotlib.ticker
 import matplotlib.lines
 import matplotlib.colors
 import matplotlib.patches
+from matplotlib.path import Path
 
 from ..base import Dashboard, DashboardResult
 
@@ -1567,6 +1568,9 @@ EXPLOIT_TRENDS_MONTHS = 36
 # A shorter window for the local-only second copy of that chart and its slide
 # (``*_exploitation_trends_24m*``): the same picture over the last two years.
 EXPLOIT_TRENDS_MONTHS_SHORT = 24
+# The window of the local-only published-month copy
+# (``*_exploitation_trends_published.png``): the last year.
+EXPLOIT_TRENDS_MONTHS_PUBLISHED = 12
 KEV_CATALOG_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 KEV_CATALOG_BASENAME = "known_exploited_vulnerabilities.json"
 
@@ -2141,8 +2145,16 @@ def plot_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wi
                                 labelpad=12)
     else:
         axes[1].set_ylabel("Per month (log scale)", fontsize=16, fontweight="bold", color="#FFFFFF", labelpad=12)
-    axes[-1].xaxis.set_major_locator(mdates.MonthLocator(bymonth=(1, 4, 7, 10)))
-    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    # Months are plotted on their 15th; quarterly ticks, or every month on a short window.
+    axes[-1].xaxis.set_major_locator(mdates.MonthLocator(
+        bymonth=range(1, 13) if months_back <= 18 else (1, 4, 7, 10), bymonthday=15))
+    if months_back <= 18:
+        # A tick a month: the year only on January and the first tick, or the labels touch.
+        axes[-1].xaxis.set_major_formatter(plt.FuncFormatter(
+            lambda v, pos: mdates.num2date(v).strftime("%b %Y" if pos == 0 or mdates.num2date(v).month == 1
+                                                       else "%b")))
+    else:
+        axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
     if part:
         pm = part["month"]
         x_end = (datetime(pm.year, pm.month, 1) + timedelta(days=32)).replace(day=1) + timedelta(days=12)
@@ -2209,6 +2221,304 @@ def plot_exploitation_trends(stats, anchor_date, anchor_month_complete=False, wi
     plt.savefig(output_filename, dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor(), edgecolor="none")
     plt.close()
     saved_files_log.append(f"Saved exploitation-trends chart to {os.path.abspath(output_filename)}")
+
+def _prep_exploitation_publication_flow(anchor_date, wild_cve_first_seen, cve_published, cve_candidate=None):
+    """The anchor year's exploitation, month by month, mapped to when the CVEs
+    were published, for ``plot_exploitation_publication_sankey``.
+
+    Per month of the anchor year (through the anchor day), two disjoint
+    sources: the CVEs CISA added to KEV that month (``dateAdded``), and the
+    CVEs first seen exploited that month — Vulners wildExploited ∪ KEV, each
+    dated by the earlier of its first ``firstSeen`` and its KEV ``dateAdded``,
+    as on the trends chart — that CISA did not list that same month. Within a
+    month a CVE counts once; across months it can count twice (first seen in
+    one month, KEV-listed in a later one), so the unit is an event, and
+    ``repeat`` says how many CVEs that is.
+
+    Publication buckets, newest first: a candidate (reserved, no record yet)
+    is its own bucket whatever its placeholder date; then every month of the
+    anchor year (and December before it when the anchor is January), then
+    whole years, then the four years before those, then older.
+    """
+    if not wild_cve_first_seen or not cve_published:
+        return None
+    path = download_cisa_kev()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            kev_added = {
+                str(v["cveID"]).upper().strip(): str(v.get("dateAdded") or "")[:10]
+                for v in json.load(f).get("vulnerabilities", []) if v.get("cveID")
+            }
+    except (OSError, ValueError, TypeError) as e:
+        print(f"Could not read KEV catalog {path}: {e}")
+        return None
+    cve_candidate = cve_candidate or set()
+    day = anchor_date[:10]
+    month = day[:7]
+    y, mo = int(month[:4]), int(month[5:7])
+    union = dict(wild_cve_first_seen)
+    for cve, added in kev_added.items():
+        if len(added) == 10 and (cve not in union or added < union[cve]):
+            union[cve] = added
+    mlbl = lambda k: datetime(int(k[:4]), int(k[5:7]), 1).strftime("%b %Y")   # noqa: E731
+
+    # Exploitation months, newest first (the right column).
+    exp_months = [f"{y}-{m_:02d}" for m_ in range(mo, 0, -1)]
+    sources = []                         # (month, "kev"|"wild", ids)
+    overlap = {}
+    for k in exp_months:
+        kev_ids = {c for c, d in kev_added.items() if d[:7] == k and d <= day}
+        wild_ids = {c for c, d in union.items() if d[:7] == k and d <= day}
+        overlap[k] = len(kev_ids & wild_ids)
+        sources += [(k, "kev", kev_ids), (k, "wild", wild_ids - kev_ids)]
+    seen = collections.Counter(c for _, _, ids in sources for c in ids)
+
+    month_keys = [f"{y}-{m_:02d}" for m_ in range(mo, 0, -1)] + ([f"{y - 1}-12"] if mo == 1 else [])
+    buckets = [("candidate", "Reserved, no record yet")]
+    buckets += [(k, mlbl(k)) for k in month_keys]
+    buckets += [("y1", f"Jan–Nov {y - 1}" if mo == 1 else str(y - 1)), ("y2", str(y - 2)),
+                ("y3_6", f"{y - 6}–{y - 3}"), ("older", f"Before {y - 6}"),
+                ("unknown", "No publication date")]
+
+    def bucket(cve):
+        if cve in cve_candidate:
+            return "candidate"
+        pub = cve_published.get(cve)
+        if not pub:
+            return "unknown"
+        k = pub[:7]
+        if k >= month:
+            return month
+        if k in month_keys:
+            return k
+        py = int(k[:4])
+        if py == y - 1:
+            return "y1"
+        if py == y - 2:
+            return "y2"
+        if py >= y - 6:
+            return "y3_6"
+        return "older"
+
+    # flows[(exploitation month, source)][publication bucket] = events
+    flows = {(k, s): collections.Counter(bucket(c) for c in ids) for k, s, ids in sources}
+    pub_totals = {s: collections.Counter() for s in ("kev", "wild")}
+    for (k, s), f_ in flows.items():
+        pub_totals[s].update(f_)
+    targets = [(b, lbl, pub_totals["kev"][b] + pub_totals["wild"][b]) for b, lbl in buckets
+               if pub_totals["kev"][b] + pub_totals["wild"][b]]
+
+    # Months between publication and exploitation, per event with a real date.
+    def lag(cve, k):
+        pub = cve_published.get(cve)
+        if not pub or cve in cve_candidate:
+            return None
+        return (int(k[:4]) - int(pub[:4])) * 12 + int(k[5:7]) - int(pub[5:7])
+    lags = [lag(c, k) for k, _, ids in sources for c in ids]
+    lags = [v for v in lags if v is not None]
+    rows = sorted(
+        ((c, k, s, kev_added.get(c, ""), union.get(c, ""), cve_published.get(c, ""), bucket(c))
+         for k, s, ids in sources for c in ids),
+        key=lambda r: (r[1], r[2], r[5] or "", r[0]),
+    )
+    return {
+        "month": month, "day": day, "year": y, "exp_months": exp_months, "mlbl": mlbl,
+        "sources": [(k, s, len(ids)) for k, s, ids in sources], "overlap": overlap,
+        "flows": flows, "targets": targets, "pub_totals": pub_totals,
+        "total": sum(len(ids) for _, _, ids in sources), "cves": len(seen),
+        "repeat": sum(1 for v in seen.values() if v > 1),
+        "lag_le1": sum(1 for v in lags if v <= 1), "lag_gt12": sum(1 for v in lags if v > 12),
+        "lag_n": len(lags), "rows": rows,
+    }
+
+
+def plot_exploitation_publication_sankey(anchor_date, anchor_month_complete=False, wild_cve_first_seen=None,
+                                         cve_published=None, cve_candidate=None,
+                                         output_filename="cve_monthly_stats_comparison_exploitation_sankey.png"):
+    """Where the year's exploitation comes from in time (local only): a Sankey
+    from the period each CVE was published in (left) to the month of the
+    anchor year it was added to CISA KEV or first seen exploited (right).
+    Both columns draw each period / month as a pair of blocks, KEV over
+    exploited, close together under one label; the running month is drawn
+    lighter. Heights are counts on one scale. See
+    ``_prep_exploitation_publication_flow`` for the sets and buckets."""
+    p = _prep_exploitation_publication_flow(anchor_date, wild_cve_first_seen, cve_published, cve_candidate)
+    if p is None or not p["total"]:
+        return
+    d = datetime.strptime(p["day"], "%Y-%m-%d")
+    running = None if anchor_month_complete else p["month"]
+    style = {"kev": (C_BLUE, "KEV"), "wild": (C_RED, "exploited")}
+    names = ("kev", "wild")
+    total = p["total"]
+    targets = p["targets"]
+    flows = p["flows"]
+    src_n = {(k, s): n for k, s, n in p["sources"]}
+    pub_totals = p["pub_totals"]
+    exp_months = [k for k in p["exp_months"] if src_n[(k, "kev")] + src_n[(k, "wild")]]
+
+    pair_gap = total * 0.003
+    gap = total * 0.010
+    min_slot = total * 0.040
+
+    def column(groups):
+        """groups: [(key, {source: n})] → block tops, slot spans, height."""
+        span = {g: sum(v.values()) + pair_gap * (sum(1 for v_ in v.values() if v_) - 1) for g, v in groups}
+        slot = {g: max(span[g], min_slot) for g in span}
+        return span, slot, sum(slot.values()) + gap * (len(groups) - 1)
+
+    left_groups = [(b, {s: pub_totals[s][b] for s in names}) for b, _, _ in targets]
+    right_groups = [(k, {s: src_n[(k, s)] for s in names}) for k in exp_months]
+    l_span, l_slot, left_h = column(left_groups)
+    r_span, r_slot, right_h = column(right_groups)
+    H = max(left_h, right_h)
+
+    def place(groups, span, slot, h):
+        tops, spans, y_ = {}, {}, H - (H - h) / 2
+        for g, v in groups:
+            top = y_
+            y_ -= (slot[g] - span[g]) / 2
+            first_block = True
+            for s in names:
+                if not v[s]:
+                    continue
+                if not first_block:
+                    y_ -= pair_gap
+                tops[(g, s)] = y_
+                y_ -= v[s]
+                first_block = False
+            spans[g] = (top, top - slot[g])
+            y_ = top - slot[g] - gap
+        return tops, spans
+
+    l_top, l_spans = place(left_groups, l_span, l_slot, left_h)
+    r_top, r_spans = place(right_groups, r_span, r_slot, right_h)
+    x_l, x_r, w = 0.30, 0.68, 0.016
+
+    plt.style.use("dark_background")
+    fig, ax = plt.subplots(figsize=(18, 17), facecolor="#1E1E1E")
+    ax.set_facecolor("#1E1E1E")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(-H * 0.01, H * 1.025)
+    ax.axis("off")
+    stroke = [path_effects.Stroke(linewidth=3, foreground="#1E1E1E"), path_effects.Normal()]
+    shade = lambda s, k: _blend_white(style[s][0], 0.5) if k == running else style[s][0]   # noqa: E731
+    # Ribbons wear their publication period's colour (blocks keep KEV blue /
+    # exploited red): the anchor year's months share one, each older period
+    # has its own, reserved and undated are gray.
+    y = p["year"]
+    period_of = lambda b: (b if b in ("y1", "y2", "y3_6", "older", "candidate", "unknown")   # noqa: E731
+                           else "this_year" if b.startswith(str(y)) else "y1")
+    period_color = {"this_year": C_GREEN, "y1": C_YELLOW, "y2": "#FFA502", "y3_6": "#A55EEA",
+                    "older": "#A4B0BE", "candidate": "#57606F", "unknown": "#57606F"}
+    period_name = {"this_year": str(y), "y1": next((l_ for b_, l_, _ in targets if b_ == "y1"), str(y - 1)),
+                   "y2": str(y - 2), "y3_6": f"{y - 6}–{y - 3}", "older": f"before {y - 6}",
+                   "candidate": "reserved / undated"}
+    ribbon = lambda b, k: (_blend_white(period_color[period_of(b)], 0.45) if k == running   # noqa: E731
+                           else period_color[period_of(b)])
+
+    # Ribbons: a left block's outflows stacked in right-column order, a right
+    # block's inflows in left-column order, so none cross inside a block.
+    l_cur, r_cur = dict(l_top), dict(r_top)
+    for b, _, _ in targets:
+        for k in exp_months:
+            for s in names:
+                v = flows[(k, s)].get(b, 0)
+                if not v:
+                    continue
+                y0a, y1a = l_cur[(b, s)], r_cur[(k, s)]
+                y0b, y1b = y0a - v, y1a - v
+                xa, xb = x_l + w, x_r
+                xm = (xa + xb) / 2
+                verts = [(xa, y0a), (xm, y0a), (xm, y1a), (xb, y1a), (xb, y1b), (xm, y1b), (xm, y0b),
+                         (xa, y0b), (xa, y0a)]
+                codes = [Path.MOVETO, Path.CURVE4, Path.CURVE4, Path.CURVE4, Path.LINETO, Path.CURVE4,
+                         Path.CURVE4, Path.CURVE4, Path.CLOSEPOLY]
+                ax.add_patch(matplotlib.patches.PathPatch(
+                    Path(verts, codes), facecolor=ribbon(b, k), alpha=0.30 if k == running else 0.40,
+                    edgecolor="none", zorder=1))
+                l_cur[(b, s)] -= v
+                r_cur[(k, s)] -= v
+    # Blocks in the series colour; the running month lighter on both sides
+    # (published so far on the left, exploited so far on the right).
+    for (b, s), top in l_top.items():
+        v = pub_totals[s][b]
+        ax.add_patch(matplotlib.patches.Rectangle((x_l, top - v), w, v, facecolor=shade(s, b),
+                                                  edgecolor="none", zorder=2))
+    for (k, s), top in r_top.items():
+        v = src_n[(k, s)]
+        ax.add_patch(matplotlib.patches.Rectangle((x_r, top - v), w, v, facecolor=shade(s, k),
+                                                  edgecolor="none", zorder=2))
+
+    def label(x, ha, yl, head, parts, color):
+        ax.text(x, yl, head, ha=ha, va="bottom", fontsize=14.5, fontweight="bold", color=color,
+                path_effects=stroke)
+        ax.text(x, yl, " · ".join(parts), ha=ha, va="top", fontsize=12, color="#A4B0BE", path_effects=stroke)
+
+    for b, lbl, n in targets:
+        parts = [f"{pub_totals[s][b]:,} {style[s][1]}" for s in names if pub_totals[s][b]]
+        if b == running:
+            lbl = f"{datetime.strptime(b, '%Y-%m').strftime('%b')} 1–{d.day} {d.year} (so far)"
+        pc = period_color[period_of(b)]
+        label(x_l - 0.010, "right", sum(l_spans[b]) / 2, f"{lbl}:  {n:,}  ({n / total:.0%})", parts,
+              _blend_white(pc, 0.45) if b == running else pc)
+    for k in exp_months:
+        n = src_n[(k, "kev")] + src_n[(k, "wild")]
+        lbl = p["mlbl"](k)
+        if k == running:
+            lbl = f"{datetime.strptime(k, '%Y-%m').strftime('%b')} 1–{d.day} {d.year} (so far)"
+        parts = [f"{src_n[(k, s)]:,} {style[s][1]}" for s in names if src_n[(k, s)]]
+        label(x_r + w + 0.010, "left", sum(r_spans[k]) / 2, f"{lbl}:  {n:,}", parts,
+              "#A4B0BE" if k == running else "#FFFFFF")
+    ax.text(x_l + w / 2, H * 1.025, "Published", ha="center", va="bottom", fontsize=15, color="#747D8C",
+            fontweight="bold")
+    ax.text(x_r + w / 2, H * 1.025, f"Added to KEV / first seen exploited, {p['year']}", ha="center",
+            va="bottom", fontsize=15, color="#747D8C", fontweight="bold")
+    fig.legend(handles=[matplotlib.patches.Patch(color=C_BLUE, label="Block: added to CISA KEV that month"),
+                       matplotlib.patches.Patch(color=C_RED, label="Block: first seen exploited that month, "
+                                                                   "not KEV-listed that month")],
+              loc="upper center", bbox_to_anchor=(0.5, 0.95), ncol=2, fontsize=14, frameon=False,
+              labelcolor="#CCCCCC")
+    used = [g for g in period_name if any(period_of(b) == g for b, _, _ in targets)]
+    fig.legend(handles=[matplotlib.patches.Patch(color=period_color[g], alpha=0.75, label=period_name[g])
+                        for g in used],
+               loc="upper center", bbox_to_anchor=(0.5, 0.925), ncol=len(used), fontsize=14, frameon=False,
+               labelcolor="#CCCCCC", title="Ribbon: published in", title_fontsize=14,
+               alignment="center").get_title().set_color("#CCCCCC")
+
+    span_lbl = f"Jan 1–{d.strftime('%b')} {d.day} {d.year}"
+    fig.suptitle(
+        f"Exploited in {span_lbl}: when were those CVEs published?\n"
+        f"{total:,} events · {p['lag_le1'] / p['lag_n']:.0%} published that month or the month before · "
+        f"{p['lag_gt12'] / p['lag_n']:.0%} over a year before",
+        fontsize=21, fontweight="bold", color="#FFFFFF", y=0.99,
+    )
+    plt.tight_layout(rect=[0.01, 0.065, 0.99, 0.925])
+    plt.figtext(
+        0.5, 0.022,
+        f"Right: per month, CVEs CISA added to KEV (by date added) and CVEs first seen exploited (Vulners "
+        f"wildExploited ∪ KEV, by earliest first-seen date) that CISA did not list that month.\n"
+        f"Within a month each CVE counts once; {p['repeat']:,} of the {p['cves']:,} CVEs appear in two months "
+        f"(first seen in one, KEV-listed in a later one). Left: the month the CVE record was published.\n"
+        f"Blocks: KEV / exploited. Ribbons: publication period. Heights are counts on one scale; the running month is drawn lighter.",
+        ha="center", fontsize=12.5, color="#A4B0BE", style="italic", linespacing=1.4,
+    )
+    plt.figtext(
+        0.5, 0.004, f"{_stamp()} | Data Sources: Vulners CVE Archive, CISA KEV catalog",
+        ha="center", fontsize=12, color="#747D8C", style="italic", fontweight="bold",
+    )
+    _add_logo(fig)
+    plt.savefig(output_filename, dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.close()
+    saved_files_log.append(f"Saved exploitation-publication Sankey to {os.path.abspath(output_filename)}")
+    if _WRITE_CSV:
+        csv_name = os.path.splitext(output_filename)[0] + ".csv"
+        with open(csv_name, "w", newline="", encoding="utf-8") as f:
+            wr = csv.writer(f)
+            wr.writerow(["cve", "exploited_month", "source", "kev_date_added", "first_seen_exploited",
+                         "published", "published_bucket"])
+            wr.writerows(p["rows"])
+        saved_files_log.append(f"Saved exploitation-publication Sankey CSV to {os.path.abspath(csv_name)}")
+
 
 _TREND_SERIES = (
     # key, colour, name — drawn in this order, publications on top
@@ -2277,7 +2587,7 @@ def plot_exploitation_trends_indexed(stats, anchor_date, anchor_month_complete=F
     _percent_axis(ax, allv)
     ax.set_xlim(datetime(p["months"][0].year, p["months"][0].month, 1),
                 datetime(p["last"].year, p["last"].month, 1) + timedelta(days=75))
-    ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=(1, 4, 7, 10)))
+    ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=(1, 4, 7, 10), bymonthday=15))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
     ax.tick_params(colors="#CCCCCC", labelsize=14)
     for label in ax.get_xticklabels() + ax.get_yticklabels():
@@ -3285,6 +3595,9 @@ def count_monthly_cves(file_path, cut_off_date=None):
     # every flagged CVE and every CISA KEV entry, so the trends chart can count
     # the same CVEs by when they were published (local-only copy of the chart).
     exploited_cve_published = {}
+    # The same CVEs that are still candidates (reserved, no published record
+    # yet): their "publication" date is only the placeholder's.
+    exploited_cve_candidate = set()
     kev_ids = load_cisa_kev_cves() if _SLIDES else set()
     # Address-shaped CNA labels on records Vulners has not finished processing
     # take the assigner of the record's own official CVE record (see
@@ -3379,6 +3692,8 @@ def count_monthly_cves(file_path, cut_off_date=None):
                                               and expl.get("wildExploited") is True)) \
                             and published_date and len(published_date) >= 10:
                         exploited_cve_published[cve_id] = published_date[:10]
+                        if is_candidate:
+                            exploited_cve_candidate.add(cve_id)
 
                 if item.get("id") in fanout_wanted:
                     fanout_records[item["id"]] = fanout_record(item)
@@ -3561,6 +3876,7 @@ def count_monthly_cves(file_path, cut_off_date=None):
         "wild_first_seen": wild_first_seen,
         "wild_cve_first_seen": wild_cve_first_seen,
         "exploited_cve_published": exploited_cve_published,
+        "exploited_cve_candidate": exploited_cve_candidate,
         "wild_sources": wild_sources,
     }
 
@@ -8032,7 +8348,7 @@ def plot_exploitation_vs_volume(stats, anchor_date, anchor_month_complete=False,
     else:
         x_end = datetime(d["last"].year, d["last"].month, 1) + timedelta(days=31)
     ax.set_xlim(datetime(d["months"][0].year, d["months"][0].month, 1), x_end)
-    ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=(1, 4, 7, 10)))
+    ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=(1, 4, 7, 10), bymonthday=15))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
 
     ax.tick_params(colors="#CCCCCC", labelsize=14, pad=8)
@@ -8599,7 +8915,14 @@ def _run_monthly(results, report_buf):
         plot_exploitation_trends(stats, anchor_date, anchor_month_complete=anchor_month_complete,
                                  wild_cve_first_seen=results.get("wild_cve_first_seen", {}),
                                  output_filename="cve_monthly_stats_comparison_exploitation_trends_published.png",
+                                 months_back=EXPLOIT_TRENDS_MONTHS_PUBLISHED,
                                  cve_published=results.get("exploited_cve_published", {}))
+        # This month's KEV additions and newly exploited CVEs, by when they
+        # were published (local only).
+        plot_exploitation_publication_sankey(anchor_date, anchor_month_complete=anchor_month_complete,
+                                             wild_cve_first_seen=results.get("wild_cve_first_seen", {}),
+                                             cve_published=results.get("exploited_cve_published", {}),
+                                             cve_candidate=results.get("exploited_cve_candidate", set()))
     # One CVE's downstream advisories, for the fan-out slide (local only).
     fanout_records = results.get("fanout_records", {})
     slide_inputs["fanout_downstream"] = dict(record=fanout_records.get(FANOUT_CVE))

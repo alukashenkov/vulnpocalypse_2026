@@ -3285,7 +3285,8 @@ def _exploitation_xaxis(ax, d, with_partial=False):
     else:
         x_end = datetime(d["last"].year, d["last"].month, 1) + timedelta(days=31)
     ax.set_xlim(datetime(d["months"][0].year, d["months"][0].month, 1), x_end)
-    ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=(1, 4, 7, 10)))
+    # Months are plotted on their 15th, so the ticks (and gridlines) go there too.
+    ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=(1, 4, 7, 10), bymonthday=15))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
     ax.tick_params(axis="x", labelsize=F_TICK - 1)
 
