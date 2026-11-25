@@ -98,7 +98,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.deployment.outputs.page_url || steps.deployment_retry.outputs.page_url }}
     env:
       # Deterministic set/dict ordering so table row ties render the same daily.
       PYTHONHASHSEED: "0"
@@ -133,9 +133,44 @@ jobs:
         if: always()
         run: rm -rf "${{ runner.temp }}/data"
 
+      # deploy-pages looks the artifact up exactly once, right after the upload
+      # finalizes, and GitHub's artifact listing is eventually consistent: on
+      # 2026-11-21 and 2026-11-25 it returned "Found 0 artifacts" a second after
+      # a successful upload, failing a finished build. Three guards:
+      #  - the name carries the run attempt, so a re-run never sees the earlier
+      #    attempt's artifact as well ("Multiple artifacts named github-pages",
+      #    which is how the 2026-11-21 re-run failed);
+      #  - the artifact is polled until the listing shows it;
+      #  - a failed deploy is retried once after a pause.
       - uses: actions/upload-pages-artifact@v5
         with:
           path: ${{ runner.temp }}/site
+          name: github-pages-${{ github.run_attempt }}
+
+      - name: Wait for the artifact to be listed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: github-pages-${{ github.run_attempt }}
+        run: |
+          for i in $(seq 1 24); do
+            n=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?name=$NAME" --jq '.total_count' || echo 0)
+            if [[ "$n" -ge 1 ]]; then echo "Artifact $NAME listed after ${i} check(s)."; exit 0; fi
+            sleep 5
+          done
+          echo "::warning::Artifact $NAME still not listed after 2 minutes; deploying anyway."
 
       - id: deployment
         uses: actions/deploy-pages@v5
+        continue-on-error: true
+        with:
+          artifact_name: github-pages-${{ github.run_attempt }}
+
+      - name: Pause before retrying the deploy
+        if: steps.deployment.outcome == 'failure'
+        run: sleep 60
+
+      - id: deployment_retry
+        if: steps.deployment.outcome == 'failure'
+        uses: actions/deploy-pages@v5
+        with:
+          artifact_name: github-pages-${{ github.run_attempt }}
