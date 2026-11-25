@@ -145,6 +145,7 @@ CHART_FILES = [
     "cve_monthly_stats_comparison_status_weekly.png",
     "cve_monthly_stats_comparison_status_by_cna.png",
     "cve_monthly_stats_comparison_exploitation_trends.png",
+    "cve_monthly_stats_comparison_exploitation_sankey.png",
     "cve_monthly_stats_comparison_candidate_track.png",
 ]
 
@@ -163,6 +164,7 @@ CHART_LINKS = {
     "cve_monthly_stats_comparison_status_weekly.png": ("nvd-status-weekly", "NVD status by week"),
     "cve_monthly_stats_comparison_status_by_cna.png": ("nvd-status-cna", "NVD status by CNA"),
     "cve_monthly_stats_comparison_exploitation_trends.png": ("exploitation", "Exploitation vs volume"),
+    "cve_monthly_stats_comparison_exploitation_sankey.png": ("exploitation-age", "When exploited CVEs were published"),
     "cve_monthly_stats_comparison_candidate_track.png": ("reserved", "Reserved but unpublished"),
 }
 
@@ -180,6 +182,7 @@ CHART_GROUPS = {
     "cve_monthly_stats_comparison_status_weekly.png": "NVD status",
     "cve_monthly_stats_comparison_status_by_cna.png": "NVD status",
     "cve_monthly_stats_comparison_exploitation_trends.png": "Beyond the count",
+    "cve_monthly_stats_comparison_exploitation_sankey.png": "Beyond the count",
     "cve_monthly_stats_comparison_candidate_track.png": "Beyond the count",
 }
 
@@ -286,6 +289,25 @@ CHART_CAPTIONS = {
         "series outgrowing its own trend. KEV sits straight under publications "
         "so those two slopes can be read side by side. Read the slopes, not the "
         "heights."
+    ),
+    "cve_monthly_stats_comparison_exploitation_sankey.png": (
+        "The slopes say how fast exploitation grows; they do not say how old the "
+        "CVEs being exploited are. This turns the same events around. On the "
+        "right is every month of the year so far, split into the CVEs CISA added "
+        "to KEV that month (blue) and the ones first seen exploited that month "
+        "that CISA did not list (red). On the left is when those same CVEs were "
+        "published: this year month by month, then last year, the year before, "
+        "the four years before that, and everything older. The ribbons wear the "
+        "publication period's colour, so green is this year's own CVEs and the "
+        "yellow, orange, purple and gray are older debts coming due. A CVE first "
+        "seen in one month and KEV-listed in a later one shows up in both, so "
+        "the unit is an event, not a CVE, and the month still running is drawn "
+        "lighter on both sides. Read how much of each month's block is green, "
+        "and how much of that green comes from the month itself or the one "
+        "right before it: the title puts a number on that gap, and on the share "
+        "that waited more than a year. Then look at the thin ribbon at the very "
+        "top: CVEs exploited while their IDs are still only reserved, with no "
+        "published record to read. That queue is next."
     ),
     "cve_monthly_stats_comparison_status_yearly.png": (
         "Counting is one thing; looking is another. Every CVE published carries an "
@@ -3598,7 +3620,9 @@ def count_monthly_cves(file_path, cut_off_date=None):
     # The same CVEs that are still candidates (reserved, no published record
     # yet): their "publication" date is only the placeholder's.
     exploited_cve_candidate = set()
-    kev_ids = load_cisa_kev_cves() if _SLIDES else set()
+    # The site needs these too, for the exploitation Sankey on the page; the
+    # KEV catalog is one of the site's allowed feeds.
+    kev_ids = load_cisa_kev_cves()
     # Address-shaped CNA labels on records Vulners has not finished processing
     # take the assigner of the record's own official CVE record (see
     # ``CveAssignerLookup``); the archive's own labels are kept apart so a
@@ -3688,7 +3712,7 @@ def count_monthly_cves(file_path, cut_off_date=None):
                             if s.get("type"):
                                 wild_sources[s["type"]] += 1
                     cve_id = str(item.get("id") or "").upper()
-                    if (cve_id in kev_ids or (_SLIDES and isinstance(expl, dict)
+                    if (cve_id in kev_ids or (isinstance(expl, dict)
                                               and expl.get("wildExploited") is True)) \
                             and published_date and len(published_date) >= 10:
                         exploited_cve_published[cve_id] = published_date[:10]
@@ -8917,12 +8941,12 @@ def _run_monthly(results, report_buf):
                                  output_filename="cve_monthly_stats_comparison_exploitation_trends_published.png",
                                  months_back=EXPLOIT_TRENDS_MONTHS_PUBLISHED,
                                  cve_published=results.get("exploited_cve_published", {}))
-        # This month's KEV additions and newly exploited CVEs, by when they
-        # were published (local only).
-        plot_exploitation_publication_sankey(anchor_date, anchor_month_complete=anchor_month_complete,
-                                             wild_cve_first_seen=results.get("wild_cve_first_seen", {}),
-                                             cve_published=results.get("exploited_cve_published", {}),
-                                             cve_candidate=results.get("exploited_cve_candidate", set()))
+    # The year's KEV additions and newly exploited CVEs, by when they were
+    # published: the page chart after the trends (#monthly-exploitation-age).
+    plot_exploitation_publication_sankey(anchor_date, anchor_month_complete=anchor_month_complete,
+                                         wild_cve_first_seen=results.get("wild_cve_first_seen", {}),
+                                         cve_published=results.get("exploited_cve_published", {}),
+                                         cve_candidate=results.get("exploited_cve_candidate", set()))
     # One CVE's downstream advisories, for the fan-out slide (local only).
     fanout_records = results.get("fanout_records", {})
     slide_inputs["fanout_downstream"] = dict(record=fanout_records.get(FANOUT_CVE))
