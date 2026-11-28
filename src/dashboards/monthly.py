@@ -8,14 +8,22 @@ cve_status_stats.py) and the aligned-table report; no CSV/TXT outputs, no tqdm, 
 published path.
 '''
 import collections
+import concurrent.futures
 import csv
 import io
 import json
+import multiprocessing
 import os
 import re
+import threading
 import time
 from contextlib import redirect_stdout
 from datetime import date, datetime, timedelta
+
+try:
+    import orjson as _orjson
+except ImportError:
+    _orjson = None
 
 import glob
 import gzip
@@ -37,6 +45,84 @@ import matplotlib.patches
 from matplotlib.path import Path
 
 from ..base import Dashboard, DashboardResult
+from . import _scan_worker
+from ._scan_worker import (
+    _ANDROID_BULLETIN_URL,
+    _CHROME_FIX_VER,
+    _CHROME_NESSUS_VER,
+    _CHROME_POST_URL,
+    _EMAIL_RE,
+    _android_row,
+    _chrome_row,
+    fanout_record,
+)
+
+# ── Shared in-memory JSON file cache & thread-local HTTP session pool ────────
+_JSON_FILE_CACHE = {}  # path -> ((mtime_ns, size), parsed_obj)
+_JSON_FILE_LOCK = threading.Lock()
+_THREAD_LOCAL = threading.local()
+
+
+def _http_session():
+    """Per-thread pooled requests.Session with retries (keep-alive across calls)."""
+    sess = getattr(_THREAD_LOCAL, "http_session", None)
+    if sess is None:
+        sess = requests.Session()
+        adapter = HTTPAdapter(
+            pool_connections=16,
+            pool_maxsize=32,
+            max_retries=Retry(
+                total=3,
+                backoff_factor=1,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["GET", "POST"],
+            ),
+        )
+        sess.mount("https://", adapter)
+        sess.mount("http://", adapter)
+        _THREAD_LOCAL.http_session = sess
+    return sess
+
+
+def _read_json_cached(path):
+    """Parse ``path`` once per ``(mtime_ns, size)``; returns ``None`` on error."""
+    try:
+        st = os.stat(path)
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+    with _JSON_FILE_LOCK:
+        hit = _JSON_FILE_CACHE.get(path)
+        if hit is not None and hit[0] == sig:
+            return hit[1]
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        data = _orjson.loads(raw) if _orjson is not None else json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    with _JSON_FILE_LOCK:
+        _JSON_FILE_CACHE[path] = (sig, data)
+    return data
+
+
+def _write_json_cached(path, data):
+    """Write ``data`` to ``path`` and refresh the in-memory file cache."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if _orjson is not None:
+        raw = _orjson.dumps(data)
+        with open(path, "wb") as f:
+            f.write(raw)
+    else:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    try:
+        st = os.stat(path)
+        sig = (st.st_mtime_ns, st.st_size)
+        with _JSON_FILE_LOCK:
+            _JSON_FILE_CACHE[path] = (sig, data)
+    except OSError:
+        pass
 
 # Configuration
 TOP_N = 15
@@ -408,53 +494,6 @@ YEAR_COLORS = {
 # numbers a release's platforms separately — so it is a display fallback, never
 # a grouping key.
 CHROME_CNA = "Chrome"
-_CHROME_NESSUS_VER = re.compile(r"^(?:MACOSX_)?GOOGLE_CHROME_(\d+)_(\d+)_(\d+)_(\d+)\.NASL$")
-_CHROME_POST_URL = re.compile(r"chromereleases\.googleblog\.com/(\d{4}/\d{2}/[^\s\"']+)")
-_CHROME_FIX_VER = re.compile(r"prior to (\d+\.\d+\.\d+\.\d+)")
-
-
-def _chrome_row(item, day, candidate=False):
-    """One Chrome CVE's release facts for the fan-in slides: the release posts
-    its references link to, its ``GCSA-…`` advisory ids, the Chrome versions of
-    its Nessus plugins and the fixed version its description names.
-
-    ``candidate`` marks a CVE that is still reserved: Google's advisory and
-    the scanner plugins list it before the CVE record is published, so a
-    release can be entirely made of such CVEs for a few days. Only the advisory
-    and the Nessus plugin identify those as Chrome — they carry no CNA, no
-    release post and a placeholder description.
-    """
-    advisories, versions = [], set()
-    ench = item.get("enchantments")
-    deps = ench.get("dependencies") if isinstance(ench, dict) else None
-    refs = deps.get("references") if isinstance(deps, dict) else None
-    for ref in refs if isinstance(refs, list) else ():
-        if not isinstance(ref, dict):
-            continue
-        if ref.get("type") == "chrome":
-            advisories.extend(str(i) for i in ref.get("idList") or [])
-        elif ref.get("type") == "nessus":
-            for plugin in ref.get("idList") or []:
-                mv = _CHROME_NESSUS_VER.match(str(plugin))
-                if mv:
-                    versions.add(".".join(mv.groups()))
-    posts = []
-    for url in item.get("references") or ():
-        mp = _CHROME_POST_URL.search(str(url))
-        if mp and mp.group(1) not in posts:
-            posts.append(mp.group(1))
-    mf = _CHROME_FIX_VER.search(str(item.get("description") or ""))
-    cwes = item.get("cwe") or []
-    return {
-        "id": item.get("id"),
-        "day": day,
-        "posts": posts,
-        "advisories": advisories,
-        "versions": sorted(versions),
-        "fix_version": mf.group(1) if mf else None,
-        "cwe": sorted({str(c) for c in (cwes if isinstance(cwes, list) else [cwes]) if c}),
-        "candidate": candidate,
-    }
 
 
 # ── Android security bulletins ───────────────────────────────────────────────
@@ -466,25 +505,6 @@ def _chrome_row(item, day, candidate=False):
 # ``…/pixel/…`` for the other products, ``…/android-17`` for a platform
 # release. That path is the bulletin key the CWE slide groups by.
 ANDROID_CNA = "google_android"
-_ANDROID_BULLETIN_URL = re.compile(r"source\.android\.com/(?:docs/)?security/bulletin/([^\s\"'#?]+)")
-
-
-def _android_row(item, day):
-    """One Android-CNA CVE for the bulletin × CWE slide: the bulletin path its
-    references name (the first one, ``None`` without one) and its CWEs."""
-    bulletin = None
-    for url in item.get("references") or ():
-        mb = _ANDROID_BULLETIN_URL.search(str(url))
-        if mb:
-            bulletin = mb.group(1).rstrip("/")
-            break
-    cwes = item.get("cwe") or []
-    return {
-        "id": item.get("id"),
-        "day": day,
-        "bulletin": bulletin,
-        "cwe": sorted({str(c) for c in (cwes if isinstance(cwes, list) else [cwes]) if c}),
-    }
 
 # ── Fan-out: one CVE, many downstream advisories ─────────────────────────────
 # The fan-out slide takes one CVE and counts the distinct downstream records
@@ -660,6 +680,58 @@ def _audit_cache_path():
     return os.path.join(os.path.abspath(os.getenv("DATA_DIR") or os.getcwd()), AUDIT_CACHE_BASENAME)
 
 
+def _fetch_audit_cve_api(cve_id, api_key):
+    try:
+        r = _http_session().post(
+            VULNERS_AUDIT_URL,
+            headers={"X-Api-Key": api_key, "Content-Type": "application/json"},
+            json={"cve": cve_id},
+            timeout=60,
+        )
+        r.raise_for_status()
+        result = r.json().get("result")
+    except (requests.RequestException, ValueError) as e:
+        print(f"audit/cve failed for {cve_id}: {e}")
+        return None
+    return result if isinstance(result, dict) else None
+
+
+def prefetch_audit_cves(cve_ids, max_age_h=AUDIT_CACHE_MAX_AGE_H):
+    """Concurrently fetch any missing/stale ``audit/cve`` entries in ``cve_ids``
+    and flush the cache once."""
+    _local_only("Vulners audit/cve")
+    path = _audit_cache_path()
+    loaded = _read_json_cached(path)
+    cache = dict(loaded) if isinstance(loaded, dict) else {}
+    now = datetime.now()
+    todo = []
+    for cve_id in dict.fromkeys(cve_ids):
+        hit = cache.get(cve_id)
+        if hit and isinstance(hit, dict) and "fetched" in hit and hit.get("result") is not None:
+            try:
+                if (now - datetime.fromisoformat(hit["fetched"])).total_seconds() / 3600 < max_age_h:
+                    continue
+            except ValueError:
+                pass
+        todo.append(cve_id)
+    if not todo:
+        return
+    api_key = os.getenv("VULNERS_API_KEY")
+    if not api_key:
+        return
+    changed = False
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(todo))) as ex:
+        for cve_id, result in zip(todo, ex.map(lambda c: _fetch_audit_cve_api(c, api_key), todo)):
+            if result is not None:
+                cache[cve_id] = {"fetched": datetime.now().isoformat(timespec="seconds"), "result": result}
+                changed = True
+    if changed:
+        try:
+            _write_json_cached(path, cache)
+        except OSError as e:
+            print(f"Could not write {path}: {e}")
+
+
 def fetch_audit_cve(cve_id, max_age_h=AUDIT_CACHE_MAX_AGE_H):
     """``audit/cve`` result for one CVE (``{"cve", "affectedPackages", "affectedCpe"}``),
     from a cache entry younger than ``max_age_h`` or the API (``max_age_h=0``
@@ -667,13 +739,8 @@ def fetch_audit_cve(cve_id, max_age_h=AUDIT_CACHE_MAX_AGE_H):
     API key or on failure — the caller falls back to the archive references."""
     _local_only("Vulners audit/cve")
     path = _audit_cache_path()
-    cache = {}
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                cache = json.load(f)
-        except (OSError, ValueError):
-            cache = {}
+    loaded = _read_json_cached(path)
+    cache = loaded if isinstance(loaded, dict) else {}
     hit = cache.get(cve_id)
     if hit and isinstance(hit, dict) and "fetched" in hit:
         try:
@@ -686,27 +753,13 @@ def fetch_audit_cve(cve_id, max_age_h=AUDIT_CACHE_MAX_AGE_H):
     if not api_key:
         print("VULNERS_API_KEY not set; fan-out slide falls back to archive references.")
         return hit.get("result") if hit else None
-    session = requests.Session()
-    session.mount("https://", HTTPAdapter(max_retries=Retry(
-        total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["POST"],
-    )))
-    try:
-        r = session.post(
-            VULNERS_AUDIT_URL, headers={"X-Api-Key": api_key, "Content-Type": "application/json"},
-            json={"cve": cve_id}, timeout=60,
-        )
-        r.raise_for_status()
-        result = r.json().get("result")
-    except (requests.RequestException, ValueError) as e:
-        print(f"audit/cve failed for {cve_id}: {e}")
+    result = _fetch_audit_cve_api(cve_id, api_key)
+    if result is None:
         return hit.get("result") if hit else None
-    if not isinstance(result, dict):
-        return hit.get("result") if hit else None
+    cache = dict(cache)
     cache[cve_id] = {"fetched": datetime.now().isoformat(timespec="seconds"), "result": result}
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(cache, f)
+        _write_json_cached(path, cache)
     except OSError as e:
         print(f"Could not write {path}: {e}")
     return result
@@ -721,10 +774,10 @@ def cache_fetched_at(basename, key):
     ``datetime``), or ``None``. After a ``fetch_*`` call this dates the data it
     returned: a fresh fetch rewrote it, a failed one fell back to it."""
     path = os.path.join(os.path.abspath(os.getenv("DATA_DIR") or os.getcwd()), basename)
+    cache = _read_json_cached(path)
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return datetime.fromisoformat(json.load(f)[key]["fetched"])
-    except (OSError, ValueError, KeyError, TypeError):
+        return datetime.fromisoformat(cache[key]["fetched"])
+    except (ValueError, KeyError, TypeError):
         return None
 
 
@@ -734,13 +787,8 @@ def fetch_cve_document(cve_id, max_age_h=AUDIT_CACHE_MAX_AGE_H):
     rule. ``None`` without an API key or on failure."""
     _local_only("Vulners search/id")
     path = os.path.join(os.path.abspath(os.getenv("DATA_DIR") or os.getcwd()), SEARCH_ID_CACHE_BASENAME)
-    cache = {}
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                cache = json.load(f)
-        except (OSError, ValueError):
-            cache = {}
+    loaded = _read_json_cached(path)
+    cache = loaded if isinstance(loaded, dict) else {}
     hit = cache.get(cve_id)
     if hit and isinstance(hit, dict) and "fetched" in hit:
         try:
@@ -753,7 +801,9 @@ def fetch_cve_document(cve_id, max_age_h=AUDIT_CACHE_MAX_AGE_H):
     if not api_key:
         return hit.get("result") if hit else None
     try:
-        r = requests.get(VULNERS_SEARCH_ID_URL, params={"id": cve_id}, headers={"X-Api-Key": api_key}, timeout=60)
+        r = _http_session().get(
+            VULNERS_SEARCH_ID_URL, params={"id": cve_id}, headers={"X-Api-Key": api_key}, timeout=60
+        )
         r.raise_for_status()
         result = r.json()["data"]["documents"][cve_id]
     except (requests.RequestException, ValueError, KeyError, TypeError) as e:
@@ -761,11 +811,10 @@ def fetch_cve_document(cve_id, max_age_h=AUDIT_CACHE_MAX_AGE_H):
         return hit.get("result") if hit else None
     if not isinstance(result, dict):
         return hit.get("result") if hit else None
+    cache = dict(cache)
     cache[cve_id] = {"fetched": datetime.now().isoformat(timespec="seconds"), "result": result}
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(cache, f)
+        _write_json_cached(path, cache)
     except OSError as e:
         print(f"Could not write {path}: {e}")
     return result
@@ -794,13 +843,8 @@ def fetch_vulnersosv(cve_id, max_age_h=AUDIT_CACHE_MAX_AGE_H):
     ``VULNERSOSV_MAX_DOCS``), or ``None`` without an API key or on failure."""
     _local_only("Vulners vulnersosv search")
     path = os.path.join(os.path.abspath(os.getenv("DATA_DIR") or os.getcwd()), VULNERSOSV_CACHE_BASENAME)
-    cache = {}
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                cache = json.load(f)
-        except (OSError, ValueError):
-            cache = {}
+    loaded = _read_json_cached(path)
+    cache = loaded if isinstance(loaded, dict) else {}
     hit = cache.get(cve_id)
     if hit and isinstance(hit, dict) and "fetched" in hit:
         try:
@@ -812,28 +856,45 @@ def fetch_vulnersosv(cve_id, max_age_h=AUDIT_CACHE_MAX_AGE_H):
     api_key = os.getenv("VULNERS_API_KEY")
     if not api_key:
         return hit.get("result") if hit else None
-    docs, total = [], None
+
+    def _fetch_page(skip):
+        r = _http_session().post(
+            VULNERS_SEARCH_LUCENE_URL,
+            json={
+                "query": f"type:vulnersosv AND cvelist:{cve_id}",
+                "skip": skip,
+                "size": 100,
+                "fields": VULNERSOSV_FIELDS,
+            },
+            headers={"X-Api-Key": api_key},
+            timeout=60,
+        )
+        r.raise_for_status()
+        return r.json()["data"]
+
+    docs, total = [], 0
     try:
-        while total is None or len(docs) < min(total, VULNERSOSV_MAX_DOCS):
-            r = requests.post(VULNERS_SEARCH_LUCENE_URL, json={
-                "query": f"type:vulnersosv AND cvelist:{cve_id}", "skip": len(docs), "size": 100,
-                "fields": VULNERSOSV_FIELDS}, headers={"X-Api-Key": api_key}, timeout=60)
-            r.raise_for_status()
-            data = r.json()["data"]
-            total = int(data["total"])
-            page = [h["_source"] for h in data["search"] if isinstance(h.get("_source"), dict)]
-            if not page:
-                break
-            docs.extend(page)
+        first = _fetch_page(0)
+        total = int(first["total"])
+        page0 = [h["_source"] for h in first["search"] if isinstance(h.get("_source"), dict)]
+        docs.extend(page0)
+        target = min(total, VULNERSOSV_MAX_DOCS)
+        if page0 and len(docs) < target:
+            skips = list(range(len(docs), target, 100))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(skips))) as ex:
+                for pdata in ex.map(_fetch_page, skips):
+                    page = [h["_source"] for h in pdata["search"] if isinstance(h.get("_source"), dict)]
+                    if not page:
+                        break
+                    docs.extend(page)
     except (requests.RequestException, ValueError, KeyError, TypeError) as e:
         print(f"vulnersosv search failed for {cve_id}: {e}")
         return hit.get("result") if hit else None
     result = {"docs": docs, "total": total or 0}
+    cache = dict(cache)
     cache[cve_id] = {"fetched": datetime.now().isoformat(timespec="seconds"), "result": result}
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(cache, f)
+        _write_json_cached(path, cache)
     except OSError as e:
         print(f"Could not write {path}: {e}")
     return result
@@ -928,15 +989,9 @@ def fetch_pypi_projects(names, max_age_h=AUDIT_CACHE_MAX_AGE_H):
     ``fetch_audit_cve``'s ``max_age_h`` rule per project. A project PyPI does
     not answer for is left out."""
     _local_only("PyPI project metadata")
-    import concurrent.futures
     path = os.path.join(os.path.abspath(os.getenv("DATA_DIR") or os.getcwd()), PYPI_CACHE_BASENAME)
-    cache = {}
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                cache = json.load(f)
-        except (OSError, ValueError):
-            cache = {}
+    loaded = _read_json_cached(path)
+    cache = dict(loaded) if isinstance(loaded, dict) else {}
 
     def fresh(hit):
         try:
@@ -946,7 +1001,7 @@ def fetch_pypi_projects(names, max_age_h=AUDIT_CACHE_MAX_AGE_H):
 
     def get(name):
         try:
-            r = requests.get(PYPI_JSON_URL.format(name), timeout=30)
+            r = _http_session().get(PYPI_JSON_URL.format(name), timeout=30)
             r.raise_for_status()
             j = r.json()
             releases = {v: [min(f["upload_time_iso_8601"] for f in files)[:10], all(f.get("yanked") for f in files)]
@@ -964,9 +1019,7 @@ def fetch_pypi_projects(names, max_age_h=AUDIT_CACHE_MAX_AGE_H):
                 if result is not None:
                     cache[name] = {"fetched": datetime.now().isoformat(timespec="seconds"), "result": result}
         try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(cache, f)
+            _write_json_cached(path, cache)
         except OSError as e:
             print(f"Could not write {path}: {e}")
     return {n: cache[n]["result"] for n in names if isinstance(cache.get(n), dict) and cache[n].get("result")}
@@ -1159,39 +1212,6 @@ def nvd_cpe_matches(doc):
     configs = ((doc or {}).get("cpeConfigurations") or {}).get("nvdCpeConfiguration") or []
     return [c for conf in configs for node in conf.get("nodes") or [] for c in node.get("cpeMatch") or []
             if isinstance(c, dict) and c.get("vulnerable")]
-
-
-def fanout_record(item):
-    """The facts the fan-out slides read from one CVE document — an archive
-    item or a live ``fetch_cve_document`` result, which share the schema."""
-    ench = item.get("enchantments")
-    deps = ench.get("dependencies") if isinstance(ench, dict) else None
-    refs = deps.get("references") if isinstance(deps, dict) else None
-    refs = refs if isinstance(refs, list) else []
-    return {
-        "id": item["id"],
-        "published": (item.get("published") or "")[:10],
-        "reporter": item.get("reporter"),
-        "short": (ench.get("short_description") if isinstance(ench, dict) else None) or "",
-        "software": sorted({
-            str(a.get("name") or a.get("cpeName") or "")
-            for a in (item.get("affectedSoftware") or []) if isinstance(a, dict)
-        }),
-        # Products the CVE's own CPE configurations name (``google:brotli`` ->
-        # ``brotli``), for a record with no ``affectedSoftware``.
-        "cpe_products": list(dict.fromkeys(
-            str(c.get("criteria") or "").split(":")[4].replace("_", " ")
-            for key in ("vulnersCpeConfiguration", "nvdCpeConfiguration")
-            for conf in ((item.get("cpeConfigurations") or {}).get(key) or [])
-            for node in conf.get("nodes") or [] for c in node.get("cpeMatch") or []
-            if isinstance(c, dict) and len(str(c.get("criteria") or "").split(":")) > 4
-        )),
-        "kev": any(isinstance(r, dict) and r.get("type") == "vulncheck_kev" for r in refs),
-        "references": [
-            {"type": r.get("type"), "idList": [str(i) for i in (r.get("idList") or [])]}
-            for r in refs if isinstance(r, dict)
-        ],
-    }
 
 
 def _version_tuple(text):
@@ -1631,11 +1651,9 @@ def load_cisa_kev_cves(data_dir=None):
     path = download_cisa_kev(data_dir)
     if not path:
         return set()
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError) as e:
-        print(f"Could not read KEV catalog {path}: {e}")
+    data = _read_json_cached(path)
+    if not isinstance(data, dict):
+        print(f"Could not read KEV catalog {path}")
         return set()
     return {str(v.get("cveID")).upper().strip() for v in data.get("vulnerabilities", []) if v.get("cveID")}
 
@@ -1646,11 +1664,9 @@ def kev_additions_by_month(data_dir=None):
     path = download_cisa_kev(data_dir)
     if not path:
         return {}, None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError) as e:
-        print(f"Could not read KEV catalog {path}: {e}")
+    data = _read_json_cached(path)
+    if not isinstance(data, dict):
+        print(f"Could not read KEV catalog {path}")
         return {}, None
     counts = collections.Counter()
     for vuln in data.get("vulnerabilities", []):
@@ -1843,15 +1859,14 @@ def _prep_exploitation_trends(stats, anchor_date, anchor_month_complete=False, w
     if d is None or not wild_cve_first_seen:
         return None
     path = download_cisa_kev()
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            kev_added = {
-                str(v["cveID"]).upper().strip(): str(v.get("dateAdded") or "")[:10]
-                for v in json.load(f).get("vulnerabilities", []) if v.get("cveID")
-            }
-    except (OSError, ValueError, TypeError) as e:
-        print(f"Could not read KEV catalog {path}: {e}")
+    data = _read_json_cached(path) if path else None
+    if not isinstance(data, dict):
+        print(f"Could not read KEV catalog {path}")
         return None
+    kev_added = {
+        str(v["cveID"]).upper().strip(): str(v.get("dateAdded") or "")[:10]
+        for v in data.get("vulnerabilities", []) if v.get("cveID")
+    }
     union = dict(wild_cve_first_seen)
     for cve, added in kev_added.items():
         if len(added) == 10 and (cve not in union or added < union[cve]):
@@ -2265,15 +2280,14 @@ def _prep_exploitation_publication_flow(anchor_date, wild_cve_first_seen, cve_pu
     if not wild_cve_first_seen or not cve_published:
         return None
     path = download_cisa_kev()
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            kev_added = {
-                str(v["cveID"]).upper().strip(): str(v.get("dateAdded") or "")[:10]
-                for v in json.load(f).get("vulnerabilities", []) if v.get("cveID")
-            }
-    except (OSError, ValueError, TypeError) as e:
-        print(f"Could not read KEV catalog {path}: {e}")
+    data = _read_json_cached(path) if path else None
+    if not isinstance(data, dict):
+        print(f"Could not read KEV catalog {path}")
         return None
+    kev_added = {
+        str(v["cveID"]).upper().strip(): str(v.get("dateAdded") or "")[:10]
+        for v in data.get("vulnerabilities", []) if v.get("cveID")
+    }
     cve_candidate = cve_candidate or set()
     day = anchor_date[:10]
     month = day[:7]
@@ -2674,6 +2688,7 @@ CNA_LIST_BASENAME = "cve_org_cna_list.json"
 # other CNAs' records and assigns nothing, so it is not counted).
 CNA_ASSIGNING_ROLES = ("CNA", "CNA-LR")
 _cna_roster_cache = {}
+_CNA_DOWNLOAD_LOCK = threading.Lock()
 
 
 def download_cna_list(data_dir=None):
@@ -2684,24 +2699,27 @@ def download_cna_list(data_dir=None):
 
     data_dir = os.path.abspath(data_dir or os.getenv("DATA_DIR") or os.getcwd())
     target_path = os.path.join(data_dir, CNA_LIST_BASENAME)
-    if os.path.exists(target_path):
-        if datetime.fromtimestamp(os.path.getmtime(target_path)).date() == datetime.now().date():
+    with _CNA_DOWNLOAD_LOCK:
+        if os.path.exists(target_path):
+            if datetime.fromtimestamp(os.path.getmtime(target_path)).date() == datetime.now().date():
+                return target_path
+        print(f"Downloading the cve.org CNA list from: {CNA_LIST_URL}")
+        try:
+            req = urllib.request.Request(
+                CNA_LIST_URL, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as response:
+                payload = response.read()
+            json.loads(payload)  # a truncated body must not overwrite a good copy
+            os.makedirs(data_dir, exist_ok=True)
+            tmp_path = target_path + ".tmp"
+            with open(tmp_path, "wb") as out_file:
+                out_file.write(payload)
+            os.replace(tmp_path, target_path)
             return target_path
-    print(f"Downloading the cve.org CNA list from: {CNA_LIST_URL}")
-    try:
-        req = urllib.request.Request(
-            CNA_LIST_URL, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-        )
-        with urllib.request.urlopen(req, timeout=15) as response:
-            payload = response.read()
-        json.loads(payload)  # a truncated body must not overwrite a good copy
-        os.makedirs(data_dir, exist_ok=True)
-        with open(target_path, "wb") as out_file:
-            out_file.write(payload)
-        return target_path
-    except Exception as e:  # noqa: BLE001 - any failure falls back to the local copy
-        print(f"Failed to download the cve.org CNA list: {e}")
-        return target_path if os.path.exists(target_path) else None
+        except Exception as e:  # noqa: BLE001 - any failure falls back to the local copy
+            print(f"Failed to download the cve.org CNA list: {e}")
+            return target_path if os.path.exists(target_path) else None
 
 
 def cna_roster(data_dir=None):
@@ -2822,6 +2840,47 @@ class CveAssignerLookup:
         self.cache[cve_id] = short
         self.dirty = True
         return short
+
+    def prefetch(self, cve_ids):
+        """Concurrently fetch official CVE records for unresolved ``cve_ids``."""
+        if self.offline:
+            return
+        todo = [
+            cid for cid in dict.fromkeys(str(c or "").upper() for c in cve_ids)
+            if cid.startswith("CVE-") and cid not in self.cache
+        ]
+        if len(todo) <= 1:
+            return
+
+        def _fetch_one(cve_id):
+            if self.offline:
+                return cve_id, None, False
+            try:
+                resp = _http_session().get(
+                    CVE_RECORD_API.format(cve_id),
+                    headers={"User-Agent": "vuln-stats-dashboard"},
+                    timeout=15,
+                )
+                if resp.status_code == 404:
+                    return cve_id, None, False
+                resp.raise_for_status()
+                meta = resp.json().get("cveMetadata") or {}
+            except (requests.RequestException, ValueError) as e:
+                return cve_id, str(e), True
+            short = meta.get("assignerShortName")
+            if not short or str(meta.get("state", "")).upper() != "PUBLISHED":
+                return cve_id, None, False
+            return cve_id, short, False
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(todo))) as ex:
+            for cve_id, val, failed in ex.map(_fetch_one, todo):
+                if failed:
+                    if not self.offline:
+                        print(f"CVE record API unavailable ({val}); assigner addresses stay unresolved.")
+                        self.offline = True
+                elif val:
+                    self.cache[cve_id] = val
+                    self.dirty = True
 
     def save(self):
         if not self.dirty:
@@ -3064,13 +3123,28 @@ def load_epss_scores_csv(csv_gz_path):
     """``{CVE-ID: epss}`` from one daily feed. Ported from cve_epss_comparison.py."""
     epss_map = {}
     with gzip.open(csv_gz_path, "rt", encoding="utf-8") as f:
-        first_line = f.readline()
-        if not first_line.startswith("#"):
-            f.seek(0)
-        for row in csv.DictReader(f):
-            cve = row.get("cve")
-            epss_val = row.get("epss")
-            if cve and epss_val is not None:
+        header = f.readline()
+        if header.startswith("#"):
+            header = f.readline()
+        if not header:
+            return epss_map
+        cols = [c.strip() for c in next(csv.reader([header]))]
+        try:
+            cve_idx = cols.index("cve")
+            epss_idx = cols.index("epss")
+        except ValueError:
+            return epss_map
+        need = max(cve_idx, epss_idx) + 1
+        for line in f:
+            if '"' in line:
+                parts = next(csv.reader([line]))
+            else:
+                parts = line.rstrip("\r\n").split(",")
+            if len(parts) < need:
+                continue
+            cve = parts[cve_idx]
+            epss_val = parts[epss_idx]
+            if cve and epss_val:
                 try:
                     epss_map[cve.upper()] = float(epss_val)
                 except ValueError:
@@ -3111,58 +3185,85 @@ def resolve_aging_snapshots(data_dir, anchor_date_str, anchor_path):
     anchor_date = datetime.strptime(anchor_date_str, "%Y-%m-%d")
     snapshots = [{"target": anchor_date_str, "date": anchor_date_str, "path": anchor_path,
                   "model_version": read_epss_model_version(anchor_path)}]
-    for years_back in range(1, AGING_SNAPSHOTS_BACK + 1):
+
+    def _resolve_one(years_back):
         target_dt = _shift_years(anchor_date, years_back)
         target_str = target_dt.strftime("%Y-%m-%d")
         try:
             path, actual_date = download_historical_epss_scores(data_dir, target_str)
         except Exception as e:  # noqa: BLE001
             print(f"EPSS snapshot {target_str} unavailable ({e}); skipped.")
-            continue
+            return None
         drift = abs((datetime.strptime(actual_date, "%Y-%m-%d") - target_dt).days)
         if drift > AGING_MAX_DATE_DRIFT_DAYS:
             print(f"EPSS snapshot {target_str} resolved to {actual_date}, {drift} days off; skipped.")
-            continue
-        snapshots.append({"target": target_str, "date": actual_date, "path": path,
-                          "model_version": read_epss_model_version(path)})
+            return None
+        return {"target": target_str, "date": actual_date, "path": path,
+                "model_version": read_epss_model_version(path)}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=AGING_SNAPSHOTS_BACK) as ex:
+        for snap in ex.map(_resolve_one, range(1, AGING_SNAPSHOTS_BACK + 1)):
+            if snap is not None:
+                snapshots.append(snap)
     snapshots.sort(key=lambda snap: snap["date"])
     return snapshots
 
 
-def cohort_aging_from_rows(epss_rows, snapshots):
+def cohort_aging_from_rows(epss_rows, snapshots, keep_path=None, out_maps=None):
     """Phase two of cve_epss_comparison.py's ``load_epss_cohort_aging_data``, run
     over the rows the monthly pass already holds instead of a second archive
     scan: for every (snapshot, publication-year cohort) the scores that snapshot
     gave the cohort's CVEs published on or before the snapshot date. Returns
-    ``{snapshot_date: {year: {"scores", "eligible", "missing"}}}``; one feed is
-    loaded at a time."""
+    ``{snapshot_date: {year: {"scores", "eligible", "missing"}}}``.
+
+    When ``keep_path`` and ``out_maps`` are given, the loaded score map for
+    ``keep_path`` is stored in ``out_maps[keep_path]`` so callers (e.g.
+    ``_epss_context``) do not decompress the anchor feed a second time."""
     for snap in snapshots:
         snap_year = int(snap["date"][:4])
         snap["cohort_years"] = [str(snap_year - age) for age in range(AGING_MAX_AGE + 1)]
-    res = {}
-    for snap in snapshots:
+
+    # Group rows by publication year once rather than scanning all rows per snapshot.
+    by_year = collections.defaultdict(list)
+    for cve_key, published_day, _wild in epss_rows:
+        by_year[published_day[:4]].append((cve_key, published_day))
+
+    def _score_snap(snap):
         snap_date = snap["date"]
-        snap_years = set(snap["cohort_years"])
+        snap_years = snap["cohort_years"]
         epss_map = load_epss_scores_csv(snap["path"])
-        snap["n_scores"] = len(epss_map)
-        scores = {y: [] for y in snap_years}
-        eligible = {y: 0 for y in snap_years}
-        missing = {y: 0 for y in snap_years}
-        for cve_key, published_day, _wild in epss_rows:
-            year = published_day[:4]
-            if year not in snap_years or published_day > snap_date:
-                continue
-            eligible[year] += 1
-            epss_val = epss_map.get(cve_key)
-            if epss_val is not None:
-                scores[year].append(epss_val)
-            else:
-                missing[year] += 1
-        del epss_map
-        res[snap_date] = {
-            year: {"scores": np.array(scores[year]), "eligible": eligible[year], "missing": missing[year]}
-            for year in snap_years
-        }
+        n_scores = len(epss_map)
+        get_score = epss_map.get
+        bucket_out = {}
+        for year in snap_years:
+            yr_scores = []
+            elig = 0
+            miss = 0
+            for cve_key, published_day in by_year.get(year, ()):
+                if published_day > snap_date:
+                    continue
+                elig += 1
+                epss_val = get_score(cve_key)
+                if epss_val is not None:
+                    yr_scores.append(epss_val)
+                else:
+                    miss += 1
+            bucket_out[year] = {"scores": np.array(yr_scores), "eligible": elig, "missing": miss}
+        kept = epss_map if (keep_path and snap["path"] == keep_path) else None
+        return snap_date, n_scores, bucket_out, kept
+
+    res = {}
+    if len(snapshots) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(snapshots))) as ex:
+            results_list = list(ex.map(_score_snap, snapshots))
+    else:
+        results_list = [_score_snap(s) for s in snapshots]
+
+    for snap, (snap_date, n_scores, bucket_out, kept) in zip(snapshots, results_list):
+        snap["n_scores"] = n_scores
+        res[snap_date] = bucket_out
+        if kept is not None and out_maps is not None:
+            out_maps[keep_path] = kept
     return res
 
 
@@ -3549,18 +3650,99 @@ def _stamp():
     return f"Generated on {today} | Data through {_DATA_THROUGH}"
 
 
+def _counter_dd():
+    return collections.defaultdict(collections.Counter)
+
+
+def _candidate_bucket():
+    return {
+        "active": 0,
+        "rejected": 0,
+        "ref_types": collections.Counter(),
+        "source_sets": collections.Counter(),
+    }
+
+
+def _merge_scan_acc(
+    accs,
+    stats,
+    partial_stats,
+    daily_counts_2025,
+    daily_counts_2026,
+    daily_cna_counts_2026,
+    daily_counts,
+    daily_counts_kernel,
+    candidate_stats,
+    status_yearly,
+    status_weekly,
+    status_cna,
+    chrome_cves,
+    android_cves,
+    fanout_records,
+    epss_rows,
+    wild_first_seen,
+    wild_sources,
+    wild_cve_first_seen,
+    exploited_cve_published,
+    exploited_cve_candidate,
+    native_labels,
+    resolved_labels,
+    unresolved_labels,
+):
+    total_processed = 0
+    relevant_found = 0
+    for acc in accs:
+        total_processed += acc["total_processed"]
+        relevant_found += acc["relevant_found"]
+        for m, by_y in acc["stats"].items():
+            for y, c in by_y.items():
+                stats[m][y].update(c)
+        for m, by_y in acc["partial_stats"].items():
+            for y, c in by_y.items():
+                partial_stats[m][y].update(c)
+        daily_counts_2025.update(acc["daily_counts_2025"])
+        daily_counts_2026.update(acc["daily_counts_2026"])
+        for cna, c in acc["daily_cna_counts_2026"].items():
+            daily_cna_counts_2026[cna].update(c)
+        for y, c in acc["daily_counts"].items():
+            daily_counts[y].update(c)
+        for y, c in acc["daily_counts_kernel"].items():
+            daily_counts_kernel[y].update(c)
+        for mkey, cs in acc["candidate_stats"].items():
+            dst = candidate_stats[mkey]
+            dst["active"] += cs["active"]
+            dst["rejected"] += cs["rejected"]
+            dst["ref_types"].update(cs["ref_types"])
+            dst["source_sets"].update(cs["source_sets"])
+        for y, c in acc["status_yearly"].items():
+            status_yearly[y].update(c)
+        for wk, c in acc["status_weekly"].items():
+            status_weekly[wk].update(c)
+        for cna, c in acc["status_cna"].items():
+            status_cna[cna].update(c)
+        chrome_cves.extend(acc["chrome_cves"])
+        android_cves.extend(acc["android_cves"])
+        fanout_records.update(acc["fanout_records"])
+        epss_rows.extend(acc["epss_rows"])
+        wild_first_seen.update(acc["wild_first_seen"])
+        wild_sources.update(acc["wild_sources"])
+        wild_cve_first_seen.update(acc["wild_cve_first_seen"])
+        exploited_cve_published.update(acc["exploited_cve_published"])
+        exploited_cve_candidate.update(acc["exploited_cve_candidate"])
+        native_labels.update(acc["native_labels"])
+        resolved_labels.update(acc["resolved_labels"])
+        unresolved_labels.update(acc["unresolved_labels"])
+    return total_processed, relevant_found
+
+
 def count_monthly_cves(file_path, cut_off_date=None):
     """
-    Counts CVEs published month-by-month for 2022 to 2026 using ijson.
+    Counts CVEs published month-by-month for 2022 to 2026.
     """
     # stats[month_str][year_str][cna_name] = count
-    stats = collections.defaultdict(
-        lambda: collections.defaultdict(collections.Counter)
-    )
+    stats = collections.defaultdict(_counter_dd)
     # partial_stats[month_str][year_str][cna_name] = count (up to current day)
-    partial_stats = collections.defaultdict(
-        lambda: collections.defaultdict(collections.Counter)
-    )
+    partial_stats = collections.defaultdict(_counter_dd)
     # daily_counts_2025[month_day_str] = count
     daily_counts_2025 = collections.Counter()
     # daily_counts_2026[month_day_str] = count
@@ -3575,10 +3757,7 @@ def count_monthly_cves(file_path, cut_off_date=None):
     # "source_sets": Counter of frozenset} -- the "hidden" reserved/candidate
     # CVEs, excluded from the main counts. source_sets keeps each CVE's own set
     # of sources so a pooled row can count CVEs rather than CVE x source pairs.
-    candidate_stats = collections.defaultdict(
-        lambda: {"active": 0, "rejected": 0, "ref_types": collections.Counter(),
-                 "source_sets": collections.Counter()}
-    )
+    candidate_stats = collections.defaultdict(_candidate_bucket)
     # status_yearly[year_str][vulnStatus] and status_weekly[monday_iso][vulnStatus]
     # = count, for the NVD status charts. Counted over every record, candidates
     # and all, the way the standalone cve_status_stats.py did, so those two
@@ -3673,173 +3852,103 @@ def count_monthly_cves(file_path, cut_off_date=None):
 
     start_time = time.time()
 
-    try:
-        with open(file_path, "rb") as f:
-            parser = ijson.items(f, "item")
+    scan_cfg = {
+        "anchor_date_str": anchor_date_str,
+        "anchor_year": anchor_year,
+        "current_day": current_day,
+        "status_start_year": STATUS_START_YEAR,
+        "status_cna_start": STATUS_CNA_START,
+        "epss_min_year": int(anchor_year) - EPSS_ROWS_YEARS_BACK,
+        "chrome_cna": CHROME_CNA,
+        "android_cna": ANDROID_CNA,
+        "kernel_cna": KERNEL_CNA,
+        "kev_ids": frozenset(kev_ids),
+        "fanout_wanted": frozenset(fanout_wanted),
+        "assigner_cache": dict(assigner_of.cache),
+        "local_mode": _LOCAL,
+    }
 
-            for item in parser:
-                total_processed += 1
+    chunk_accs = None
+    if _scan_worker.is_compact_ndjson_array(file_path):
+        n_cpus = os.cpu_count() or 1
+        use_mp = (
+            file_size >= 16 * 1024 * 1024
+            and n_cpus >= 2
+            and not os.getenv("VULN_STATS_SERIAL")
+        )
+        n_workers = min(n_cpus, 8) if use_mp else 1
+        ranges = _scan_worker.compute_line_chunks(file_path, n_workers)
+        n_chunks = len(ranges)
+        tasks = [
+            (file_path, s_off, e_off, i == 0, i == n_chunks - 1, scan_cfg)
+            for i, (s_off, e_off) in enumerate(ranges)
+        ]
+        if n_chunks > 1:
+            mp_ctx = multiprocessing.get_context("spawn")
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=n_chunks, mp_context=mp_ctx
+            ) as ex:
+                results_raw = list(ex.map(_scan_worker.scan_chunk, tasks))
+        else:
+            results_raw = [_scan_worker.scan_chunk(tasks[0])]
+        if all(r is not None for r in results_raw):
+            chunk_accs = results_raw
 
-                published_date = item.get("published")
-                vuln_status = item.get("vulnStatus")
-                reporter = item.get("reporter")
-                cna_name = item.get("cna") or reporter or "Unknown"
-                if "@" in cna_name and _EMAIL_RE.fullmatch(cna_name):
-                    resolved = assigner_of(item.get("id"))
-                    if resolved:
-                        resolved_labels[(cna_name, resolved)] += 1
-                        cna_name = resolved
-                    else:
-                        unresolved_labels[cna_name] += 1
-                else:
-                    native_labels.add(cna_name)
-
-                is_rejected = bool(vuln_status) and vuln_status.lower() == "rejected"
-                is_candidate = bool(reporter) and reporter.lower() == "candidate"
-
-                if not is_rejected:
-                    ench = item.get("enchantments")
-                    expl = ench.get("exploitation") if isinstance(ench, dict) else None
-                    if isinstance(expl, dict) and expl.get("wildExploited") is True:
-                        srcs = [s for s in expl.get("wildExploitedSources") or [] if isinstance(s, dict)]
-                        seen = [str(s.get("firstSeen") or "")[:10] for s in srcs]
-                        seen = [d for d in seen if len(d) == 10]
-                        if seen:
-                            wild_first_seen[min(seen)] += 1
-                            if item.get("id"):
-                                wild_cve_first_seen[str(item["id"]).upper()] = min(seen)
-                        for s in srcs:
-                            if s.get("type"):
-                                wild_sources[s["type"]] += 1
-                    cve_id = str(item.get("id") or "").upper()
-                    if (cve_id in kev_ids or (isinstance(expl, dict)
-                                              and expl.get("wildExploited") is True)) \
-                            and published_date and len(published_date) >= 10:
-                        exploited_cve_published[cve_id] = published_date[:10]
-                        if is_candidate:
-                            exploited_cve_candidate.add(cve_id)
-
-                if item.get("id") in fanout_wanted:
-                    fanout_records[item["id"]] = fanout_record(item)
-
-                if (
-                    published_date and len(published_date) >= 10
-                    and published_date[:10] <= anchor_date_str
-                    and published_date[:4].isdigit()
-                    and int(published_date[:4]) >= STATUS_START_YEAR
-                ):
-                    try:
-                        pub_day = date(
-                            int(published_date[:4]), int(published_date[5:7]), int(published_date[8:10])
-                        )
-                    except ValueError:
-                        pub_day = None
-                    if pub_day is not None:
-                        status_key = vuln_status or "Reserved"
-                        status_yearly[published_date[:4]][status_key] += 1
-                        week_start = pub_day - timedelta(days=pub_day.weekday())
-                        status_weekly[week_start.isoformat()][status_key] += 1
-                        if published_date[:10] >= STATUS_CNA_START:
-                            status_cna[cna_name][status_key] += 1
-
-                # Candidate (reserved / not-yet-published) CVEs are excluded from
-                # the main counts, but tracked separately as the "hidden" volume:
-                # active vs rejected, plus OSV/GitHub reference presence, by month
-                # of the current year up to the anchor date.
-                if is_candidate:
-                    if (
-                        published_date and len(published_date) >= 10
-                        and published_date[:4] == anchor_year
-                        and published_date[:10] <= anchor_date_str
-                    ):
-                        mkey = published_date[:7]
-                        candidate_stats[mkey]["rejected" if is_rejected else "active"] += 1
-                        # Count each source once per CVE (presence, not reference
-                        # multiplicity) so overlapping refs don't double-count.
-                        ench = item.get("enchantments")
-                        if isinstance(ench, dict):
-                            deps = ench.get("dependencies")
-                            if isinstance(deps, dict):
-                                refs = deps.get("references")
-                                if isinstance(refs, list):
-                                    src_types = {
-                                        ref["type"] for ref in refs
-                                        if isinstance(ref, dict) and ref.get("type")
-                                    }
-                                    for t in src_types:
-                                        candidate_stats[mkey]["ref_types"][t] += 1
-                                    if src_types:
-                                        candidate_stats[mkey]["source_sets"][frozenset(src_types)] += 1
-                        # A Chrome release whose CVEs are still reserved: the
-                        # advisory and the Nessus plugin already name them, the
-                        # CVE records do not exist yet. Kept, flagged, for the
-                        # fan-in slides, which draw them apart from published.
-                        if not is_rejected:
-                            row = _chrome_row(item, published_date[:10], candidate=True)
-                            if row["posts"] or row["advisories"] or row["versions"]:
-                                chrome_cves.append(row)
-                    continue
-
-                if is_rejected:
-                    continue
-
-                if (
-                    published_date and len(published_date) >= 10 and item.get("id")
-                    and published_date[:4].isdigit()
-                    and int(published_date[:4]) >= int(anchor_year) - EPSS_ROWS_YEARS_BACK
-                    and published_date[:10] <= anchor_date_str
-                ):
-                    ench = item.get("enchantments")
-                    expl = ench.get("exploitation") if isinstance(ench, dict) else None
-                    epss_rows.append((
-                        str(item["id"]).upper(), published_date[:10],
-                        isinstance(expl, dict) and expl.get("wildExploited") is True,
-                    ))
-
-                if published_date and len(published_date) >= 10:
-                    year = published_date[:4]
-                    month = published_date[5:7]
-                    day = int(published_date[8:10])
-                    record_date_str = published_date[:10]
-
-                    if record_date_str > anchor_date_str:
-                        continue
-
-                    if year in ["2022", "2023", "2024", "2025", "2026"]:
-                        if cna_name == CHROME_CNA and year == anchor_year:
-                            chrome_cves.append(_chrome_row(item, record_date_str))
-                        if cna_name == ANDROID_CNA and year == anchor_year:
-                            android_cves.append(_android_row(item, record_date_str))
-
-                        # Store in full monthly stats
-                        stats[month][year][cna_name] += 1
-                        if cna_name == KERNEL_CNA:
-                            daily_counts_kernel[year][f"{month}-{day:02d}"] += 1
-
-                        # Store in partial stats if within the same day-range as current date
-                        if day <= current_day:
-                            partial_stats[month][year][cna_name] += 1
-
-                        # Store daily counts for plotting
-                        day_key = f"{month}-{day:02d}"
-                        daily_counts[year][day_key] += 1
-                        if year == "2025":
-                            daily_counts_2025[day_key] += 1
-                        elif year == "2026":
-                            daily_counts_2026[day_key] += 1
-                            daily_cna_counts_2026[cna_name][day_key] += 1
-
-                        relevant_found += 1
-
-    except ijson.common.IncompleteJSONError as e:
-        print(f"\nError: File parsing ended prematurely: {e}")
-        print(f"The data file '{abs_file_path}' is corrupted/incomplete.")
+    if chunk_accs is not None:
+        deferred = []
+        for acc in chunk_accs:
+            if acc["deferred_email_lines"]:
+                deferred.extend(acc["deferred_email_lines"])
+                acc["deferred_email_lines"] = []
+        if deferred:
+            assigner_of.prefetch([cid for cid, _ in deferred])
+            def_acc = _scan_worker.make_empty_acc()
+            week_cache = {}
+            for _cid, raw_line in deferred:
+                _scan_worker.process_item(
+                    _scan_worker.loads_bytes(raw_line),
+                    def_acc,
+                    scan_cfg,
+                    week_cache,
+                    resolve_fn=assigner_of,
+                )
+            chunk_accs.append(def_acc)
+        total_processed, relevant_found = _merge_scan_acc(
+            chunk_accs,
+            stats, partial_stats, daily_counts_2025, daily_counts_2026,
+            daily_cna_counts_2026, daily_counts, daily_counts_kernel,
+            candidate_stats, status_yearly, status_weekly, status_cna,
+            chrome_cves, android_cves, fanout_records, epss_rows,
+            wild_first_seen, wild_sources, wild_cve_first_seen,
+            exploited_cve_published, exploited_cve_candidate,
+            native_labels, resolved_labels, unresolved_labels,
+        )
+    else:
         try:
-            os.remove(file_path)
-            print("Successfully deleted the corrupted file. Please re-run the script to perform a clean download.")
-        except Exception as remove_err:
-            print(f"Failed to delete the corrupted file: {remove_err}")
-        return None
+            acc = _scan_worker.make_empty_acc()
+            week_cache = {}
+            with open(file_path, "rb", buffering=4 * 1024 * 1024) as f:
+                for item in ijson.items(f, "item", use_float=True):
+                    _scan_worker.process_item(item, acc, scan_cfg, week_cache, resolve_fn=assigner_of)
+            total_processed, relevant_found = _merge_scan_acc(
+                [acc],
+                stats, partial_stats, daily_counts_2025, daily_counts_2026,
+                daily_cna_counts_2026, daily_counts, daily_counts_kernel,
+                candidate_stats, status_yearly, status_weekly, status_cna,
+                chrome_cves, android_cves, fanout_records, epss_rows,
+                wild_first_seen, wild_sources, wild_cve_first_seen,
+                exploited_cve_published, exploited_cve_candidate,
+                native_labels, resolved_labels, unresolved_labels,
+            )
+        except ijson.common.IncompleteJSONError as e:
+            print(f"\nError: File parsing ended prematurely: {e}")
+            print(f"The data file '{abs_file_path}' is corrupted/incomplete.")
+            try:
+                os.remove(file_path)
+                print("Successfully deleted the corrupted file. Please re-run the script to perform a clean download.")
+            except Exception as remove_err:
+                print(f"Failed to delete the corrupted file: {remove_err}")
+            return None
 
     duration = time.time() - start_time
     print(f"Scan completed in {duration:.2f} seconds.")
@@ -7526,6 +7635,7 @@ def _write_status_csvs(status_yearly, status_weekly):
 def _write_fanout_csv(fanout_records, output_filename="cve_monthly_stats_comparison_fanout_downstream.csv"):
     """The shortlist's downstream counts, so the pick can be sanity-checked:
     one row per candidate with distinct records, issuers, and the top issuers."""
+    prefetch_audit_cves([cid for cid in FANOUT_SHORTLIST if cid in fanout_records])
     rows = []
     for cve_id in FANOUT_SHORTLIST:
         rec = fanout_records.get(cve_id)
@@ -8567,7 +8677,17 @@ def generate(archive_path, out_dir):
     archive_path = os.path.abspath(archive_path)
     os.makedirs(out_dir, exist_ok=True)
 
-    results = count_monthly_cves(archive_path, cut_off_date=CUT_OFF_DATE)
+    # Fetch the small CNA roster (~700 KB) concurrently while scanning the
+    # multi-GB archive so its network latency is hidden behind the scan.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as bg_ex:
+        cna_fut = bg_ex.submit(download_cna_list)
+        try:
+            results = count_monthly_cves(archive_path, cut_off_date=CUT_OFF_DATE)
+        finally:
+            try:
+                cna_fut.result()
+            except Exception:  # noqa: BLE001 - download_cna_list handles its own errors
+                pass
     if not results:
         return None
 
@@ -8659,6 +8779,8 @@ def _run_monthly(results, report_buf):
     incomplete_month_str = None if anchor_month_complete else anchor_month_str
 
     sorted_months = sorted(stats.keys())
+    incomplete_sankey_call = None
+
     for month_str in sorted_months:
         # Nothing after the anchor month is in play: the anchor is the last full
         # day, so on the 1st the new month has no data to show yet.
@@ -8771,7 +8893,7 @@ def _run_monthly(results, report_buf):
             prev_month_name = months_map.get(prev_month_str, prev_month_str)
             prev_range_label = f"{prev_month_name[:3]} 1-{current_day}"
             prev_shown_top = _top_n_names(prev_data_2026_partial, (data_2026_partial, data_2025_partial))
-            sankey_named_cnas = set(top_names) | prev_shown_top
+            sankey_named_cnas = list(set(top_names) | prev_shown_top)
             slide_inputs["incomplete_month"] = dict(
                 data_2025_partial=data_2025_partial,
                 data_2026_partial=data_2026_partial,
@@ -8786,17 +8908,25 @@ def _run_monthly(results, report_buf):
                     anchor_month_str, anchor_month_complete,
                 ),
             )
-            plot_incomplete_month_sankey(
-                data_2025_partial,
-                data_2026_partial,
-                prev_data_2026_partial,
-                sankey_named_cnas,
-                range_label,
-                prev_range_label,
-                prev_year_str,
-                anchor_date,
-                output_filename="cve_monthly_stats_comparison_incomplete_month.png",
-                rank_colors=slide_inputs["incomplete_month"]["rank_colors"],
+            incomplete_sankey_call = (
+                "monthly",
+                "plot_incomplete_month_sankey",
+                (
+                    data_2025_partial,
+                    data_2026_partial,
+                    prev_data_2026_partial,
+                    sankey_named_cnas,
+                    range_label,
+                    prev_range_label,
+                    prev_year_str,
+                    anchor_date,
+                ),
+                {
+                    "output_filename": "cve_monthly_stats_comparison_incomplete_month.png",
+                    "rank_colors": slide_inputs["incomplete_month"]["rank_colors"],
+                },
+                False,
+                "incomplete_month",
             )
 
     # A finished anchor month still gets the same three-column comparison chart —
@@ -8838,11 +8968,12 @@ def _run_monthly(results, report_buf):
             prev_data_2026_full=prev_data_full,
         )
         prev_shown_top = _top_n_names(prev_data_full, (data_2026_full, data_2025_full))
+        sankey_named_cnas_full = list(set(top_names) | prev_shown_top)
         slide_inputs["incomplete_month"] = dict(
             data_2025_partial=data_2025_full,
             data_2026_partial=data_2026_full,
             prev_data_partial=prev_data_full,
-            top_names=set(top_names) | prev_shown_top,
+            top_names=sankey_named_cnas_full,
             range_label=month_name,
             prev_range_label=prev_month_name,
             prev_year_str=prev_year_str,
@@ -8853,18 +8984,26 @@ def _run_monthly(results, report_buf):
                 anchor_month_str, anchor_month_complete,
             ),
         )
-        plot_incomplete_month_sankey(
-            data_2025_full,
-            data_2026_full,
-            prev_data_full,
-            set(top_names) | prev_shown_top,
-            month_name,
-            prev_month_name,
-            prev_year_str,
-            anchor_date,
-            output_filename="cve_monthly_stats_comparison_incomplete_month.png",
-            center_is_complete=True,
-            rank_colors=slide_inputs["incomplete_month"]["rank_colors"],
+        incomplete_sankey_call = (
+            "monthly",
+            "plot_incomplete_month_sankey",
+            (
+                data_2025_full,
+                data_2026_full,
+                prev_data_full,
+                sankey_named_cnas_full,
+                month_name,
+                prev_month_name,
+                prev_year_str,
+                anchor_date,
+            ),
+            {
+                "output_filename": "cve_monthly_stats_comparison_incomplete_month.png",
+                "center_is_complete": True,
+                "rank_colors": slide_inputs["incomplete_month"]["rank_colors"],
+            },
+            False,
+            "incomplete_month",
         )
 
     # Resolve the final cumulative YTD dictionary to use
@@ -8898,6 +9037,13 @@ def _run_monthly(results, report_buf):
             anchor_date,
         )
 
+    render_batches = []
+    if incomplete_sankey_call is not None:
+        render_batches.append([incomplete_sankey_call])
+
+    def _queue_web(fn_name, *args, **kwargs):
+        render_batches.append([("monthly", fn_name, args, kwargs, False, fn_name)])
+
     # Every Chrome release of the year with its CVE count, for the fan-in slide (local only).
     slide_inputs["fanin_chrome"] = dict(chrome_cves=results.get("chrome_cves", []), anchor_date=anchor_date)
     # Every Android security bulletin of the year by CWE (local only).
@@ -8912,7 +9058,7 @@ def _run_monthly(results, report_buf):
         stats=stats, anchor_date=anchor_date, anchor_month_complete=anchor_month_complete,
     )
     if _SLIDES:
-        plot_exploitation_vs_volume(stats, anchor_date, anchor_month_complete=anchor_month_complete)
+        _queue_web("plot_exploitation_vs_volume", stats, anchor_date, anchor_month_complete=anchor_month_complete)
     # The same slide with Vulners' wildExploited flag in place of KEV (local only).
     slide_inputs["exploitation_wild"] = dict(
         stats=stats, anchor_date=anchor_date, anchor_month_complete=anchor_month_complete,
@@ -8925,28 +9071,43 @@ def _run_monthly(results, report_buf):
         stats=stats, anchor_date=anchor_date, anchor_month_complete=anchor_month_complete,
         wild_cve_first_seen=results.get("wild_cve_first_seen", {}),
     )
-    plot_exploitation_trends(stats, anchor_date, anchor_month_complete=anchor_month_complete,
-                             wild_cve_first_seen=results.get("wild_cve_first_seen", {}))
+    _queue_web(
+        "plot_exploitation_trends",
+        stats, anchor_date, anchor_month_complete=anchor_month_complete,
+        wild_cve_first_seen=results.get("wild_cve_first_seen", {}),
+    )
     if _SLIDES:
-        plot_exploitation_trends_indexed(stats, anchor_date, anchor_month_complete=anchor_month_complete,
-                                         wild_cve_first_seen=results.get("wild_cve_first_seen", {}))
-        plot_exploitation_trends(stats, anchor_date, anchor_month_complete=anchor_month_complete,
-                                 wild_cve_first_seen=results.get("wild_cve_first_seen", {}),
-                                 output_filename="cve_monthly_stats_comparison_exploitation_trends_24m.png",
-                                 months_back=EXPLOIT_TRENDS_MONTHS_SHORT)
+        _queue_web(
+            "plot_exploitation_trends_indexed",
+            stats, anchor_date, anchor_month_complete=anchor_month_complete,
+            wild_cve_first_seen=results.get("wild_cve_first_seen", {}),
+        )
+        _queue_web(
+            "plot_exploitation_trends",
+            stats, anchor_date, anchor_month_complete=anchor_month_complete,
+            wild_cve_first_seen=results.get("wild_cve_first_seen", {}),
+            output_filename="cve_monthly_stats_comparison_exploitation_trends_24m.png",
+            months_back=EXPLOIT_TRENDS_MONTHS_SHORT,
+        )
         # The same chart with the KEV and exploited CVEs also counted by their
         # own publication month (local only).
-        plot_exploitation_trends(stats, anchor_date, anchor_month_complete=anchor_month_complete,
-                                 wild_cve_first_seen=results.get("wild_cve_first_seen", {}),
-                                 output_filename="cve_monthly_stats_comparison_exploitation_trends_published.png",
-                                 months_back=EXPLOIT_TRENDS_MONTHS_PUBLISHED,
-                                 cve_published=results.get("exploited_cve_published", {}))
+        _queue_web(
+            "plot_exploitation_trends",
+            stats, anchor_date, anchor_month_complete=anchor_month_complete,
+            wild_cve_first_seen=results.get("wild_cve_first_seen", {}),
+            output_filename="cve_monthly_stats_comparison_exploitation_trends_published.png",
+            months_back=EXPLOIT_TRENDS_MONTHS_PUBLISHED,
+            cve_published=results.get("exploited_cve_published", {}),
+        )
     # The year's KEV additions and newly exploited CVEs, by when they were
     # published: the page chart after the trends (#monthly-exploitation-age).
-    plot_exploitation_publication_sankey(anchor_date, anchor_month_complete=anchor_month_complete,
-                                         wild_cve_first_seen=results.get("wild_cve_first_seen", {}),
-                                         cve_published=results.get("exploited_cve_published", {}),
-                                         cve_candidate=results.get("exploited_cve_candidate", set()))
+    _queue_web(
+        "plot_exploitation_publication_sankey",
+        anchor_date, anchor_month_complete=anchor_month_complete,
+        wild_cve_first_seen=results.get("wild_cve_first_seen", {}),
+        cve_published=results.get("exploited_cve_published", {}),
+        cve_candidate=results.get("exploited_cve_candidate", set()),
+    )
     # One CVE's downstream advisories, for the fan-out slide (local only).
     fanout_records = results.get("fanout_records", {})
     slide_inputs["fanout_downstream"] = dict(record=fanout_records.get(FANOUT_CVE))
@@ -8964,7 +9125,8 @@ def _run_monthly(results, report_buf):
         anchor_date=anchor_date,
         anchor_month_complete=anchor_month_complete,
     )
-    plot_custom_sankey_flow(
+    _queue_web(
+        "plot_custom_sankey_flow",
         stats,
         partial_stats,
         ytd_top_cnas,
@@ -8973,7 +9135,8 @@ def _run_monthly(results, report_buf):
     )
     # The same picture, lanes resorted by the newest month's volume (local only).
     if _SANKEY_MONTH_ORDER:
-        plot_custom_sankey_flow(
+        _queue_web(
+            "plot_custom_sankey_flow",
             stats,
             partial_stats,
             ytd_top_cnas,
@@ -8988,7 +9151,7 @@ def _run_monthly(results, report_buf):
     slide_inputs["active_cnas"] = dict(
         stats=stats, anchor_date=anchor_date, anchor_month_complete=anchor_month_complete,
     )
-    plot_active_cnas(stats, anchor_date, anchor_month_complete=anchor_month_complete)
+    _queue_web("plot_active_cnas", stats, anchor_date, anchor_month_complete=anchor_month_complete)
     if _WRITE_CSV:
         _write_active_cnas_csv(stats, anchor_date, anchor_month_complete=anchor_month_complete)
 
@@ -8998,19 +9161,19 @@ def _run_monthly(results, report_buf):
         daily_counts_2026=daily_counts_2026,
         anchor_date_str=anchor_date,
     )
-    plot_ytd_growth(daily_counts_2025, daily_counts_2026, anchor_date)
+    _queue_web("plot_ytd_growth", daily_counts_2025, daily_counts_2026, anchor_date)
 
     # CVEs per day, one small panel per month of the anchor year.
     slide_inputs["daily_by_month"] = dict(
         daily_counts=daily_counts, anchor_date=anchor_date, anchor_month_complete=anchor_month_complete,
     )
-    plot_daily_by_month(daily_counts, anchor_date, anchor_month_complete=anchor_month_complete)
+    _queue_web("plot_daily_by_month", daily_counts, anchor_date, anchor_month_complete=anchor_month_complete)
     if _WRITE_CSV:
         _write_daily_by_month_csv(daily_counts, anchor_date, anchor_month_complete=anchor_month_complete)
 
     # Generate Yearly Cumulative YoY comparison chart (2022-2025 full year, 2026 YTD)
     slide_inputs["yearly_cumulative"] = dict(daily_counts=daily_counts, anchor_date_str=anchor_date)
-    plot_yearly_cumulative(daily_counts, anchor_date)
+    _queue_web("plot_yearly_cumulative", daily_counts, anchor_date)
 
     # Generate Monthly Projections comparison chart
     completed_month_strs = [m[0] for m in full_month_data]
@@ -9070,7 +9233,8 @@ def _run_monthly(results, report_buf):
         current_month_yoy_growth=current_month_yoy_growth,
         anchor_date=anchor_date,
     )
-    plot_monthly_projections(
+    _queue_web(
+        "plot_monthly_projections",
         stats,
         completed_month_strs,
         slope,
@@ -9088,19 +9252,72 @@ def _run_monthly(results, report_buf):
     slide_inputs["status_weekly"] = dict(status_weekly=status_weekly, anchor_date=anchor_date)
     status_cna = results.get("status_cna", {})
     slide_inputs["status_by_cna"] = dict(status_cna=status_cna, anchor_date=anchor_date)
-    plot_status_yearly_bar(status_yearly, anchor_date)
-    plot_status_stacked_charts(status_weekly, anchor_date)
-    plot_status_by_cna(status_cna, anchor_date)
+    _queue_web("plot_status_yearly_bar", status_yearly, anchor_date)
+    _queue_web("plot_status_stacked_charts", status_weekly, anchor_date)
+    _queue_web("plot_status_by_cna", status_cna, anchor_date)
     if _WRITE_CSV:
         _write_status_csvs(status_yearly, status_weekly)
         _write_status_by_cna_csv(status_cna)
 
     # Hidden volume: reserved/candidate CVEs (last chart on the dashboard).
     slide_inputs["candidate_track"] = dict(candidate_stats=results.get("candidate_stats", {}))
-    plot_candidate_track(results.get("candidate_stats", {}))
+    _queue_web("plot_candidate_track", results.get("candidate_stats", {}))
 
-    # The same six pictures again, rethought as 16:9 presentation slides. Local
-    # runs only — the published page never sees these files.
+    # The presentation slides share the same render pool on local runs.
     if _SLIDES:
         from . import monthly_slides
-        monthly_slides.render_all(slide_inputs)
+        render_batches.extend(monthly_slides.build_render_batches(slide_inputs))
+
+    # Ensure shared feeds are warm on disk before parallel workers read them.
+    download_cisa_kev()
+    download_cna_list()
+
+    n_cpus = os.cpu_count() or 1
+    use_mp = (
+        n_cpus >= 2
+        and len(render_batches) > 2
+        and not os.getenv("VULN_STATS_SERIAL")
+    )
+    if use_mp:
+        from . import _render_worker
+        worker_state = {
+            "out_dir": os.getcwd(),
+            "local": _LOCAL,
+            "write_csv": _WRITE_CSV,
+            "slides": _SLIDES,
+            "sankey_month_order": _SANKEY_MONTH_ORDER,
+            "data_through": _DATA_THROUGH,
+            "cut_off_date": CUT_OFF_DATE,
+            "load_slides": _SLIDES,
+        }
+        max_workers = min(n_cpus, 6 if _SLIDES else 4, len(render_batches))
+        mp_ctx = multiprocessing.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=max_workers,
+            mp_context=mp_ctx,
+            initializer=_render_worker.init_render_worker,
+            initargs=(worker_state,),
+        ) as ex:
+            batch_results = list(ex.map(_render_worker.run_render_batch, render_batches))
+        for out_text, new_logs, fatal_tb in batch_results:
+            if out_text:
+                print(out_text, end="")
+            saved_files_log.extend(new_logs)
+            if fatal_tb is not None:
+                raise RuntimeError(f"Chart rendering failed:\n{fatal_tb}")
+    else:
+        import traceback
+        mods = {"monthly": globals()}
+        if _SLIDES:
+            from . import monthly_slides
+            mods["monthly_slides"] = monthly_slides
+        for batch in render_batches:
+            for mod_name, fn_name, args, kwargs, isolate, label in batch:
+                fn = mods[mod_name][fn_name] if mod_name == "monthly" else getattr(mods[mod_name], fn_name)
+                if isolate:
+                    try:
+                        fn(*args, **kwargs)
+                    except Exception:  # noqa: BLE001
+                        print(f"Slide '{label}' failed; skipping:\n{traceback.format_exc()}")
+                else:
+                    fn(*args, **kwargs)

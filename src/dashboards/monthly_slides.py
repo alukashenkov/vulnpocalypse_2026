@@ -2291,10 +2291,12 @@ _FANOUT_MAX_BARS = 15   # products drawn individually; the rest pool into one ba
 _FANOUT_SOFTWARE_LABELS = {"linux linux_kernel": "Linux kernel", "openssl": "OpenSSL", "haxx curl": "curl", "php": "PHP"}
 
 
-def _fanout_rows(record):
+def _fanout_rows(record, audit=None):
     """The bars: from ``audit/cve`` (package updates per product) when it can be
     reached, else from the archive references (records per issuer)."""
-    audit_rows, totals = m.fanout_packages(m.fetch_audit_cve(record["id"]))
+    if audit is None:
+        audit = m.fetch_audit_cve(record["id"])
+    audit_rows, totals = m.fanout_packages(audit)
     if audit_rows:
         rows = [{"label": r["product"], "value": r["updates"], "vendor": r["kind"] == "vendor",
                  "note": (f"vendor advisory · {r['releases']} product line{'s' if r['releases'] != 1 else ''} · "
@@ -2346,7 +2348,7 @@ def _fit_fanout_note(fig, ax, note, row, inside, right):
 
 
 def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstream"], nvd=None, stamp=None,
-                            libdeps=None):
+                            libdeps=None, audit=None):
     """One CVE, and how far its fix travels: every downstream package rebuilt for
     it, grouped by the product that ships it. The matched pair of the Chrome
     fan-in slide — same frame, opposite direction of travel.
@@ -2375,7 +2377,7 @@ def slide_fanout_downstream(record, output_filename=SLIDE_FILES["fanout_downstre
     ``_FANOUT_LIBDEPS_PANEL_H`` and sits at the bottom, under the NVD panel."""
     if not record:
         return
-    rows, totals, source = _fanout_rows(record)
+    rows, totals, source = _fanout_rows(record, audit=audit)
     if not rows:
         return
     total = totals["updates"]
@@ -2946,16 +2948,21 @@ def slide_fanout_downstream_extra(records):
     document are asked live (``max_age_h=0``, the day's cache only as the
     fallback), the record is rebuilt from the live document, and the footer
     dates the slide by those fetches instead of "Data through"."""
+    import concurrent.futures
     for record in records:
         if not record:
             continue
         cve = record["id"]
-        audit = m.fetch_audit_cve(cve, max_age_h=0)
-        doc = m.fetch_cve_document(cve, max_age_h=0)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+            f_audit = ex.submit(m.fetch_audit_cve, cve, 0)
+            f_doc = ex.submit(m.fetch_cve_document, cve, 0)
+            f_osv = ex.submit(m.fetch_vulnersosv, cve, 0)
+            audit = f_audit.result()
+            doc = f_doc.result()
+            osv = f_osv.result()
         if doc:
             record = m.fanout_record(doc)
         nvd = m.fanout_cpe_mismatch(audit, m.nvd_cpe_matches(doc))
-        osv = m.fetch_vulnersosv(cve, max_age_h=0)
         lib_rows, lib_totals = m.library_dependents(osv)
         if lib_rows:
             print(f"Library layer for {cve}: {lib_totals['dependents']:,} dependent packages on "
@@ -2981,7 +2988,8 @@ def slide_fanout_downstream_extra(records):
         slide_fanout_downstream(record, output_filename=(
             f"cve_monthly_stats_comparison_fanout_downstream_{cve.lower()}_slide.png"),
             nvd=nvd if nvd and nvd["matched"] else None, stamp=dep_stamp or stamp,
-            libdeps=(lib_rows, lib_totals, dep_rows or None) if lib_rows else None)
+            libdeps=(lib_rows, lib_totals, dep_rows or None) if lib_rows else None,
+            audit=audit)
         if dep_rows:
             slide_fanout_libdeps(cve, dep_rows, dep_info, lib_rows[0]["name"], output_filename=(
                 f"cve_monthly_stats_comparison_fanout_libdeps_{cve.lower()}_slide.png"), stamp=dep_stamp)
@@ -3058,12 +3066,12 @@ def slide_fanout_status(record=None, output_filename=SLIDE_FILES["fanout_status"
             txt = names(items) if len(items) <= 4 else ", ".join(r for r, _ in items)
             parts.append(("open: " + txt, "#FF8A95"))
         x_px = 0
+        renderer = fig.canvas.get_renderer()
         for txt, color in parts:
             t = ax.annotate(textwrap.shorten(txt, 125, placeholder="…"), xy=(0, y - 0.25),
                             xytext=(x_px, 0), textcoords="offset points",
                             ha="left", va="center", fontsize=8.5, color=color, zorder=5)
-            fig.canvas.draw()
-            x_px += t.get_window_extent().width * 72 / fig.dpi + 14
+            x_px += t.get_window_extent(renderer=renderer).width * 72 / fig.dpi + 14
     ax.legend(loc="lower right", facecolor="#262626", edgecolor="#444444", fontsize=F_SMALL, framealpha=0.95)
 
     # Right margin: the ladder again, ending in the split.
@@ -3945,14 +3953,18 @@ def _epss_context(epss_rows, anchor_date):
         return None
     feed_date = m.epss_date_from_filename(anchor_path)
     snapshots = m.resolve_aging_snapshots(data_dir, feed_date, anchor_path)
-    aging = m.calculate_cohort_aging_stats(m.cohort_aging_from_rows(epss_rows, snapshots), snapshots) \
-        if len(snapshots) >= 2 else None
+    kept_maps = {}
+    aging = m.calculate_cohort_aging_stats(
+        m.cohort_aging_from_rows(epss_rows, snapshots, keep_path=anchor_path, out_maps=kept_maps),
+        snapshots,
+    ) if len(snapshots) >= 2 else None
     anchor_year = int(anchor_date[:4])
     years = [str(y) for y in range(anchor_year - m.EPSS_RECALL_YEARS_BACK, anchor_year + 1)]
-    epss_map = m.load_epss_scores_csv(anchor_path)
+    epss_map = kept_maps.get(anchor_path) or m.load_epss_scores_csv(anchor_path)
     kev_ids = m.load_cisa_kev_cves()          # the same catalog the exploitation slides use
     recall, cutoff_md = m.epss_recall_by_year(epss_rows, epss_map, anchor_date, years, exploited_ids=kev_ids or None)
     del epss_map
+    kept_maps.clear()
     ctx = {"feed_date": feed_date, "snapshots": snapshots, "aging": aging, "recall": recall, "cutoff_md": cutoff_md}
     _epss_ctx_cache[key] = ctx
     return ctx
@@ -4189,6 +4201,43 @@ _RENDERERS = [
     ("epss", slide_epss_cohort_age),
     ("epss", slide_epss_recall),
 ]
+
+
+def build_render_batches(inputs):
+    """Group ``_RENDERERS`` into independent batches for parallel execution.
+
+    Coupled slides stay sequential inside one batch:
+    - ``slide_fanin_chrome`` -> ``slide_fanin_chrome_estate`` (shared CSV)
+    - ``slide_fanout_downstream`` -> ``slide_fanout_downstream_extra`` (shared audit cache)
+    - ``slide_epss_*`` (shared ``_epss_context``)
+    """
+    batches = []
+    # Keys whose renderers share disk or in-memory state are batched together.
+    coupled_groups = {
+        slide_fanin_chrome: "fanin_chrome_csv",
+        slide_fanin_chrome_estate: "fanin_chrome_csv",
+        slide_fanout_downstream: "fanout_audit",
+        slide_fanout_downstream_extra: "fanout_audit",
+        slide_epss_by_year: "epss_ctx",
+        slide_epss_cohort_age: "epss_ctx",
+        slide_epss_recall: "epss_ctx",
+    }
+    group_idx = {}
+    for key, fn in _RENDERERS:
+        kwargs = inputs.get(key)
+        if kwargs is None:
+            continue
+        call = ("monthly_slides", fn.__name__, (), kwargs, True, key)
+        grp = coupled_groups.get(fn)
+        if grp is not None:
+            if grp in group_idx:
+                batches[group_idx[grp]].append(call)
+            else:
+                group_idx[grp] = len(batches)
+                batches.append([call])
+        else:
+            batches.append([call])
+    return batches
 
 
 def render_all(inputs):

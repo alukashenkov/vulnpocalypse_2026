@@ -19,12 +19,18 @@ import shutil
 import sys
 import time
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+try:
+    import orjson as _orjson
+except ImportError:
+    _orjson = None
 
 ARCHIVE_BASENAME = "vulners_archive_cve.json"
 
@@ -70,9 +76,35 @@ DOWNLOADER_STATE_SUFFIX = ".state.json"
 # them; ``indent=4`` once grew a 21 GB snapshot to 35 GB. Readers
 # stream with ijson, so the layout is not part of the format.
 _COMPACT = (",", ":")
+_IO_BUFFER_BYTES = 4 * 1024 * 1024
+
+# Keep typical delta payloads (≤ 256 MB serialized) in RAM to avoid SQLite I/O;
+# spill transparently to an unjournaled temp SQLite DB if a delta is larger.
+_STAGE_MEM_LIMIT_BYTES = 256 * 1024 * 1024
+
+# Byte-level prefilter for single-line JSON objects in ``_apply_updates``:
+# matches ``"id": "<value><quote-or-backslash>`` using a non-backtracking char
+# class; a hit (or an escaped value) is verified with full JSON decoding of that
+# line so nested ``"id"`` fields never cause false replacements.
+_ID_VALUE_RE = re.compile(rb'"id"\s*:\s*"([^"\\]*)(["\\])')
+
+# Read small collection-update payloads in one C call instead of streaming ijson.
+_FAST_UPDATE_LOAD_MAX_BYTES = 64 * 1024 * 1024
 
 # How often the merge reports progress, in documents (no tqdm here).
 _MERGE_PROGRESS_EVERY = 100_000
+
+
+def _dumps_compact_bytes(obj):
+    if _orjson is not None:
+        return _orjson.dumps(obj)
+    return json.dumps(obj, separators=_COMPACT).encode("utf-8")
+
+
+def _loads_bytes(raw):
+    if _orjson is not None:
+        return _orjson.loads(raw)
+    return json.loads(raw)
 
 
 class _DecimalEncoder(json.JSONEncoder):
@@ -248,7 +280,7 @@ def _stream_gzip_to(session, url, params, headers, dest, timeout):
     ) as r:
         r.raise_for_status()
         decompressor = zlib.decompressobj(wbits=zlib.MAX_WBITS | 16)
-        with open(dest, "wb") as f:
+        with open(dest, "wb", buffering=_IO_BUFFER_BYTES) as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(decompressor.decompress(chunk))
@@ -304,7 +336,7 @@ def _published_archive_head(session, headers, collection="cve"):
     return None
 
 
-def _report_published_archive(session, headers, watermark, now, collection="cve"):
+def _report_published_archive(session, headers, watermark, now, collection="cve", emit=print):
     """Print what the CDN is publishing right now, against this local copy.
 
     The watermark line above says how current *this* archive is; it cannot say
@@ -322,13 +354,13 @@ def _report_published_archive(session, headers, watermark, now, collection="cve"
         state = r.json().get("result") or {}
     except Exception as e:  # noqa: BLE001 - a missing report must not stop the run
         state = {}
-        print(f"Note: collection-state unavailable ({e}).")
+        emit(f"Note: collection-state unavailable ({e}).")
 
     try:
         head = _published_archive_head(session, headers, collection)
     except Exception as e:  # noqa: BLE001 - ditto
         head = None
-        print(f"Note: could not read the published archive's newest record ({e}).")
+        emit(f"Note: could not read the published archive's newest record ({e}).")
 
     newest = None
     if head:
@@ -357,7 +389,7 @@ def _report_published_archive(session, headers, watermark, now, collection="cve"
         bits.append(f"built {state['upload_time']}")
     if state.get("total_docs"):
         bits.append(f"{int(state['total_docs']):,} docs")
-    print("Published CDN archive: " + "; ".join(bits))
+    emit("Published CDN archive: " + "; ".join(bits))
 
 
 def _ijson_array_prefix(path):
@@ -371,100 +403,296 @@ def _ijson_array_prefix(path):
     return "item"
 
 
+def _merge_raw_lines(
+    old_path, tmp_path, updated_ids, updated_id_bytes, fetch_replacement, iter_remaining
+):
+    """Fast streaming byte-line merge for compact 1-doc-per-line JSON arrays.
+
+    Unchanged documents are copied as raw bytes without JSON decoding or
+    re-serialization; only lines containing a candidate ``"id"`` match (or
+    escaped ``"id"`` bytes) are parsed to verify the exact top-level ``id``.
+    Returns ``(modified, added, total)`` on success, or ``None`` if the file is
+    not in 1-doc-per-line array layout (caller falls back to ijson).
+    """
+    seen_ids = set()
+    modified = added = total = 0
+    id_findall = _ID_VALUE_RE.findall
+
+    with (
+        open(old_path, "rb", buffering=_IO_BUFFER_BYTES) as old_f,
+        open(tmp_path, "wb", buffering=_IO_BUFFER_BYTES) as new_f,
+    ):
+        # First non-empty line must be the opening '[' alone on its line.
+        for line in old_f:
+            s = line.strip()
+            if not s:
+                continue
+            if s != b"[":
+                return None
+            break
+        else:
+            return None
+
+        new_f.write(b"[\n")
+        first = True
+        closed = False
+
+        for line in old_f:
+            s = line.strip()
+            if not s:
+                continue
+            if s == b"]":
+                closed = True
+                break
+            if s.endswith(b","):
+                s = s[:-1].rstrip()
+            if not (s.startswith(b"{") and s.endswith(b"}")):
+                return None
+
+            replacement = None
+            if total == 0:
+                # Validate that line 1 is genuinely a single JSON object.
+                try:
+                    doc = _loads_bytes(s)
+                except ValueError:
+                    return None
+                if not isinstance(doc, dict):
+                    return None
+                top_id = doc.get("id")
+                if isinstance(top_id, str) and top_id in updated_ids and top_id not in seen_ids:
+                    replacement = fetch_replacement(top_id)
+                    seen_ids.add(top_id)
+                    modified += 1
+            else:
+                # Candidate check: parse only if any "id" value matches an updated id
+                # (or uses JSON escapes that could decode to one).
+                maybe = False
+                for val, term in id_findall(s):
+                    if term == b"\\" or val in updated_id_bytes:
+                        maybe = True
+                        break
+                if not maybe and b"\\u0069" in s:
+                    maybe = True
+                if maybe:
+                    try:
+                        doc = _loads_bytes(s)
+                    except ValueError:
+                        return None
+                    if not isinstance(doc, dict):
+                        return None
+                    top_id = doc.get("id")
+                    if isinstance(top_id, str) and top_id in updated_ids and top_id not in seen_ids:
+                        replacement = fetch_replacement(top_id)
+                        seen_ids.add(top_id)
+                        modified += 1
+
+            if not first:
+                new_f.write(b",\n")
+            new_f.write(replacement if replacement is not None else s)
+            first = False
+            total += 1
+            if total % _MERGE_PROGRESS_EVERY == 0:
+                print(f"  … {total:,} documents merged", flush=True)
+
+        if not closed:
+            return None
+        # Reject trailing garbage after closing ']'.
+        for trailing in old_f:
+            if trailing.strip():
+                return None
+
+        for data in iter_remaining(seen_ids):
+            if not first:
+                new_f.write(b",\n")
+            new_f.write(data)
+            first = False
+            total += 1
+            added += 1
+        new_f.write(b"\n]")
+
+    return modified, added, total
+
+
 def _apply_updates(path, update_file):
     """Merge a ``collection-update`` payload into the archive in place.
 
-    Updates are staged in a temporary SQLite table keyed by document id, then the
-    archive is streamed through ijson and rewritten: a document with a staged
-    replacement is written from the payload, everything else is copied, and the
-    ids never seen in the archive are appended as new documents. Both halves are
-    O(1) in memory, which is the only way to touch a multi-GB array.
+    Typical deltas are staged in memory (up to ``_STAGE_MEM_LIMIT_BYTES``) and
+    spill to an unjournaled temporary SQLite table if larger, keeping memory
+    bounded on arbitrarily large payloads. Compact 1-doc-per-line archives are
+    merged via raw byte-line passthrough (parsing only candidate updated lines);
+    any other JSON layout falls back to streaming ``ijson``.
 
     Returns ``(modified, added, total, max_updated_dt)``; ``max_updated_dt`` is the
     newest modification actually applied and is the only value the watermark may
     advance to. Raises on failure, leaving the original archive untouched.
     """
-    import sqlite3
-
     import ijson
 
     db_path = path + ".updates.db"
     tmp_path = path + ".merge.tmp"
-    for leftover in (db_path, tmp_path):
+    db_sidecars = (db_path, db_path + "-journal", db_path + "-wal", db_path + "-shm")
+    for leftover in (*db_sidecars, tmp_path):
         if os.path.exists(leftover):
             os.remove(leftover)
 
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute("CREATE TABLE updates (id TEXT PRIMARY KEY, data TEXT)")
-        cur = conn.cursor()
+    conn = None
+    cur = None
+    mem_updates = {}
+    staged_bytes = 0
+    staged = 0
+    max_dt = None
 
-        staged = 0
-        max_dt = None
-        with open(update_file, "rb") as f:
-            for item in ijson.items(f, _ijson_array_prefix(update_file)):
-                doc_id = item.get("id")
-                if not doc_id:
-                    continue
+    def _open_spill_db():
+        nonlocal conn, cur, mem_updates
+        import sqlite3
+
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA synchronous = OFF")
+        conn.execute("PRAGMA journal_mode = OFF")
+        conn.execute("PRAGMA temp_store = MEMORY")
+        conn.execute("PRAGMA cache_size = -65536")
+        conn.execute("CREATE TABLE updates (id TEXT PRIMARY KEY, data BLOB)")
+        cur = conn.cursor()
+        if mem_updates:
+            cur.executemany(
+                "INSERT OR REPLACE INTO updates (id, data) VALUES (?, ?)",
+                mem_updates.items(),
+            )
+            mem_updates = None
+
+    try:
+        def _iter_update_items():
+            if os.path.getsize(update_file) <= _FAST_UPDATE_LOAD_MAX_BYTES:
+                try:
+                    with open(update_file, "rb") as uf:
+                        raw_upd = _loads_bytes(uf.read())
+                    if isinstance(raw_upd, list):
+                        return iter(raw_upd)
+                except ValueError:
+                    pass
+            prefix = _ijson_array_prefix(update_file)
+
+            def _stream():
+                with open(update_file, "rb", buffering=_IO_BUFFER_BYTES) as uf:
+                    yield from ijson.items(uf, prefix, use_float=True)
+
+            return _stream()
+
+        for item in _iter_update_items():
+            if not isinstance(item, dict):
+                continue
+            doc_id = item.get("id")
+            if not doc_id:
+                continue
+            payload = _dumps_compact_bytes(item)
+            if conn is None:
+                prev = mem_updates.get(doc_id)
+                staged_bytes += len(payload) - (len(prev) if prev is not None else 0)
+                mem_updates[doc_id] = payload
+                if staged_bytes > _STAGE_MEM_LIMIT_BYTES:
+                    _open_spill_db()
+            else:
                 cur.execute(
                     "INSERT OR REPLACE INTO updates (id, data) VALUES (?, ?)",
-                    (doc_id, json.dumps(item, separators=_COMPACT, cls=_DecimalEncoder)),
+                    (doc_id, payload),
                 )
-                staged += 1
-                item_dt = _to_dt(
-                    (item.get("timestamps") or {}).get("updated") or item.get("modified")
-                )
-                if item_dt and (max_dt is None or item_dt > max_dt):
-                    max_dt = item_dt
-                if staged % 10_000 == 0:
-                    conn.commit()
-        conn.commit()
+            staged += 1
+            item_dt = _to_dt(
+                (item.get("timestamps") or {}).get("updated") or item.get("modified")
+            )
+            if item_dt and (max_dt is None or item_dt > max_dt):
+                max_dt = item_dt
+            if conn is not None and staged % 10_000 == 0:
+                conn.commit()
+        if conn is not None:
+            conn.commit()
 
         if staged == 0:
             return 0, 0, 0, None
 
         print(f"Merging {staged:,} updated documents into the archive ...")
-        modified = added = total = 0
-        with open(path, "rb") as old_f, open(tmp_path, "w", encoding="utf-8") as new_f:
-            new_f.write("[\n")
-            first = True
-            for item in ijson.items(old_f, "item"):
-                doc_id = item.get("id")
-                if not first:
-                    new_f.write(",\n")
+
+        if conn is None:
+            updated_ids = set(mem_updates)
+
+            def fetch_replacement(doc_id):
+                return mem_updates[doc_id]
+
+            def iter_remaining(seen_ids):
+                for doc_id, data in mem_updates.items():
+                    if doc_id not in seen_ids:
+                        yield data
+        else:
+            updated_ids = {row[0] for row in conn.execute("SELECT id FROM updates")}
+
+            def fetch_replacement(doc_id):
                 cur.execute("SELECT data FROM updates WHERE id = ?", (doc_id,))
                 row = cur.fetchone()
-                if row:
-                    new_f.write(row[0])
-                    # Drop it, so what remains in the table is exactly the new docs.
-                    cur.execute("DELETE FROM updates WHERE id = ?", (doc_id,))
-                    modified += 1
-                else:
-                    json.dump(item, new_f, separators=_COMPACT, cls=_DecimalEncoder)
-                first = False
-                total += 1
-                if total % _MERGE_PROGRESS_EVERY == 0:
-                    print(f"  … {total:,} documents merged", flush=True)
-            conn.commit()
+                return row[0] if row else None
 
-            # Iterate the cursor rather than fetchall(): the leftover rows are whole
-            # documents, and materialising them all defeats the point of staging them.
-            for (data,) in conn.execute("SELECT data FROM updates"):
-                if not first:
-                    new_f.write(",\n")
-                new_f.write(data)
-                first = False
-                total += 1
-                added += 1
-            new_f.write("\n]")
+            def iter_remaining(seen_ids):
+                for doc_id, data in conn.execute("SELECT id, data FROM updates"):
+                    if doc_id not in seen_ids:
+                        yield data
+
+        # Enable raw-line fast path whenever all updated IDs are plain strings.
+        can_raw = all(isinstance(k, str) for k in updated_ids)
+        result = None
+        if can_raw:
+            updated_id_bytes = set()
+            for k in updated_ids:
+                raw_k = k.encode("utf-8")
+                updated_id_bytes.add(raw_k)
+                # Also include JSON-escaped form if the ID has special chars.
+                if "\\" in k or '"' in k or not k.isascii():
+                    updated_id_bytes.add(json.dumps(k)[1:-1].encode("utf-8"))
+            result = _merge_raw_lines(
+                path, tmp_path, updated_ids, updated_id_bytes, fetch_replacement, iter_remaining
+            )
+
+        if result is not None:
+            modified, added, total = result
+        else:
+            seen_ids = set()
+            modified = added = total = 0
+            with (
+                open(path, "rb", buffering=_IO_BUFFER_BYTES) as old_f,
+                open(tmp_path, "wb", buffering=_IO_BUFFER_BYTES) as new_f,
+            ):
+                new_f.write(b"[\n")
+                first = True
+                for item in ijson.items(old_f, "item", use_float=True):
+                    doc_id = item.get("id")
+                    if not first:
+                        new_f.write(b",\n")
+                    if doc_id in updated_ids and doc_id not in seen_ids:
+                        new_f.write(fetch_replacement(doc_id))
+                        seen_ids.add(doc_id)
+                        modified += 1
+                    else:
+                        new_f.write(_dumps_compact_bytes(item))
+                    first = False
+                    total += 1
+                    if total % _MERGE_PROGRESS_EVERY == 0:
+                        print(f"  … {total:,} documents merged", flush=True)
+
+                for data in iter_remaining(seen_ids):
+                    if not first:
+                        new_f.write(b",\n")
+                    new_f.write(data)
+                    first = False
+                    total += 1
+                    added += 1
+                new_f.write(b"\n]")
 
         if not _is_json_file_complete(tmp_path):
             raise ValueError("merged archive failed the completeness check")
         os.replace(tmp_path, path)
         return modified, added, total, max_dt
     finally:
-        conn.close()
-        for leftover in (db_path, tmp_path, update_file):
+        if conn is not None:
+            conn.close()
+        for leftover in (*db_sidecars, tmp_path, update_file):
             if os.path.exists(leftover):
                 try:
                     os.remove(leftover)
@@ -577,19 +805,37 @@ def download_archive_once(collection="cve"):
             f"({(now - watermark).total_seconds() / 3600:.1f}h behind); "
             f"fetching updates after {after} ..."
         )
-        _report_published_archive(session, headers, watermark, now, collection)
+        # Overlap the published-archive report with the delta download (each
+        # uses its own requests.Session), buffering the report's lines so stdout
+        # order stays identical without touching global sys.stdout.
+        def _run_report_bg():
+            lines = []
+            bg_session = _robust_session()
+            try:
+                _report_published_archive(
+                    bg_session, headers, watermark, now, collection, emit=lines.append
+                )
+            finally:
+                bg_session.close()
+            return lines
 
         update_file = path + ".update.tmp"
         start = time.time()
         try:
-            size, response_headers = _stream_gzip_to(
-                session,
-                UPDATE_URL,
-                {"type": collection, "after": after},
-                headers,
-                update_file,
-                timeout=(10, 120),
-            )
+            with ThreadPoolExecutor(max_workers=1) as report_pool:
+                report_fut = report_pool.submit(_run_report_bg)
+                try:
+                    size, response_headers = _stream_gzip_to(
+                        session,
+                        UPDATE_URL,
+                        {"type": collection, "after": after},
+                        headers,
+                        update_file,
+                        timeout=(10, 120),
+                    )
+                finally:
+                    for line in report_fut.result():
+                        print(line)
             announced = _update_count(response_headers)
             print(
                 "collection-update: "

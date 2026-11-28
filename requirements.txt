@@ -2,3 +2,4 @@ requests
 ijson
 matplotlib
 numpy
+orjson

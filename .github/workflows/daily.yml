@@ -72,8 +72,12 @@ jobs:
               # apart would otherwise both build. The current run is excluded:
               # its own build job is already pending while this gate runs, and
               # would veto itself.
-              ids=$(gh api "repos/$REPO/actions/workflows/daily.yml/runs?per_page=50" \
-                    --jq "[.workflow_runs[] | select(.created_at >= \"${today}T00:00:00Z\" and .id != ${{ github.run_id }}) | .id] | .[]")
+              # Check the earliest runs of today first (reverse): the 00:30 UTC
+              # build is usually the oldest run of the day, so reversing lets
+              # subsequent hourly ticks stop on the first API check instead of
+              # scanning every skipped tick before it.
+              ids=$(gh api "repos/$REPO/actions/workflows/daily.yml/runs?created=>=${today}&per_page=50" \
+                    --jq "[.workflow_runs[] | select(.created_at >= \"${today}T00:00:00Z\" and .id != ${{ github.run_id }}) | .id] | reverse | .[]")
               for id in $ids; do
                 taken=$(gh api "repos/$REPO/actions/runs/$id/jobs" \
                   --jq 'any(.jobs[]; .name == "build-and-deploy" and (.conclusion == "success" or .status != "completed"))')
@@ -105,16 +109,32 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The decompressed archive is ~5.4 GB; reclaim space as cheap insurance.
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: false
-          large-packages: false
+      # The decompressed archive is ~5.4 GB (~11 GB peak during delta merge).
+      # Only reclaim space when under 20 GB free, targeting just the few
+      # multi-GB SDK trees in parallel (~5-8s vs ~60s for full disk-cleanup actions).
+      - name: Ensure disk space
+        run: |
+          avail_gb=$(df -BG --output=avail "${{ runner.temp }}" | tail -1 | tr -dc '0-9')
+          echo "Available disk space on runner.temp: ${avail_gb} GB"
+          if (( avail_gb < 20 )); then
+            sudo rm -rf /usr/local/lib/android &
+            sudo rm -rf /usr/share/dotnet &
+            sudo rm -rf /opt/ghc &
+            wait
+            df -h "${{ runner.temp }}"
+          fi
 
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Cache Matplotlib font list
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/matplotlib
+          key: mpl-fontcache-${{ runner.os }}-py312-${{ hashFiles('requirements.txt') }}
 
       - name: Install dependencies
         run: pip install -r requirements.txt
