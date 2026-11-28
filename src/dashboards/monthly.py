@@ -7,6 +7,7 @@ and the thin local wrapper drive one copy of the code. Produces the eight charts
 cve_status_stats.py) and the aligned-table report; no CSV/TXT outputs, no tqdm, no stdout-teeing on the
 published path.
 '''
+import calendar
 import collections
 import concurrent.futures
 import csv
@@ -6884,7 +6885,57 @@ def plot_yearly_cumulative(daily_counts, anchor_date_str, output_filename="cve_m
     saved_files_log.append(f"Yearly cumulative comparison chart saved to {os.path.abspath(output_filename)}")
 
 
-def _prep_projections(stats, completed_month_strs, slope, intercept, partial_stats=None, current_month_str=None, current_month_yoy_growth=None, anchor_date=None):
+def _trailing_daily_ma(daily_counts, anchor_date, window_days=30):
+    """Trailing ``window_days``-day moving average of daily CVE counts ending on
+    ``anchor_date`` (reaches into December of the prior year in January)."""
+    anchor_dt = datetime.strptime(anchor_date[:10], "%Y-%m-%d")
+    total = 0
+    for offset in range(window_days):
+        dt = anchor_dt - timedelta(days=offset)
+        total += daily_counts.get(str(dt.year), {}).get(dt.strftime("%m-%d"), 0)
+    return total / window_days
+
+
+def _current_month_projection_yoy(stats, partial_stats, daily_counts, current_month_str, anchor_date):
+    """Return ``(yoy_growth, used_ma)`` for the running partial month.
+
+    Starts from the same-slice partial YoY rate ``(p26 - p25) / p25``. When its
+    implied full-month total ``g25 * (p26 / p25)`` falls below
+    ``actual + 30d_MA * remaining_days`` (for instance when the tail of last
+    year's month was unusually quiet, or actuals overtake the YoY projection),
+    switches to ``actual + 30d_MA * remaining_days`` and returns that point's
+    implied full-month YoY rate so both the current month and the OLS trend
+    feeding subsequent months reflect it.
+    """
+    p25 = sum(partial_stats[current_month_str]["2025"].values()) if (
+        partial_stats and current_month_str in partial_stats and "2025" in partial_stats[current_month_str]
+    ) else 0
+    p26 = sum(partial_stats[current_month_str]["2026"].values()) if (
+        partial_stats and current_month_str in partial_stats and "2026" in partial_stats[current_month_str]
+    ) else 0
+    g25 = sum(stats[current_month_str]["2025"].values()) if (
+        stats and current_month_str in stats and "2025" in stats[current_month_str]
+    ) else 0
+    actual_cur = sum(stats[current_month_str]["2026"].values()) if (
+        stats and current_month_str in stats and "2026" in stats[current_month_str]
+    ) else p26
+
+    yoy_growth = (p26 - p25) / p25 if p25 > 0 else None
+    yoy_proj = g25 * (1.0 + clamp_growth(yoy_growth)) if (yoy_growth is not None and g25 > 0) else None
+
+    if anchor_date and daily_counts and g25 > 0:
+        anchor_dt = datetime.strptime(anchor_date[:10], "%Y-%m-%d")
+        days_in_month = calendar.monthrange(anchor_dt.year, anchor_dt.month)[1]
+        remaining_days = max(0, days_in_month - anchor_dt.day)
+        ma_daily = _trailing_daily_ma(daily_counts, anchor_date, window_days=30)
+        ma_proj = actual_cur + ma_daily * remaining_days
+        if yoy_proj is None or ma_proj > yoy_proj:
+            return (ma_proj - g25) / g25, True
+
+    return yoy_growth, False
+
+
+def _prep_projections(stats, completed_month_strs, slope, intercept, partial_stats=None, current_month_str=None, current_month_yoy_growth=None, anchor_date=None, current_month_is_projected=False):
     """Everything ``plot_monthly_projections`` draws, before any layout. Shared
     with the slide renderer (``monthly_slides``)."""
     # Display years derived from the data anchor (falls back to the clock if unset).
@@ -7073,6 +7124,7 @@ def _prep_projections(stats, completed_month_strs, slope, intercept, partial_sta
         "n_comp": n_comp,
         "last_comp_idx": last_comp_idx,
         "cur_month_idx": cur_month_idx,
+        "cur_month_is_projected": current_month_is_projected,
         "start_proj_idx": start_proj_idx,
         "y_2025": y_2025,
         "y_2025_cum": y_2025_cum,
@@ -7087,7 +7139,7 @@ def _prep_projections(stats, completed_month_strs, slope, intercept, partial_sta
     }
 
 
-def plot_monthly_projections(stats, completed_month_strs, slope, intercept, partial_stats=None, current_month_str=None, current_month_yoy_growth=None, anchor_date=None, output_filename="cve_monthly_stats_comparison_projection.png"):
+def plot_monthly_projections(stats, completed_month_strs, slope, intercept, partial_stats=None, current_month_str=None, current_month_yoy_growth=None, anchor_date=None, output_filename="cve_monthly_stats_comparison_projection.png", current_month_is_projected=False):
     """
     Generates a cumulative monthly publication comparison chart for 2025 vs 2026,
     including trend projections for remaining 2026 months and MoM growth annotations.
@@ -7096,6 +7148,7 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
         stats, completed_month_strs, slope, intercept,
         partial_stats=partial_stats, current_month_str=current_month_str,
         current_month_yoy_growth=current_month_yoy_growth, anchor_date=anchor_date,
+        current_month_is_projected=current_month_is_projected,
     )
     current_year = p["current_year"]
     prev_year = p["prev_year"]
@@ -7287,12 +7340,13 @@ def plot_monthly_projections(stats, completed_month_strs, slope, intercept, part
                 rr_offset_yoy, rr_va_yoy = -48, "top"
                 rr_offset_val, rr_va_val = -18, "top"
 
-            # Run-rate YoY% label. The current month's rate is measured against the
-            # same slice of last year (see current_month_yoy_growth), so it is an
-            # incomplete actual, not a forecast: keep the dotted frame to mark it
-            # partial, but drop the '*', which the footer defines as a projection.
-            # Later months' rates come off the regression and stay starred.
-            yoy_rr_text = f"{yoy_runrate:+5.1f}%" if i == cur_month_idx else f"{yoy_runrate:+5.1f}%*"
+            # Run-rate YoY% label. When the current month's rate is measured
+            # directly against the same slice of last year, it is an incomplete
+            # actual (keep the dotted frame, drop '*'). When it falls back to
+            # actual + 30d MA * remaining days, keep '*' since the full-month
+            # rate itself is projected.
+            is_measured_cur = i == cur_month_idx and not p["cur_month_is_projected"]
+            yoy_rr_text = f"{yoy_runrate:+5.1f}%" if is_measured_cur else f"{yoy_runrate:+5.1f}%*"
             ax.annotate(
                 yoy_rr_text,
                 xy=(i, val_runrate),
@@ -9186,11 +9240,13 @@ def _run_monthly(results, report_buf):
         x_coords.append(idx)
         y_coords.append((g26 - g25) / g25 if g25 > 0 else 0.0)
 
-    # If the current month has partial data, compute its actual YoY factor
-    # and include it as a data point in the trend-line regression
-    # ...unless the anchor month has closed, in which case it is already one of
-    # the completed months above and must not be counted a second time.
+    # If the current month has partial data, compute its YoY factor (upgraded
+    # to ``actual + 30d MA * remaining days`` whenever that exceeds the partial
+    # YoY projection) and include that point in the trend-line regression so
+    # subsequent months' predictions follow it — unless the anchor month has
+    # closed, in which case it is already one of the completed months above.
     current_month_yoy_growth = None
+    current_month_is_projected = False
     current_month_has_data_for_chart = (
         not anchor_month_complete
         and current_month_str and stats
@@ -9199,11 +9255,11 @@ def _run_monthly(results, report_buf):
         and sum(stats[current_month_str]["2026"].values()) > 0
     )
     if current_month_has_data_for_chart and partial_stats:
-        p25 = sum(partial_stats[current_month_str]["2025"].values()) if (current_month_str in partial_stats and "2025" in partial_stats[current_month_str]) else 0
-        p26 = sum(partial_stats[current_month_str]["2026"].values()) if (current_month_str in partial_stats and "2026" in partial_stats[current_month_str]) else 0
-        if p25 > 0:
-            current_month_yoy_growth = (p26 - p25) / p25  # e.g. 1.151 for +115.1%
-            # Add to regression data points
+        current_month_yoy_growth, current_month_is_projected = _current_month_projection_yoy(
+            stats, partial_stats, daily_counts, current_month_str, anchor_date
+        )
+        if current_month_yoy_growth is not None:
+            # Add to regression data points so next months' predictions use it
             x_coords.append(int(current_month_str))
             y_coords.append(current_month_yoy_growth)
 
@@ -9232,6 +9288,7 @@ def _run_monthly(results, report_buf):
         current_month_str=current_month_str,
         current_month_yoy_growth=current_month_yoy_growth,
         anchor_date=anchor_date,
+        current_month_is_projected=current_month_is_projected,
     )
     _queue_web(
         "plot_monthly_projections",
@@ -9243,6 +9300,7 @@ def _run_monthly(results, report_buf):
         current_month_str=current_month_str,
         current_month_yoy_growth=current_month_yoy_growth,
         anchor_date=anchor_date,
+        current_month_is_projected=current_month_is_projected,
     )
 
     # NVD status of what was published: by year, then by week.

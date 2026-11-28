@@ -848,11 +848,11 @@ def slide_incomplete_month(data_2025_partial, data_2026_partial, prev_data_parti
 
 def slide_projections(stats, completed_month_strs, slope, intercept, partial_stats=None,
                       current_month_str=None, current_month_yoy_growth=None, anchor_date=None,
-                      output_filename=SLIDE_FILES["projections"]):
+                      output_filename=SLIDE_FILES["projections"], current_month_is_projected=False):
     p = m._prep_projections(
         stats, completed_month_strs, slope, intercept, partial_stats=partial_stats,
         current_month_str=current_month_str, current_month_yoy_growth=current_month_yoy_growth,
-        anchor_date=anchor_date,
+        anchor_date=anchor_date, current_month_is_projected=current_month_is_projected,
     )
     cur, prev = p["current_year"], p["prev_year"]
     names = p["months_names"]
@@ -903,8 +903,11 @@ def slide_projections(stats, completed_month_strs, slope, intercept, partial_sta
     # projected series ride the same rising segment, so the upper one's labels
     # sit above-left and the lower one's below-right, in the empty wedges.
     def rr_pill_text(i):
-        # The running month's rate is a measured partial, not a forecast: no '*'.
-        return f"{yoy_rr[i]:+.1f}%" if i == cur_idx else f"{yoy_rr[i]:+.1f}%*"
+        # The running month's rate drops '*' only when it is a measured partial
+        # YoY; when upgraded to actual + 30d MA * remaining days, keep '*'.
+        if i == cur_idx and not p["cur_month_is_projected"]:
+            return f"{yoy_rr[i]:+.1f}%"
+        return f"{yoy_rr[i]:+.1f}%*"
 
     for i in range(12):
         if i <= last:
